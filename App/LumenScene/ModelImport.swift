@@ -73,7 +73,7 @@ enum ModelImporter {
             guard !submeshes.isEmpty else { continue }
 
             for (subIndex, sub) in submeshes.enumerated() {
-                guard sub.topology == .triangles else { continue }
+                guard sub.topology == .triangle else { continue }
                 let indices = readIndices(sub)
                 guard indices.count >= 3 else { continue }
 
@@ -98,10 +98,11 @@ enum ModelImporter {
                 var next: UInt32 = 0
 
                 func corner(_ vi: Int) -> (SIMD3<Double>, SIMD3<Double>) {
-                    let p = raw.positions[vi]
+                    let p = SIMD3<Double>(raw.positions[vi])
                     let cp = SIMD3<Double>(p.x * scale, p.z * scale, -p.y * scale)
                     if let n = raw.normals?[vi] {
-                        var rn = SIMD3<Double>(n.x, n.z, -n.y)
+                        let nd = SIMD3<Double>(n)
+                        var rn = SIMD3<Double>(nd.x, nd.z, -nd.y)
                         let len = simd_length(rn)
                         if len > 1e-12 { rn /= len }
                         return (cp, rn)
