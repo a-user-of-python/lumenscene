@@ -73,7 +73,9 @@ enum ModelImporter {
             guard !submeshes.isEmpty else { continue }
 
             for (subIndex, sub) in submeshes.enumerated() {
-                guard sub.topology == .triangle else { continue }
+                // ModelIO's loaders hand back triangle submeshes for
+                // STL/OBJ/USD in practice; indices are consumed as
+                // triangles below.
                 let indices = readIndices(sub)
                 guard indices.count >= 3 else { continue }
 
