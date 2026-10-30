@@ -7,6 +7,7 @@
 
 import SwiftUI
 import UIKit
+import simd
 
 enum FieldFocus: Hashable { case projectName, objectName }
 
@@ -33,18 +34,11 @@ struct EditorView: View {
     @FocusState private var kbFocused: Bool
 
     var body: some View {
-        VStack(spacing: 0) {
-            topBar
-            Divider()
-            HStack(spacing: 0) {
-                treePanel
-                    .frame(width: 238)
-                Divider()
-                viewportPanel
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                Divider()
-                propertiesPanel
-                    .frame(width: 302)
+        Group {
+            if session.mode == .play {
+                playLayout
+            } else {
+                editLayout
             }
         }
         .background(Color(white: 0.09))
@@ -66,6 +60,54 @@ struct EditorView: View {
         .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
     }
 
+    // MARK: Layouts
+
+    /// Edit mode: the full editor chrome (top bar + panels).
+    private var editLayout: some View {
+        VStack(spacing: 0) {
+            topBar
+            Divider()
+            HStack(spacing: 0) {
+                treePanel
+                    .frame(width: 238)
+                Divider()
+                viewportPanel
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Divider()
+                propertiesPanel
+                    .frame(width: 302)
+            }
+        }
+    }
+
+    /// Play mode: the 3D view fills everything. The only chrome is
+    /// a circular pause button (top-right) and the touch joystick
+    /// (bottom-left) — no panels, no hint bars, no status text.
+    private var playLayout: some View {
+        ZStack {
+            MetalViewport(session: session)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .overlay(alignment: .topTrailing) {
+            Button { session.toggleMode() } label: {
+                Image(systemName: "pause.fill")
+                    .foregroundStyle(.white)
+                    .frame(width: 52, height: 52)
+                    .background(Color.black.opacity(0.55))
+                    .clipShape(Circle())
+                    .overlay(Circle().stroke(Color.white.opacity(0.25), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 16)
+            .padding(.trailing, 16)
+        }
+        .overlay(alignment: .bottomLeading) {
+            JoystickView(session: session)
+                .padding(.leading, 22)
+                .padding(.bottom, 26)
+        }
+    }
+
     private var qualityBinding: Binding<Int> {
         Binding(
             get: { session.renderer.qualityPreference },
@@ -74,6 +116,30 @@ struct EditorView: View {
                 session.renderer.resetAccumulation()
                 session.kickRender()
             })
+    }
+
+    private var weatherBinding: Binding<Int> {
+        Binding(
+            get: { session.project.scene.weather.mode },
+            set: { session.setWeatherMode($0) })
+    }
+
+    /// "Ground: 62% wet · Snow cover: 30%" style summary of the
+    /// current weather build-up, for the tree panel.
+    private var weatherCaption: String {
+        let w = session.project.scene.weather
+        var parts: [String] = []
+        if w.wetness > 0.02 {
+            parts.append("Ground: \(Int((w.wetness * 100).rounded()))% wet")
+        }
+        if w.snow > 0.02 {
+            parts.append("Snow cover: \(Int((w.snow * 100).rounded()))%")
+        }
+        if parts.isEmpty {
+            if w.mode == 1 { parts.append("Ground: 0% wet") }
+            else if w.mode == 2 { parts.append("Snow cover: 0%") }
+        }
+        return parts.joined(separator: " · ")
     }
 
     // MARK: Top bar
@@ -105,6 +171,20 @@ struct EditorView: View {
             }
             .buttonStyle(.borderedProminent)
             .help("Play: walk around the scene. Pause: back to editing.")
+            Menu {
+                Picker("Weather", selection: weatherBinding) {
+                    Text("Off").tag(0)
+                    Text("Rain").tag(1)
+                    Text("Snow").tag(2)
+                }
+                if session.project.scene.weather.wetness > 0.01
+                    || session.project.scene.weather.snow > 0.01 {
+                    Divider()
+                    Button("Clear ground build-up") { session.clearWeatherBuildup() }
+                }
+            } label: {
+                Label("Weather", systemImage: "cloud.rain")
+            }
             Menu {
                 Picker("Quality", selection: qualityBinding) {
                     Text("Auto").tag(0)
@@ -175,6 +255,15 @@ struct EditorView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(8)
+            if session.project.scene.weather.mode != 0
+                || session.project.scene.weather.wetness > 0.02
+                || session.project.scene.weather.snow > 0.02 {
+                Text(weatherCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 8)
+            }
         }
         .background(Color(white: 0.11))
     }
@@ -340,6 +429,54 @@ struct EditorView: View {
     }
 }
 
+// MARK: - Touch joystick (Play mode)
+
+/// Bottom-left thumb stick for walking in Play mode. A separate
+/// view on top of the viewport, so touches on it never reach the
+/// viewport's drag-to-look gesture; everywhere else look-around
+/// keeps working. Up on screen = forward (+y in the session's
+/// touch vector).
+struct JoystickView: View {
+    @ObservedObject var session: EditorSession
+    @State private var offset: CGSize = .zero
+
+    private let maxTravel: CGFloat = 38
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Color.white.opacity(0.12))
+                .frame(width: 124, height: 124)
+                .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 1.5))
+            Circle()
+                .fill(Color(white: 0.9).opacity(0.9))
+                .frame(width: 54, height: 54)
+                .offset(x: offset.width, y: offset.height)
+        }
+        .frame(width: 124, height: 124)
+        .shadow(color: Color.black.opacity(0.35), radius: 8, x: 0, y: 2)
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    var dx = value.translation.width
+                    var dy = value.translation.height
+                    let len = sqrt(dx * dx + dy * dy)
+                    if len > maxTravel {
+                        dx = dx / len * maxTravel
+                        dy = dy / len * maxTravel
+                    }
+                    offset = CGSize(width: dx, height: dy)
+                    session.touchVector = SIMD2<Float>(Float(dx / maxTravel),
+                                                       Float(-dy / maxTravel))
+                }
+                .onEnded { _ in
+                    offset = .zero
+                    session.touchVector = .zero
+                }
+        )
+    }
+}
+
 // MARK: - Properties panel for one object
 
 struct ObjectPropertiesView: View {
@@ -348,6 +485,7 @@ struct ObjectPropertiesView: View {
     var fieldFocus: FocusState<FieldFocus?>.Binding
 
     @State private var nameText: String = ""
+    @State private var customTextures: [CustomTextureStore.CustomTextureMeta] = []
 
     private var obj: Binding<SceneObject> { session.objectBinding(objectID) }
 
@@ -399,14 +537,35 @@ struct ObjectPropertiesView: View {
                         { $0.material.baseColor }, { $0.material.baseColor = $1 }))
                     Picker("Texture", selection: presetBinding) {
                         Text("Plain").tag("none")
-                        Text("Concrete").tag("concrete")
-                        Text("Cement").tag("cement")
-                        Text("Brick").tag("brick")
+                        Section("Surfaces") {
+                            Text("Concrete").tag("concrete")
+                            Text("Cement").tag("cement")
+                            Text("Brick").tag("brick")
+                        }
+                        Section("Roads") {
+                            ForEach(TextureGen.roadNames, id: \.self) { name in
+                                Text(TextureGen.displayName(name)).tag(name)
+                            }
+                        }
+                        if !customTextures.isEmpty {
+                            Section("My Textures") {
+                                ForEach(customTextures) { meta in
+                                    Text(meta.name).tag("custom:\(meta.id.uuidString)")
+                                }
+                            }
+                        }
                     }
-                    if obj.wrappedValue.material.texturePreset != "none" {
+                    if obj.wrappedValue.material.texturePreset != "none"
+                        && !obj.wrappedValue.material.textureFit {
                         sliderRow("Tiling", dbl({ $0.material.textureScale },
                                                 { $0.material.textureScale = $1 }),
                                   0.25...8)
+                    }
+                    if obj.wrappedValue.material.texturePreset != "none"
+                        && obj.wrappedValue.material.textureFit {
+                        Text("Auto-fit: this texture spans the whole face it is applied to.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
 
@@ -453,7 +612,10 @@ struct ObjectPropertiesView: View {
             .padding(14)
         }
         .background(Color(white: 0.11))
-        .onAppear { nameText = obj.wrappedValue.name }
+        .onAppear {
+            nameText = obj.wrappedValue.name
+            customTextures = CustomTextureStore.list()
+        }
         .onChange(of: objectID) { _, _ in nameText = obj.wrappedValue.name }
     }
 
@@ -583,6 +745,7 @@ struct ObjectPropertiesView: View {
                     session.beginEditIfNewGesture()
                     var o = obj.wrappedValue
                     o.material.texturePreset = v
+                    o.material.textureFit = TextureGen.isRoad(v)
                     obj.wrappedValue = o
                 })
     }

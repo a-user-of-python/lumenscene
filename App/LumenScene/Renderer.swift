@@ -23,10 +23,27 @@
 //   * Manipulation preview: `previewObjectID` renders one object
 //     cheap (emissive stops emitting, glass turns opaque) through
 //     the material-only path, so drags stay fluid.
+//
+// V3 notes:
+//   * Firefly clamp in the trace kernel caps each sample against
+//     the pixel's own running average; a spatial cross-bilateral
+//     denoise pass (second guide texture: surface normals) cleans
+//     interactive and Play frames while the settled image is
+//     still displayed raw from the accumulation.
+//   * Texture slices now come from TextureGen.allSliceNames()
+//     (presets + roads) plus the user's custom texture library;
+//     `reloadTextureArraysIfNeeded()` rebuilds the arrays when
+//     that library changes. Material flag bit3 = texture FIT.
+//   * Weather: wet/snow levels ride the trace uniforms (up-facing
+//     surfaces darken / whiten and gain/lose gloss, with a sheen
+//     bounce); rain/snow precipitation is a blended overlay pass
+//     on the live draw only. `lightsCut` suppresses every
+//     emissive flag for stage-lighting previews.
 
 import Foundation
 import Metal
 import MetalKit
+import QuartzCore
 import simd
 import ImageIO
 import UniformTypeIdentifiers
@@ -46,6 +63,9 @@ struct GPUUniforms {
     var envIntensity: Float = 1
     var historyCap: Float = 768
     var glassRefractBudget: UInt32 = 4
+    var wetLevel: Float = 0
+    var snowLevel: Float = 0
+    var weatherPad = SIMD2<Float>(0, 0)
 }
 
 struct ReprojUniforms {
@@ -68,6 +88,23 @@ struct GPUMaterial {
     var pad = SIMD2<UInt32>(0, 0)
 }
 
+struct DenoiseUniforms {
+    var camOrigin = SIMD4<Float>(0, 0, 0, 0) // xyz used; w pads float3
+    var strength: Float = 1
+    var pad0: Float = 0
+    var pad1: Float = 0
+}
+
+struct PrecipUniforms {
+    var camOrigin = SIMD4<Float>(0, 0, 0, 0)
+    var camRight = SIMD4<Float>(1, 0, 0, 0)
+    var camUp = SIMD4<Float>(0, 1, 0, 0)
+    var camForward = SIMD4<Float>(0, 0, -1, 0)
+    var tanFovAspect = SIMD2<Float>(0.7, 1)
+    var time: Float = 0
+    var mode: UInt32 = 0
+}
+
 struct TonemapParams {
     var samples: UInt32 = 0
     var exposure: Float = 1.15
@@ -86,7 +123,9 @@ final class Renderer {
     private var tracePipeline: MTLComputePipelineState?
     private var guidePipeline: MTLComputePipelineState?
     private var reprojectPipeline: MTLComputePipelineState?
+    private var denoisePipeline: MTLComputePipelineState?
     private var tonemapPipeline: MTLRenderPipelineState?
+    private var precipPipeline: MTLRenderPipelineState?
 
     // Scene GPU state.
     private var accel: MTLAccelerationStructure?
@@ -110,16 +149,27 @@ final class Renderer {
     private var cpuTriMats: [UInt32] = []
     private var cachedObjectOrder: [UUID] = []
 
-    // Procedural texture arrays (built once).
+    // Texture arrays: built-in presets + roads plus the custom
+    // texture library. `sliceNames` is kept in lockstep with the
+    // array slices (slice i holds sliceNames[i]).
     private var texAlbedo: MTLTexture?
     private var texNormal: MTLTexture?
     private var texData: MTLTexture?
+    private(set) var sliceNames: [String] = []
+    /// Fingerprint (custom library ids+names) the arrays were
+    /// built with; see reloadTextureArraysIfNeeded().
+    private var builtTextureFingerprint: String = ""
 
     // Accumulation + guide textures, ping-ponged per frame. The
     // accumulation alpha channel carries the effective sample
-    // count; guides carry primary-hit world positions (rgba32F).
+    // count; guides carry primary-hit world positions (rgba32F)
+    // and guide-normals carry the interpolated surface normals
+    // (rgba16F, denoise guide). `displayTex` is the single
+    // (non-ping-ponged) denoise output the tonemap can read.
     private var accumTex: [MTLTexture?] = [nil, nil]
     private var guideTex: [MTLTexture?] = [nil, nil]
+    private var guideNormalTex: [MTLTexture?] = [nil, nil]
+    private var displayTex: MTLTexture?
     private var curIdx: Int = 0
     private var historyValid: Bool = false
     private var prevCamera: CameraBasis?
@@ -135,6 +185,23 @@ final class Renderer {
     /// Manipulation preview: this object (if any) renders cheap —
     /// emissive objects stop emitting, glass renders opaque.
     var previewObjectID: UUID?
+
+    /// Stage-lighting cut: when true, NO object is flagged
+    /// emissive (emissive surfaces shade with their emissive
+    /// colour as base, like the per-object preview), so the
+    /// emissive light index — and its CDF — comes out empty.
+    var lightsCut: Bool = false
+
+    /// Weather, set by the session every frame tick: mode
+    /// 0 = dry, 1 = rain, 2 = snow; wet/snow are 0…1 build-up
+    /// levels that shade up-facing surfaces in the trace kernel.
+    var weatherMode: Int = 0
+    var weatherWet: Float = 0
+    var weatherSnow: Float = 0
+    /// Weather levels used by the previous draw; a change softens
+    /// reprojection history so the ground visibly wets/dries.
+    private var lastWet: Float = 0
+    private var lastSnow: Float = 0
 
     /// 0 = Auto, 1 = High detail, 2 = Battery saver.
     var qualityPreference: Int = 0
@@ -153,6 +220,7 @@ final class Renderer {
     var frameWanted: Bool {
         if presentationDirty { return true }
         guard accel != nil else { return false }
+        if weatherMode != 0 { return true } // precipitation animates
         return !historyValid || sampleCount < lastMaxSettle
     }
 
@@ -176,6 +244,9 @@ final class Renderer {
         if let fn = library.makeFunction(name: "reprojectKernel") {
             reprojectPipeline = try? device.makeComputePipelineState(function: fn)
         }
+        if let fn = library.makeFunction(name: "denoiseKernel") {
+            denoisePipeline = try? device.makeComputePipelineState(function: fn)
+        }
         if let vfn = library.makeFunction(name: "tonemapVertex"),
            let ffn = library.makeFunction(name: "tonemapFragment") {
             let desc = MTLRenderPipelineDescriptor()
@@ -183,6 +254,23 @@ final class Renderer {
             desc.fragmentFunction = ffn
             desc.colorAttachments[0].pixelFormat = .bgra8Unorm
             tonemapPipeline = try? device.makeRenderPipelineState(descriptor: desc)
+        }
+        if let vfn = library.makeFunction(name: "precipVertex"),
+           let ffn = library.makeFunction(name: "precipFragment") {
+            // Blended overlay, no depth — drawn over the
+            // tonemapped drawable with a .load pass.
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = vfn
+            desc.fragmentFunction = ffn
+            desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            desc.colorAttachments[0].isBlendingEnabled = true
+            desc.colorAttachments[0].rgbBlendOperation = .add
+            desc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            desc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            desc.colorAttachments[0].alphaBlendOperation = .add
+            desc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+            desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            precipPipeline = try? device.makeRenderPipelineState(descriptor: desc)
         }
         thermalObserver = NotificationCenter.default.addObserver(
             forName: ProcessInfo.thermalStateDidChangeNotification,
@@ -206,15 +294,50 @@ final class Renderer {
 
     // MARK: Texture arrays
 
+    /// Fingerprint of the custom texture library (ids + names):
+    /// any library edit changes it, which is the rebuild signal.
+    private func textureLibraryFingerprint() -> String {
+        CustomTextureStore.list()
+            .map { "\($0.id.uuidString):\($0.name)" }
+            .joined(separator: "|")
+    }
+
     private func buildTextureArrays() {
-        let names = TextureGen.presetNames
-        guard !names.isEmpty else { return }
+        let customMetas = CustomTextureStore.list()
+        builtTextureFingerprint = customMetas
+            .map { "\($0.id.uuidString):\($0.name)" }
+            .joined(separator: "|")
+        let candidateNames = TextureGen.allSliceNames()
+            + customMetas.map { "custom:\($0.id.uuidString)" }
+        var builtNames: [String] = []
         var albedos: [Data] = [], normals: [Data] = [], datas: [Data] = []
         var size = 0
-        for name in names {
-            let set = TextureGen.makeSet(preset: name)
-            size = set.size
+        for name in candidateNames {
+            let set: PBRTextureSet?
+            if name.hasPrefix("custom:") {
+                let idString = String(name.dropFirst("custom:".count))
+                guard let id = UUID(uuidString: idString),
+                      let loaded = CustomTextureStore.loadSet(id: id) else { continue }
+                set = loaded
+            } else {
+                set = TextureGen.makeSet(preset: name)
+            }
+            guard let set else { continue }
+            // All slices of one array share a size; a set that
+            // doesn't match the established size is skipped (its
+            // name too — names and slices stay in lockstep).
+            if size == 0 {
+                size = set.size
+            } else if set.size != size {
+                continue
+            }
+            builtNames.append(name)
             albedos.append(set.albedo); normals.append(set.normal); datas.append(set.data)
+        }
+        sliceNames = builtNames
+        guard !builtNames.isEmpty, size > 0 else {
+            texAlbedo = nil; texNormal = nil; texData = nil
+            return
         }
         func makeArray(_ slices: [Data]) -> MTLTexture? {
             let desc = MTLTextureDescriptor()
@@ -243,10 +366,30 @@ final class Renderer {
         texData = makeArray(datas)
     }
 
-    /// Texture array slice for a preset name (0 = none in materials).
-    static func texIndex(forPreset preset: String) -> UInt32 {
-        guard let i = TextureGen.presetNames.firstIndex(of: preset) else { return 0 }
+    /// Rebuilds the texture arrays when the custom texture
+    /// library changed since they were built. Returns true when
+    /// a rebuild happened (accumulation is reset — slice indices
+    /// may have moved).
+    func reloadTextureArraysIfNeeded() -> Bool {
+        guard textureLibraryFingerprint() != builtTextureFingerprint else { return false }
+        buildTextureArrays()
+        resetAccumulation()
+        return true
+    }
+
+    /// Texture array slice for a texture name (0 = none in
+    /// materials). Resolves built-in presets, roads, and
+    /// "custom:<uuid>" names against this renderer's slice list.
+    func texIndexValue(forPreset preset: String) -> UInt32 {
+        guard let i = sliceNames.firstIndex(of: preset) else { return 0 }
         return UInt32(i + 1)
+    }
+
+    /// Texture array slice for a preset name (0 = none in
+    /// materials), resolved via the shared renderer's slices.
+    static func texIndex(forPreset preset: String) -> UInt32 {
+        guard let shared = Renderer.shared else { return 0 }
+        return shared.texIndexValue(forPreset: preset)
     }
 
     // MARK: Scene building
@@ -393,8 +536,10 @@ final class Renderer {
         var flags: UInt32 = 0
         let previewing = (obj.id == previewObjectID)
         if m.emissiveOn {
-            if previewing {
-                // Manipulation preview: no light cast; the surface
+            if previewing || lightsCut {
+                // Manipulation preview / lights cut: no light cast
+                // (no emissive flag — the light index keys off it,
+                // so lightsCut yields an empty CDF); the surface
                 // takes the emissive colour so it still reads as
                 // the same object.
                 base = m.emissiveColor.simd
@@ -412,11 +557,12 @@ final class Renderer {
             }
         }
         if m.triplanar { flags |= 4 }
+        if m.textureFit { flags |= 8 }
         g.baseColor = SIMD4<Float>(base, 0)
         g.emissive = SIMD4<Float>(m.emissiveColor.simd, Float(m.emissiveIntensity))
         g.glassParams = SIMD4<Float>(Float(m.transmission), Float(m.roughness), Float(m.ior), 0)
         g.tint = SIMD4<Float>(m.tint.simd, Float(m.textureScale))
-        g.texIndex = Renderer.texIndex(forPreset: m.texturePreset)
+        g.texIndex = texIndexValue(forPreset: m.texturePreset)
         g.flags = flags
         return g
     }
@@ -477,6 +623,18 @@ final class Renderer {
         return device.makeTexture(descriptor: desc)
     }
 
+    /// Guide-normal texture (v3): interpolated surface normals
+    /// for the denoise pass — half precision is plenty for a
+    /// bilateral weight.
+    private func makeGuideNormalTexture(width: Int, height: Int) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float, width: max(width, 1), height: max(height, 1),
+            mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        desc.storageMode = .private
+        return device.makeTexture(descriptor: desc)
+    }
+
     /// Zero the accumulation texture (alpha = 0: no samples yet).
     /// The trace kernel reads the previous contents before adding
     /// its sample, so a brand-new texture MUST be cleared first.
@@ -520,7 +678,7 @@ final class Renderer {
             break
         }
         if play {
-            maxSettle = qualityPreference == 1 ? 128 : (qualityPreference == 2 ? 64 : 96)
+            maxSettle = qualityPreference == 1 ? 192 : (qualityPreference == 2 ? 64 : 128)
         }
         var reuseCap = Float(maxSettle)
         if moving {
@@ -528,7 +686,7 @@ final class Renderer {
             spp = qualityPreference == 2 ? 3 : 4
             bounces = min(bounces, 4)
             glass = min(glass, 2)
-            reuseCap = play ? 12 : 24
+            reuseCap = play ? 16 : 24
         }
         // Thermal state is an emergency brake only.
         switch thermalTier {
@@ -549,7 +707,7 @@ final class Renderer {
         default:
             break
         }
-        if moving { reuseCap = min(reuseCap, play ? 12 : 24) }
+        if moving { reuseCap = min(reuseCap, play ? 16 : 24) }
         return FrameTargets(scale: scale, spp: spp, bounces: bounces,
                             glassBudget: glass, maxSettle: maxSettle,
                             reuseCap: reuseCap)
@@ -573,6 +731,8 @@ final class Renderer {
         u.envIntensity = 1.0
         u.historyCap = cap
         u.glassRefractBudget = glassBudget
+        u.wetLevel = weatherWet
+        u.snowLevel = weatherSnow
         return u
     }
 
@@ -585,14 +745,17 @@ final class Renderer {
                             threadsPerThreadgroup: MTLSize(width: w, height: h, depth: 1))
     }
 
-    private func encodeGuide(guide: MTLTexture, camera: CameraBasis,
+    private func encodeGuide(guide: MTLTexture, guideNormal: MTLTexture,
+                             camera: CameraBasis,
                              cmd: MTLCommandBuffer) -> Bool {
         guard let guidePipeline, let accel,
-              let posBuffer, let idxBuffer, let triMatBuffer, let matBuffer,
+              let posBuffer, let nrmBuffer, let idxBuffer, let triMatBuffer, let matBuffer,
               let enc = cmd.makeComputeCommandEncoder() else { return false }
         enc.setComputePipelineState(guidePipeline)
         enc.setTexture(guide, index: 0)
+        enc.setTexture(guideNormal, index: 1)
         enc.setBuffer(posBuffer, offset: 0, index: 1)
+        enc.setBuffer(nrmBuffer, offset: 0, index: 2)
         enc.setBuffer(idxBuffer, offset: 0, index: 5)
         enc.setBuffer(triMatBuffer, offset: 0, index: 6)
         enc.setBuffer(matBuffer, offset: 0, index: 7)
@@ -668,6 +831,29 @@ final class Renderer {
         return true
     }
 
+    /// Spatial denoise of the current accumulation into the
+    /// display texture (interactive / Play frames only — the
+    /// settled frame is always shown raw).
+    private func encodeDenoise(accum: MTLTexture, guide: MTLTexture,
+                               guideNormal: MTLTexture, output: MTLTexture,
+                               strength: Float, camera: CameraBasis,
+                               cmd: MTLCommandBuffer) -> Bool {
+        guard let denoisePipeline,
+              let enc = cmd.makeComputeCommandEncoder() else { return false }
+        enc.setComputePipelineState(denoisePipeline)
+        enc.setTexture(accum, index: 0)
+        enc.setTexture(guide, index: 1)
+        enc.setTexture(guideNormal, index: 2)
+        enc.setTexture(output, index: 3)
+        var u = DenoiseUniforms()
+        u.camOrigin = SIMD4<Float>(camera.origin, 0)
+        u.strength = strength
+        enc.setBytes(&u, length: MemoryLayout<DenoiseUniforms>.stride, index: 0)
+        dispatch(enc, pipeline: denoisePipeline, width: accum.width, height: accum.height)
+        enc.endEncoding()
+        return true
+    }
+
     private func cameraChanged(_ a: CameraBasis, _ b: CameraBasis) -> Bool {
         simd_length(a.origin - b.origin) > 1e-5
             || simd_length(a.forward - b.forward) > 1e-5
@@ -689,6 +875,12 @@ final class Renderer {
 
         let t = targets(moving: moving, play: play)
         lastMaxSettle = t.maxSettle
+        // Weather levels moved since the last presented frame:
+        // reprojection history gets capped hard for one frame so
+        // the ground visibly wets/dries instead of staying frozen
+        // in pre-change samples.
+        let weatherLevelsMoved = abs(weatherWet - lastWet) > 0.004
+            || abs(weatherSnow - lastSnow) > 0.004
         let pixelW = max(1, Int(Float(view.drawableSize.width) * t.scale))
         let pixelH = max(1, Int(Float(view.drawableSize.height) * t.scale))
         if accumTex[0] == nil || accumTex[0]!.width != pixelW || accumTex[0]!.height != pixelH {
@@ -696,18 +888,23 @@ final class Renderer {
                         makeAccumTexture(width: pixelW, height: pixelH)]
             guideTex = [makeGuideTexture(width: pixelW, height: pixelH),
                         makeGuideTexture(width: pixelW, height: pixelH)]
+            guideNormalTex = [makeGuideNormalTexture(width: pixelW, height: pixelH),
+                              makeGuideNormalTexture(width: pixelW, height: pixelH)]
+            displayTex = makeAccumTexture(width: pixelW, height: pixelH)
             historyValid = false
             sampleCount = 0
         }
         let dst = curIdx
         let src = 1 - curIdx
         guard let curAccum = accumTex[dst], let curGuide = guideTex[dst] else { return false }
+        let curGuideNormal = guideNormalTex[dst]
 
         // Settled fast path: history valid, camera identical to
         // the last presented frame, sample cap reached — just
         // present the finished image (which lives in the other
-        // ping-pong slot) and sleep.
-        if accel != nil, historyValid, sampleCount >= t.maxSettle,
+        // ping-pong slot) and sleep. Never taken while weather
+        // is active (precipitation must keep animating).
+        if accel != nil, weatherMode == 0, historyValid, sampleCount >= t.maxSettle,
            let pc = prevCamera, !cameraChanged(pc, camera),
            let settled = accumTex[src] {
             if let tonemapPipeline,
@@ -722,6 +919,8 @@ final class Renderer {
             cmd.present(drawable)
             cmd.commit()
             wasMoving = moving
+            lastWet = weatherWet
+            lastSnow = weatherSnow
             return false
         }
 
@@ -729,7 +928,10 @@ final class Renderer {
         if accel != nil {
             // Guide pass for the current camera (becomes next
             // frame's "previous"), then history: reproject or clear.
-            _ = encodeGuide(guide: curGuide, camera: camera, cmd: cmd)
+            if let curGuideNormal {
+                _ = encodeGuide(guide: curGuide, guideNormal: curGuideNormal,
+                                camera: camera, cmd: cmd)
+            }
             let camMoved = prevCamera.map { cameraChanged($0, camera) } ?? true
             if historyValid, let prevAccum = accumTex[src], let prevGuide = guideTex[src],
                prevCamera != nil {
@@ -743,13 +945,16 @@ final class Renderer {
                         sampleCount = 0 // the image really is fresh
                     }
                 }
+                if weatherLevelsMoved {
+                    reuse = min(reuse, 8) // ground is changing state
+                }
                 _ = encodeReproject(prevAccum: prevAccum, prevGuide: prevGuide,
                                     curGuide: curGuide, curAccum: curAccum,
                                     reuseCap: reuse, cmd: cmd)
                 if wasMoving && !moving {
                     // Settle bookkeeping: per-pixel history after
                     // motion is roughly the moving reuse cap.
-                    sampleCount = min(sampleCount, play ? 12 : 24)
+                    sampleCount = min(sampleCount, play ? 16 : 24)
                 }
             } else {
                 clearAccum(curAccum, cmd: cmd)
@@ -757,7 +962,10 @@ final class Renderer {
             }
             // Trace more samples unless settled and the camera
             // has not moved since the last presented frame.
-            if moving || camMoved || sampleCount < t.maxSettle {
+            // Active weather always traces (at the non-moving
+            // tier's spp): precipitation frames keep refreshing
+            // the wet/snow shading instead of freezing.
+            if moving || camMoved || sampleCount < t.maxSettle || weatherMode != 0 {
                 if encodeTrace(accum: curAccum, camera: camera, count: t.spp,
                                seedStart: frameSeedCounter, bounces: t.bounces,
                                cap: Float(t.maxSettle), glassBudget: t.glassBudget,
@@ -780,20 +988,65 @@ final class Renderer {
             sampleCount = 0
         }
 
+        // Display source: interactive / Play / still-converging
+        // frames go through the spatial denoise pass; the settled
+        // frame (sampleCount >= maxSettle) is shown raw.
+        var displaySource = curAccum
+        if accel != nil, moving || play || sampleCount < t.maxSettle,
+           denoisePipeline != nil, let displayTex, let curGuideNormal {
+            let strength: Float = (play || moving) ? 1.0 : 0.65
+            if encodeDenoise(accum: curAccum, guide: curGuide,
+                             guideNormal: curGuideNormal, output: displayTex,
+                             strength: strength, camera: camera, cmd: cmd) {
+                displaySource = displayTex
+            }
+        }
+
         if let tonemapPipeline,
            let renc = cmd.makeRenderCommandEncoder(descriptor: passDesc) {
             var params = TonemapParams(samples: max(sampleCount, 1), exposure: exposure)
             renc.setRenderPipelineState(tonemapPipeline)
-            renc.setFragmentTexture(curAccum, index: 0)
+            renc.setFragmentTexture(displaySource, index: 0)
             renc.setFragmentBytes(&params, length: MemoryLayout<TonemapParams>.stride, index: 0)
             renc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             renc.endEncoding()
         }
+
+        // Precipitation overlay (live draw only): a fresh pass
+        // over the presented drawable, loading what the tonemap
+        // wrote. Rain = 900 streaks, snow = 700 sprites.
+        if weatherMode == 1 || weatherMode == 2, let precipPipeline {
+            let precipPass = MTLRenderPassDescriptor()
+            precipPass.colorAttachments[0].texture = drawable.texture
+            precipPass.colorAttachments[0].loadAction = .load
+            precipPass.colorAttachments[0].storeAction = .store
+            if let penc = cmd.makeRenderCommandEncoder(descriptor: precipPass) {
+                penc.setRenderPipelineState(precipPipeline)
+                var pu = PrecipUniforms()
+                pu.camOrigin = SIMD4<Float>(camera.origin, 0)
+                pu.camRight = SIMD4<Float>(camera.right, 0)
+                pu.camUp = SIMD4<Float>(camera.up, 0)
+                pu.camForward = SIMD4<Float>(camera.forward, 0)
+                pu.tanFovAspect = SIMD2<Float>(
+                    tan(fovY / 2),
+                    Float(view.drawableSize.width) / Float(max(view.drawableSize.height, 1)))
+                pu.time = Float(CACurrentMediaTime().truncatingRemainder(dividingBy: 3600))
+                pu.mode = UInt32(weatherMode)
+                penc.setVertexBytes(&pu, length: MemoryLayout<PrecipUniforms>.stride, index: 0)
+                let particleCount = weatherMode == 1 ? 900 : 700
+                penc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                    vertexCount: particleCount * 6)
+                penc.endEncoding()
+            }
+        }
+
         cmd.present(drawable)
         cmd.commit()
         wasMoving = moving
+        lastWet = weatherWet
+        lastSnow = weatherSnow
         guard accel != nil else { return false }
-        return moving || (traced && sampleCount < t.maxSettle)
+        return moving || weatherMode != 0 || (traced && sampleCount < t.maxSettle)
     }
 
     /// Render the current scene offscreen and return a PNG (used for

@@ -79,6 +79,41 @@ struct MaterialProps: Codable, Equatable {
     /// True for imported models (no UVs in the file): the
     /// renderer samples textures triplanar from world position.
     var triplanar: Bool = false
+    /// Auto-fit: the texture spans the face exactly once instead of
+    /// tiling by `textureScale`. Used by road textures, whose whole
+    /// design (markings, crossings) lives in a single tile.
+    var textureFit: Bool = false
+}
+
+extension MaterialProps {
+    private enum CodingKeys: String, CodingKey {
+        case baseColor, emissiveOn, emissiveColor, emissiveIntensity
+        case glassOn, transmission, roughness, ior, tint
+        case texturePreset, textureScale, triplanar, textureFit
+    }
+
+    // Custom Decodable for backward compatibility: project.json files
+    // written by v1/v2 lack `textureFit` (and may lack any later key),
+    // so every field is decoded with decodeIfPresent and falls back to
+    // exactly the property default above. encode(to:) stays
+    // synthesised — providing init(from:) in an extension does not
+    // suppress it, and the synthesised encoder uses the same key names.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        baseColor = try c.decodeIfPresent(RGB.self, forKey: .baseColor) ?? .white
+        emissiveOn = try c.decodeIfPresent(Bool.self, forKey: .emissiveOn) ?? false
+        emissiveColor = try c.decodeIfPresent(RGB.self, forKey: .emissiveColor) ?? RGB(1, 0.6, 0.2)
+        emissiveIntensity = try c.decodeIfPresent(Double.self, forKey: .emissiveIntensity) ?? 4.0
+        glassOn = try c.decodeIfPresent(Bool.self, forKey: .glassOn) ?? false
+        transmission = try c.decodeIfPresent(Double.self, forKey: .transmission) ?? 1.0
+        roughness = try c.decodeIfPresent(Double.self, forKey: .roughness) ?? 0.05
+        ior = try c.decodeIfPresent(Double.self, forKey: .ior) ?? 1.5
+        tint = try c.decodeIfPresent(RGB.self, forKey: .tint) ?? .white
+        texturePreset = try c.decodeIfPresent(String.self, forKey: .texturePreset) ?? "none"
+        textureScale = try c.decodeIfPresent(Double.self, forKey: .textureScale) ?? 1.0
+        triplanar = try c.decodeIfPresent(Bool.self, forKey: .triplanar) ?? false
+        textureFit = try c.decodeIfPresent(Bool.self, forKey: .textureFit) ?? false
+    }
 }
 
 // MARK: - Scene objects
@@ -157,13 +192,42 @@ struct CameraState: Codable, Equatable {
     }
 }
 
+// MARK: - Weather
+
+/// Scene-wide weather state. `mode`: 0 = off, 1 = rain, 2 = snow.
+/// `wetness` (0...1) darkens / slickens surfaces in rain; `snow`
+/// (0...1) is accumulation in snow mode.
+struct WeatherState: Codable, Equatable {
+    var mode: Int = 0
+    var wetness: Double = 0
+    var snow: Double = 0
+}
+
 // MARK: - Scene & project
 
 struct Scene: Codable, Equatable {
     var objects: [SceneObject] = []
     var camera: CameraState = CameraState()
+    var weather: WeatherState = WeatherState()
 
     func object(id: UUID) -> SceneObject? { objects.first { $0.id == id } }
+}
+
+extension Scene {
+    private enum CodingKeys: String, CodingKey {
+        case objects, camera, weather
+    }
+
+    // Custom Decodable for backward compatibility: v1/v2 project.json
+    // files have no `weather` key. Every field falls back to exactly
+    // the property default above. encode(to:) stays synthesised (see
+    // the note on MaterialProps above).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        objects = try c.decodeIfPresent([SceneObject].self, forKey: .objects) ?? []
+        camera = try c.decodeIfPresent(CameraState.self, forKey: .camera) ?? CameraState()
+        weather = try c.decodeIfPresent(WeatherState.self, forKey: .weather) ?? WeatherState()
+    }
 }
 
 struct Project: Codable, Equatable, Identifiable {

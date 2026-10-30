@@ -21,6 +21,14 @@ enum ProjectStore {
         return base.appendingPathComponent("LumenScene/Projects", isDirectory: true)
     }
 
+    /// Root for user-painted custom textures (see CustomTextureStore
+    /// in Textures.swift): Application Support/LumenScene/Textures.
+    static var texturesRootURL: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory,
+                                            in: .userDomainMask)[0]
+        return base.appendingPathComponent("LumenScene/Textures", isDirectory: true)
+    }
+
     static var documentsURL: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }

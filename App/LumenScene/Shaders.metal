@@ -42,6 +42,19 @@
 // continues, so the settled image is the full-quality one. At the
 // sample cap the accumulator becomes a moving average (oldest
 // weight decays), which keeps Play mode smooth instead of noisy.
+//
+// V3 additions:
+//   * Firefly clamp: each new sample is capped against the
+//     pixel's own running average before accumulation, so one
+//     hot path can't sparkle a settled pixel.
+//   * Spatial denoise: a 3x3 cross-bilateral pass (guide position
+//     + guide normal + luminance) over the accumulation, faded
+//     out as pixels accumulate — interactive frames and Play
+//     read clean; the settled image is displayed raw.
+//   * Weather: wetness darkens up-facing surfaces and rolls
+//     their bounces toward glossy sheen; snow whitens them and
+//     flattens the shading normal. Precipitation (rain streaks /
+//     snow sprites) is a separate camera-box overlay pass.
 
 #include <metal_stdlib>
 #include <metal_raytracing>
@@ -63,6 +76,9 @@ struct Uniforms {
     float envIntensity;
     float historyCap;          // max effective samples kept per pixel
     uint glassRefractBudget;   // max refraction events per path
+    float wetLevel;            // v3: 0 dry .. 1 soaked (up-facing)
+    float snowLevel;           // v3: 0 none .. 1 full cover (up-facing)
+    float2 weatherPad;
 };
 
 struct Material {
@@ -70,14 +86,15 @@ struct Material {
     float4 emissive;     // rgb colour; a = intensity
     float4 glassParams;  // x: transmission, y: roughness, z: ior, w unused
     float4 tint;         // rgb; a = textureScale
-    uint texIndex;       // 0 none, 1..3 texture array slice+1 (slice = texIndex-1)
-    uint flags;          // bit0 emissive on, bit1 glass on, bit2 triplanar
+    uint texIndex;       // 0 none, else texture array slice+1 (slice = texIndex-1)
+    uint flags;          // bit0 emissive, bit1 glass, bit2 triplanar, bit3 fit
     uint2 pad;
 };
 
 constant uint FLAG_EMISSIVE = 1u;
 constant uint FLAG_GLASS = 2u;
 constant uint FLAG_TRIPLANAR = 4u;
+constant uint FLAG_FIT = 8u;
 
 // MARK: - RNG (xorshift128, seeded per pixel + frame)
 
@@ -267,7 +284,9 @@ kernel void pathTraceKernel(
                 float3 blended = normalize(wnx * w.x + wny * w.y + wnz * w.z);
                 if (dot(blended, geoN) > 0.05f) shadingN = blended;
             } else {
-                float2 tuv = vUV * scale;
+                // FIT materials sample the texture once across the
+                // face (vUV as authored); others tile by scale.
+                float2 tuv = (mat.flags & FLAG_FIT) ? vUV : vUV * scale;
                 // One-step parallax from the height channel, then
                 // tangent-space normal mapping — light rakes across
                 // the surface relief.
@@ -290,7 +309,25 @@ kernel void pathTraceKernel(
                 if (dot(shadingN, geoN) < 0) shadingN = ns;
             }
         }
-        (void)texRough;
+
+        // ---- Weather + gloss (v3). Texture roughness finally
+        // shades: gloss = 1 - roughness for textured surfaces.
+        // Wetness darkens up-facing surfaces and raises their
+        // gloss; snow whitens them, kills the gloss, and pulls
+        // the shading normal toward the geometric up-face.
+        float upFace = smoothstep(0.5f, 0.85f, geoN.y);
+        float wet = u.wetLevel * upFace;
+        float snowC = u.snowLevel * upFace;
+        float gloss = (mat.texIndex > 0) ? clamp(1.0f - texRough, 0.0f, 1.0f) : 0.0f;
+        if (wet > 0.001f) {
+            albedo *= (1.0f - 0.45f * wet);
+            gloss = max(gloss, wet * 0.85f);
+        }
+        if (snowC > 0.001f) {
+            albedo = mix(albedo, float3(0.88f, 0.91f, 0.97f), snowC * 0.92f);
+            gloss *= (1.0f - snowC);
+            shadingN = normalize(mix(shadingN, geoN, snowC * 0.6f));
+        }
 
         // ---- Glass: reflect / refract with Fresnel. Past the
         // refraction budget the surface falls through to diffuse
@@ -380,13 +417,34 @@ kernel void pathTraceKernel(
             }
         }
 
-        // ---- Diffuse bounce.
+        // ---- Diffuse bounce, with a glossy sheen roll for wet
+        // or low-roughness textured surfaces: with probability
+        // pSpec (Fresnel- and gloss-driven) the bounce goes
+        // specular instead — a jittered reflection, tinted only
+        // partway toward the albedo, and allowed to count
+        // emissive hits directly on the next segment.
         float3 newDir = cosineDirection(shadingN, rng);
-        throughput *= albedo;
+        float3 bounceTint = albedo;
+        bool bounceSpecular = false;
+        if (gloss > 0.02f) {
+            float cosI = clamp(dot(-ray.direction, shadingN), 0.0f, 1.0f);
+            float fres = fresnelSchlick(cosI, 0.04f);
+            float pSpec = clamp(gloss * (0.25f + 0.75f * fres) * 1.6f, 0.0f, 0.85f);
+            if (rng.nextFloat() < pSpec) {
+                float3 specDir = jitterDirection(reflect(ray.direction, shadingN),
+                                                 (1.0f - gloss) * 0.35f, rng);
+                if (dot(specDir, shadingN) > 0.0f) {
+                    newDir = specDir;
+                    bounceTint = mix(float3(1.0f), albedo, 0.45f) * (0.35f + 0.65f * gloss);
+                    bounceSpecular = true;
+                }
+            }
+        }
+        throughput *= bounceTint;
         ray.origin = hitPos + geoN * 0.0015f;
         ray.direction = newDir;
         ray.min_distance = 0.0f;
-        prevSpecular = false;
+        prevSpecular = bounceSpecular;
 
         // Russian roulette once the path is deep.
         if (bounce >= 3) {
@@ -396,11 +454,29 @@ kernel void pathTraceKernel(
         }
     }
 
+    // Firefly clamp (v3): cap this sample against the pixel's
+    // own running average before it lands, so a single hot path
+    // can't blow out a pixel that has otherwise settled. Young
+    // pixels (no trustworthy average yet) get a generous fixed
+    // cap; a settled pixel's own average is high, so legitimate
+    // bright content is not biased down.
+    float4 prevA = accum.read(pixel);
+    float capLum;
+    if (prevA.a > 0.5f) {
+        float3 avg = prevA.rgb / prevA.a;
+        capLum = max(max(avg.x, max(avg.y, avg.z)) * 6.0f, 1.5f);
+    } else {
+        capLum = 30.0f;
+    }
+    float sampleLum = max(max(radiance.x, max(radiance.y, radiance.z)), 0.0f);
+    if (sampleLum > capLum && sampleLum > 0.0f) {
+        radiance *= capLum / sampleLum;
+    }
+
     // Accumulate: alpha tracks the effective sample count. At the
     // history cap, decay the stored sum so it becomes a moving
     // average over the last `historyCap` samples (Play mode and
     // in-motion frames stay smooth instead of freezing or noising).
-    float4 prevA = accum.read(pixel);
     float a = prevA.a;
     float3 rgb = prevA.rgb;
     if (a >= u.historyCap) {
@@ -416,12 +492,18 @@ kernel void pathTraceKernel(
 // One jitterless primary ray per pixel. Writes (worldPos, reusable)
 // where reusable = 1 for diffuse and emissive first hits (their
 // radiance is view-independent) and 0 for glass, environment, and
-// misses (view-dependent: always traced fresh).
+// misses (view-dependent: always traced fresh). Also writes the
+// guideNormal texture (v3): the interpolated vertex normal at the
+// same hit (shading-agnostic — no texture normal mapping), with
+// the same reusable flag in w; the spatial denoise pass uses it
+// to stop blur crossing surface orientations.
 
 kernel void guideKernel(
     texture2d<float, access::write> guide [[texture(0)]],
+    texture2d<float, access::write> guideNormal [[texture(1)]],
     constant Uniforms& u [[buffer(0)]],
     device const float* positions [[buffer(1)]],
+    device const float* normals [[buffer(2)]],
     device const uint* indices [[buffer(5)]],
     device const uint* triMat [[buffer(6)]],
     device const Material* materials [[buffer(7)]],
@@ -447,6 +529,7 @@ kernel void guideKernel(
     auto hit = isect.intersect(ray, accel);
     if (hit.type == intersection_type::none) {
         guide.write(float4(0, 0, 0, 0), pixel);
+        guideNormal.write(float4(0, 0, 0, 0), pixel);
         return;
     }
     uint tri = hit.primitive_id;
@@ -458,9 +541,91 @@ kernel void guideKernel(
     float bc2 = hit.triangle_barycentric_coord.y;
     float bc0 = 1.0f - bc1 - bc2;
     float3 hitPos = p0 * bc0 + p1 * bc1 + p2 * bc2;
+    float3 nInterp = normalize(
+        float3(normals[3 * i0], normals[3 * i0 + 1], normals[3 * i0 + 2]) * bc0 +
+        float3(normals[3 * i1], normals[3 * i1 + 1], normals[3 * i1 + 2]) * bc1 +
+        float3(normals[3 * i2], normals[3 * i2 + 1], normals[3 * i2 + 2]) * bc2);
     Material mat = materials[triMat[tri]];
     float reusable = (mat.flags & FLAG_GLASS) ? 0.0f : 1.0f;
     guide.write(float4(hitPos, reusable), pixel);
+    guideNormal.write(float4(nInterp, reusable), pixel);
+}
+
+// MARK: - Spatial denoise kernel (v3: interactive anti-sparkle)
+//
+// A 3x3 cross-bilateral filter over the accumulation, guided by
+// the primary-hit position, the interpolated surface normal, and
+// luminance. Neighbours blend only within the same reusability
+// class (diffuse/emissive vs glass/environment), so the filter
+// never smears across glass or silhouette edges. The blend fades
+// out as a pixel's sample count climbs toward ~96, handing over
+// to the raw (unbiased) image; the renderer only runs this pass
+// for interactive / Play display and always shows the settled
+// frame raw. Output keeps the accumulated-sum convention
+// (rgb = mean * alpha) so the tonemap is unchanged.
+
+struct DenoiseUniforms {
+    float3 camOrigin;
+    float strength;
+    float pad0;
+    float pad1;
+};
+
+static float denoiseLuminance(float3 c) {
+    return dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+kernel void denoiseKernel(
+    texture2d<float, access::read> accum [[texture(0)]],
+    texture2d<float, access::read> guide [[texture(1)]],
+    texture2d<float, access::read> guideNormal [[texture(2)]],
+    texture2d<float, access::write> output [[texture(3)]],
+    constant DenoiseUniforms& u [[buffer(0)]],
+    uint2 pixel [[thread_position_in_grid]])
+{
+    uint width = accum.get_width();
+    uint height = accum.get_height();
+    if (pixel.x >= width || pixel.y >= height) return;
+
+    float4 c = accum.read(pixel);
+    if (c.a < 1.0f) {
+        output.write(c, pixel);
+        return;
+    }
+    float3 mean = c.rgb / max(c.a, 1.0f);
+    float4 gc = guide.read(pixel);
+    float3 nc = guideNormal.read(pixel).xyz;
+    float lumC = denoiseLuminance(mean);
+    // Position tolerance scales with distance from the camera.
+    float sp = max(0.04f, 0.012f * distance(u.camOrigin, gc.xyz));
+
+    float3 sum = float3(0);
+    float wSum = 0.0f;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int2 np = int2(pixel) + int2(dx, dy);
+            if (np.x < 0 || np.y < 0 || np.x >= int(width) || np.y >= int(height)) continue;
+            float4 g = guide.read(uint2(np));
+            if (g.w != gc.w) continue; // same reusability class only
+            float4 nAcc = accum.read(uint2(np));
+            if (nAcc.a < 1.0f) continue;
+            float3 meanN = nAcc.rgb / max(nAcc.a, 1.0f);
+            float3 nn = guideNormal.read(uint2(np)).xyz;
+            float3 dp = g.xyz - gc.xyz;
+            float wp = exp(-dot(dp, dp) / (2.0f * sp * sp));
+            float wn = pow(clamp(dot(nc, nn), 0.0f, 1.0f), 6.0f);
+            float wl = exp(-abs(denoiseLuminance(meanN) - lumC) / (0.12f + 0.25f * lumC));
+            float ws = (dx == 0 && dy == 0) ? (4.0f / 16.0f)
+                     : ((dx == 0 || dy == 0) ? (2.0f / 16.0f) : (1.0f / 16.0f));
+            float w = wp * wn * wl * ws;
+            sum += meanN * w;
+            wSum += w;
+        }
+    }
+    float3 filtered = wSum > 1e-6f ? sum / wSum : mean;
+    float fade = clamp(1.0f - c.a / 96.0f, 0.0f, 1.0f);
+    float3 blended = mix(mean, filtered, u.strength * fade);
+    output.write(float4(blended * c.a, c.a), pixel);
 }
 
 // MARK: - Reprojection kernel (seed current accumulation from history)
@@ -572,4 +737,117 @@ fragment float4 tonemapFragment(VSOut in [[stage_in]],
     c = aces(c * p.exposure);
     c = pow(c, float3(1.0f / 2.2f));
     return float4(c, 1.0f);
+}
+
+// MARK: - Precipitation overlay (v3: rain / snow, live draw only)
+//
+// Procedural particles in a camera-centred box, generated purely
+// from the vertex id — no buffers. Each particle is a camera-
+// aware quad (two triangles, 6 vertices): rain is a short streak
+// aligned to its fall velocity; snow is a camera-facing soft
+// sprite. Projection is manual (same basis maths as the primary
+// ray) and the pass has no depth attachment, so particles simply
+// blend over the tonemapped frame in draw order.
+
+struct PrecipUniforms {
+    float3 camOrigin;
+    float3 camRight;
+    float3 camUp;
+    float3 camForward;
+    float2 tanFovAspect; // x: tan(half vertical fov), y: aspect
+    float time;
+    uint mode;           // 1 = rain, 2 = snow
+};
+
+struct PrecipOut {
+    float4 pos [[position]];
+    float2 uv;
+    float fade;
+    float kind; // 1 rain, 2 snow (mirrors PrecipUniforms.mode)
+};
+
+static float precipHash(uint x) {
+    return float(hash32(x) >> 8) * (1.0f / 16777216.0f);
+}
+
+vertex PrecipOut precipVertex(uint vid [[vertex_id]],
+                              constant PrecipUniforms& u [[buffer(0)]]) {
+    PrecipOut out;
+    out.uv = float2(0);
+    out.fade = 0.0f;
+    out.kind = float(u.mode);
+    out.pos = float4(3.0f, 3.0f, 0.5f, 1.0f); // clipped until proven visible
+
+    uint inst = vid / 6u;
+    uint corner = vid % 6u;
+    // Quad corners: (-1,-1) (1,-1) (-1,1) (-1,1) (1,-1) (1,1).
+    float cx = (corner == 1u || corner == 4u || corner == 5u) ? 1.0f : -1.0f;
+    float cy = (corner == 2u || corner == 3u || corner == 5u) ? 1.0f : -1.0f;
+    out.uv = float2(cx * 0.5f + 0.5f, cy * 0.5f + 0.5f);
+
+    bool rain = u.mode == 1u;
+    float3 box = rain ? float3(36.0f, 22.0f, 36.0f) : float3(34.0f, 20.0f, 34.0f);
+    float hSpeed = precipHash(inst * 5u + 3u);
+    float speed = rain ? (10.0f + hSpeed * 3.0f) : (1.0f + hSpeed * 0.9f);
+    float3 wind = float3(1.2f, 0.0f, 0.4f);
+
+    float3 base = float3(precipHash(inst * 5u + 0u),
+                         precipHash(inst * 5u + 1u),
+                         precipHash(inst * 5u + 2u));
+    float3 p = base * box;
+    p.y = mod(p.y - u.time * speed, box.y);
+    if (!rain) {
+        float phase = precipHash(inst * 5u + 4u) * 6.2831853f;
+        p.x += sin(u.time * 0.8f + phase) * 0.35f;
+    }
+    // Box is centred on the camera in xz; y runs from 2 m below
+    // the camera to box.y - 2 above it.
+    float3 centre = float3(u.camOrigin.x + (p.x - box.x * 0.5f),
+                           u.camOrigin.y - 2.0f + p.y,
+                           u.camOrigin.z + (p.z - box.z * 0.5f));
+
+    float3 centreRel = centre - u.camOrigin;
+    float centreDist = length(centreRel);
+    float centreZ = dot(centreRel, u.camForward);
+    if (centreZ < 0.3f) return out; // behind / too close: degenerate
+
+    float3 world;
+    if (rain) {
+        float3 axis = normalize(float3(wind.x, -speed, wind.z));
+        float3 viewDir = centreDist > 1e-4f ? centreRel / centreDist : u.camForward;
+        float3 sideRaw = cross(axis, viewDir);
+        float sideLen = length(sideRaw);
+        float3 side = sideLen > 1e-4f ? sideRaw / sideLen : u.camRight;
+        world = centre + side * (cx * 0.014f * 0.5f) + axis * (cy * 0.5f * 0.5f);
+    } else {
+        float size = 0.05f + precipHash(inst * 5u + 4u) * 0.05f;
+        world = centre + u.camRight * (cx * size * 0.5f) + u.camUp * (cy * size * 0.5f);
+    }
+
+    float3 rel = world - u.camOrigin;
+    float z = dot(rel, u.camForward);
+    float tanF = u.tanFovAspect.x;
+    float2 ndc = float2(dot(rel, u.camRight) / (z * tanF * u.tanFovAspect.y),
+                        dot(rel, u.camUp) / (z * tanF));
+    out.pos = float4(ndc.x, ndc.y, 0.5f, 1.0f);
+
+    float farDist = rain ? 30.0f : 28.0f;
+    float fadeFar = 1.0f - smoothstep(farDist * 0.65f, farDist, centreDist);
+    float fadeNear = smoothstep(0.0f, 1.2f, centreDist);
+    out.fade = fadeFar * fadeNear;
+    return out;
+}
+
+fragment float4 precipFragment(PrecipOut in [[stage_in]]) {
+    if (in.kind < 1.5f) {
+        // Rain: faint blue-grey streak, fading along its length.
+        float lengthFade = sin(3.14159265f * clamp(in.uv.y, 0.0f, 1.0f));
+        float alpha = 0.30f * lengthFade * in.fade;
+        return float4(float3(0.72f, 0.80f, 0.95f), alpha);
+    }
+    // Snow: soft radial disc.
+    float d = length(in.uv - float2(0.5f)) * 2.0f;
+    float disc = 1.0f - smoothstep(0.35f, 1.0f, d);
+    float alpha = 0.9f * disc * in.fade;
+    return float4(float3(0.93f, 0.96f, 1.0f), alpha);
 }

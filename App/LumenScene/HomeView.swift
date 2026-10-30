@@ -8,6 +8,7 @@ struct HomeView: View {
     var onOpen: (UUID) -> Void
 
     @State private var metas: [ProjectMeta] = []
+    @State private var showDesigner = false
     @State private var renameTarget: ProjectMeta?
     @State private var renameText: String = ""
     @State private var deleteTarget: ProjectMeta?
@@ -22,6 +23,12 @@ struct HomeView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button {
+                    showDesigner = true
+                } label: {
+                    Label("Texture Designer", systemImage: "paintpalette")
+                }
+                .buttonStyle(.bordered)
                 Button {
                     let p = Project(name: "Untitled Project")
                     ProjectStore.saveProject(p, thumbnailPNG: nil)
@@ -54,6 +61,9 @@ struct HomeView: View {
         }
         .background(Color(white: 0.07))
         .onAppear { reload() }
+        .sheet(isPresented: $showDesigner) {
+            TextureDesignerView()
+        }
         .alert("Rename Project", isPresented: renameBinding) {
             TextField("Name", text: $renameText)
             Button("Save") {

@@ -31,6 +31,11 @@ final class EditorSession: ObservableObject {
 
     var pressedKeys: Set<MoveKey> = []
 
+    /// Touch joystick vector (Play mode): x = strafe right,
+    /// y = forward, each in -1...1.
+    var touchVector = SIMD2<Float>(0, 0)
+    var touchActive: Bool { simd_length(touchVector) > 0.02 }
+
     /// The live viewport (set by the view's coordinator). Draws
     /// happen only when kicked — see kickRender().
     weak var viewport: MTKView?
@@ -46,6 +51,7 @@ final class EditorSession: ObservableObject {
             }
         }
         renderer.onNeedsFrame = { [weak self] in self?.kickRender() }
+        _ = renderer.reloadTextureArraysIfNeeded()
         renderer.rebuild(scene: project.scene, meshes: meshes)
         if !renderer.rayTracingSupported {
             status = "This device does not support Metal ray tracing."
@@ -62,7 +68,8 @@ final class EditorSession: ObservableObject {
     }
 
     func wantsFrame() -> Bool {
-        renderer.frameWanted || !pressedKeys.isEmpty
+        renderer.frameWanted || !pressedKeys.isEmpty || touchActive
+            || project.scene.weather.mode != 0
     }
 
     /// Camera input happened (orbit / pan / zoom / focus / mode
@@ -197,17 +204,30 @@ final class EditorSession: ObservableObject {
 
     // MARK: Manipulation preview + viewport drag-move
 
-    /// While an object is being moved, it renders cheap: an
-    /// emissive object casts no light and a glass object renders
-    /// opaque (Sean's ask). Restores in full when the move ends.
-    /// Goes through the material-only path — no AS rebuild.
-    func setManipulationPreview(_ id: UUID?) {
-        guard renderer.previewObjectID != id else { return }
-        renderer.previewObjectID = id
+    /// The object currently being dragged (viewport drag or
+    /// transform slider), if any. While a drag is active the
+    /// render is cheap: ALL stage light is cut (renderer.lightsCut
+    /// zeroes every emissive flag, so nothing casts light) and the
+    /// dragged object additionally gets the v2 preview treatment
+    /// (a glass object renders opaque via previewObjectID).
+    /// Everything restores in full when the drag ends.
+    private var dragPreviewID: UUID?
+
+    /// Push the current drag state into the renderer and refresh
+    /// through the material-only path — no AS rebuild.
+    private func applyDragRenderState() {
+        renderer.previewObjectID = dragPreviewID
+        renderer.lightsCut = (dragPreviewID != nil)
         if !renderer.updateMaterialsOnly(scene: project.scene, meshes: meshes) {
             renderer.rebuild(scene: project.scene, meshes: meshes)
         }
         kickRender()
+    }
+
+    /// Back-compat wrapper: sets/clears the drag render state.
+    func setManipulationPreview(_ id: UUID?) {
+        dragPreviewID = id
+        applyDragRenderState()
     }
 
     /// Hook for transform sliders (position / rotation / scale /
@@ -216,10 +236,11 @@ final class EditorSession: ObservableObject {
     func transformDragChanged(_ editing: Bool, objectID: UUID) {
         if editing {
             beginEdit()
-            setManipulationPreview(objectID)
+            dragPreviewID = objectID
         } else {
-            setManipulationPreview(nil)
+            dragPreviewID = nil
         }
+        applyDragRenderState()
     }
 
     private var dragState: (id: UUID, planeY: Float, grabOffset: SIMD2<Float>)?
@@ -237,7 +258,8 @@ final class EditorSession: ObservableObject {
         guard t > 0 else { return false }
         let grab = origin + dir * t
         beginEdit()
-        setManipulationPreview(id)
+        dragPreviewID = id
+        applyDragRenderState()
         dragState = (id, planeY, SIMD2<Float>(Float(obj.transform.position[0]) - grab.x,
                                               Float(obj.transform.position[2]) - grab.z))
         return true
@@ -261,7 +283,8 @@ final class EditorSession: ObservableObject {
     func endObjectDrag() {
         guard dragState != nil else { return }
         dragState = nil
-        setManipulationPreview(nil)
+        dragPreviewID = nil
+        applyDragRenderState()
     }
 
     // MARK: Editing operations
@@ -396,11 +419,31 @@ final class EditorSession: ObservableObject {
 
     func toggleMode() {
         pressedKeys.removeAll() // a held key must not survive the switch
+        touchVector = .zero // a stuck joystick must not survive either
         mode = (mode == .edit) ? .play : .edit
         renderer.resetAccumulation()
         noteCameraActivity()
         status = mode == .play ? "Play mode — walk around. Pause to edit."
                                 : "Edit mode."
+    }
+
+    // MARK: Weather
+
+    /// Set the precipitation mode (0 off, 1 rain, 2 snow). Scene
+    /// state, but NOT undoable — undo snapshots only cover objects,
+    /// so no beginEdit() here.
+    func setWeatherMode(_ mode: Int) {
+        project.scene.weather.mode = mode
+        kickRender()
+    }
+
+    /// Clear rain wetness / snow cover back to dry ground.
+    func clearWeatherBuildup() {
+        project.scene.weather.wetness = 0
+        project.scene.weather.snow = 0
+        renderer.resetAccumulation()
+        kickRender()
+        status = "Ground build-up cleared."
     }
 
     // MARK: Per-frame: keyboard movement + camera
@@ -410,7 +453,25 @@ final class EditorSession: ObservableObject {
         defer { lastTick = now }
         let dt = lastTick.map { Float(now - $0) } ?? 0
         if dt > 0 && dt < 0.25 { applyMovement(dt: dt) }
+        // Weather build-up advances with real time while it is
+        // precipitating: rain wets the ground over ~75 s and melts
+        // snow slowly; snow covers the ground over ~100 s.
+        if project.scene.weather.mode != 0, dt > 0, dt <= 0.25 {
+            switch project.scene.weather.mode {
+            case 1:
+                project.scene.weather.wetness = min(1, project.scene.weather.wetness + Double(dt) / 75)
+                project.scene.weather.snow = max(0, project.scene.weather.snow - Double(dt) / 300)
+            case 2:
+                project.scene.weather.snow = min(1, project.scene.weather.snow + Double(dt) / 100)
+            default:
+                break
+            }
+        }
+        renderer.weatherMode = project.scene.weather.mode
+        renderer.weatherWet = Float(project.scene.weather.wetness)
+        renderer.weatherSnow = Float(project.scene.weather.snow)
         let moving = !pressedKeys.isEmpty
+            || touchActive
             || (now - lastCameraActivity) < 0.35
             || isDraggingObject
         let basis = mode == .play ? project.scene.camera.playBasis()
@@ -422,7 +483,7 @@ final class EditorSession: ObservableObject {
     private var lastTick: CFTimeInterval?
 
     private func applyMovement(dt: Float) {
-        guard !pressedKeys.isEmpty else { return }
+        guard !pressedKeys.isEmpty || touchActive else { return }
         var cam = project.scene.camera
         var moved = false
         let fwdKey = pressedKeys.contains(.w) || pressedKeys.contains(.up)
@@ -438,9 +499,17 @@ final class EditorSession: ObservableObject {
             let yaw = Float(cam.playYaw) * .pi / 180
             let f = SIMD2<Float>(-sin(yaw), -cos(yaw))     // XZ forward
             let r = SIMD2<Float>(cos(yaw), -sin(yaw))      // XZ right... (perp of f)
-            var delta = f * Float(fwdAmt) + r * Float(sideAmt)
-            if simd_length(delta) > 0 {
-                delta = simd_normalize(delta) * speed * dt
+            // Keys and the touch joystick combine; an over-long
+            // combined vector is normalised so diagonals and a
+            // full key+stick push don't run faster than `speed`,
+            // while a partial stick push stays proportional.
+            let fwdAmtF = Float(fwdAmt) + touchVector.y
+            let sideAmtF = Float(sideAmt) + touchVector.x
+            var moveVec = SIMD2<Float>(sideAmtF, fwdAmtF)
+            let moveLen = simd_length(moveVec)
+            if moveLen > 1 { moveVec /= moveLen }
+            if simd_length(moveVec) > 0 {
+                let delta = (f * moveVec.y + r * moveVec.x) * speed * dt
                 cam.playPosition[0] += Double(delta.x)
                 cam.playPosition[2] += Double(delta.y)
                 moved = true

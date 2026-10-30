@@ -23,6 +23,9 @@
 //     under ~2 s on an A-series CPU.
 
 import Foundation
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 
 // MARK: - Public contract
 
@@ -36,18 +39,70 @@ struct PBRTextureSet {
 enum TextureGen {
     static let presetNames = ["concrete", "cement", "brick"]
 
-    /// Builds the texture set for `preset` (one of `presetNames`).
-    /// Unknown names fall back to "concrete"; callers are expected to
-    /// pass a value from `presetNames`.
+    /// Road designs. These are fit-mapped (MaterialProps.textureFit):
+    /// the whole 512x512 design spans one face, so unlike the material
+    /// presets they are not required to tile. Road direction runs
+    /// along v — top to bottom of the texture.
+    static let roadNames = ["road-highway", "road-normal", "road-intersection", "road-crosswalk", "road-roundabout"]
+
+    /// Every slice the renderer should build a texture array from:
+    /// material presets first, then roads.
+    static func allSliceNames() -> [String] { presetNames + roadNames }
+
+    static func isRoad(_ name: String) -> Bool { roadNames.contains(name) }
+
+    static func displayName(_ name: String) -> String {
+        switch name {
+        case "concrete": return "Concrete"
+        case "cement": return "Cement"
+        case "brick": return "Brick"
+        case "road-highway": return "Highway"
+        case "road-normal": return "Road"
+        case "road-intersection": return "Intersection"
+        case "road-crosswalk": return "Crosswalk"
+        case "road-roundabout": return "Roundabout"
+        default: return name
+        }
+    }
+
+    /// Builds the texture set for `preset` (one of `presetNames` or
+    /// `roadNames`). Unknown names fall back to "concrete"; callers are
+    /// expected to pass a value from `allSliceNames()`.
     static func makeSet(preset: String) -> PBRTextureSet {
         switch preset {
         case "cement":
             return makeCement()
         case "brick":
             return makeBrick()
+        case "road-highway":
+            return makeRoadHighway()
+        case "road-normal":
+            return makeRoadNormal()
+        case "road-intersection":
+            return makeRoadIntersection()
+        case "road-crosswalk":
+            return makeRoadCrosswalk()
+        case "road-roundabout":
+            return makeRoadRoundabout()
         default: // "concrete", plus any unexpected name
             return makeConcrete()
         }
+    }
+
+    /// Builds a PBR set from caller-supplied per-pixel fields (the
+    /// Texture Designer's painted channels), deriving normals from
+    /// `height` exactly like the procedural presets do.
+    /// - Parameters:
+    ///   - albedo: interleaved RGB floats in 0..1, `size*size*3` values.
+    ///   - height: height floats in 0..1, `size*size` values.
+    ///   - roughness: roughness floats in 0..1, `size*size` values.
+    static func makeCustomSet(size: Int,
+                              albedo: [Double],
+                              height: [Double],
+                              roughness: [Double],
+                              normalStrength: Double) -> PBRTextureSet {
+        buildSet(size: size, albedo: albedo, height: height,
+                 roughness: roughness, normalStrength: normalStrength)
     }
 
     // MARK: - PRNG (SplitMix64)
@@ -207,7 +262,7 @@ enum TextureGen {
     ///   - roughness: roughness floats in 0..1, `size*size` values.
     ///   - normalStrength: scales the height gradient. Brick uses a large
     ///     value (deep mortar joints), cement a small one (nearly flat).
-    private static func buildSet(size: Int,
+    static func buildSet(size: Int,
                                  albedo: [Double],
                                  height: [Double],
                                  roughness: [Double],
@@ -531,5 +586,379 @@ enum TextureGen {
                         height: height,
                         roughness: roughness,
                         normalStrength: 3.0) // strong: deep mortar joints
+    }
+
+    // MARK: - Roads
+    //
+    // Roads share an asphalt field and a worn-paint marking pass.
+    // They are fit-mapped (one whole design per face), so they do not
+    // need to tile. Coordinate convention: u runs right, v runs DOWN
+    // the texture (v = 0 is the far side); the road direction runs
+    // along v, top to bottom.
+
+    /// Per-pixel fields for a road, plus a `wear` noise field used to
+    /// erode painted markings so the paint looks worn, not printed.
+    private struct RoadFields {
+        var albedo: [Double]
+        var height: [Double]
+        var roughness: [Double]
+        var wear: [Double]
+    }
+
+    /// Asphalt: ~0.16–0.22 grey with fbm tone and speckle,
+    /// roughness 0.92–0.97, height ~0.5 ± speckle.
+    private static func makeRoadFields(seed: UInt64) -> RoadFields {
+        let size = 512
+        let count = size * size
+        var rng = SplitMix64(seed: seed)
+        let tone = FBMNoise(basePeriod: 4, octaves: 3, rng: &rng)
+        let wearNoise = FBMNoise(basePeriod: 8, octaves: 2, rng: &rng)
+        let speckle = makeSpeckle(count: count, rng: &rng)
+
+        var fields = RoadFields(albedo: [Double](repeating: 0, count: count * 3),
+                                height: [Double](repeating: 0, count: count),
+                                roughness: [Double](repeating: 0, count: count),
+                                wear: [Double](repeating: 0, count: count))
+        for y in 0 ..< size {
+            for x in 0 ..< size {
+                let index = y * size + x
+                let u = (Double(x) + 0.5) / Double(size)
+                let v = (Double(y) + 0.5) / Double(size)
+                let t = tone.sample(u: u, v: v)
+                let grain = speckle[index]
+                let grey = clamp(0.19 + (t - 0.5) * 0.05 + (grain - 0.5) * 0.04, 0.16, 0.22)
+                fields.albedo[index * 3] = grey
+                fields.albedo[index * 3 + 1] = grey
+                fields.albedo[index * 3 + 2] = grey * 0.99
+                fields.height[index] = clamp01(0.5 + (grain - 0.5) * 0.1)
+                fields.roughness[index] = clamp(0.945 + (t - 0.5) * 0.04, 0.92, 0.97)
+                fields.wear[index] = wearNoise.sample(u: u, v: v)
+            }
+        }
+        return fields
+    }
+
+    /// Paints one marking pixel, worn: the paint only survives where
+    /// the wear noise clears the threshold, so edges look eroded.
+    /// Paint is smoother (roughness 0.72) and slightly raised (+0.03).
+    private static func paintMarking(_ fields: inout RoadFields, index: Int,
+                                     red: Double, green: Double, blue: Double) {
+        guard fields.wear[index] > 0.25 else { return }
+        fields.albedo[index * 3] = red
+        fields.albedo[index * 3 + 1] = green
+        fields.albedo[index * 3 + 2] = blue
+        fields.roughness[index] = 0.72
+        fields.height[index] = clamp01(fields.height[index] + 0.03)
+    }
+
+    private static func paintWhite(_ fields: inout RoadFields, index: Int) {
+        paintMarking(&fields, index: index, red: 0.85, green: 0.84, blue: 0.8)
+    }
+
+    private static func paintYellow(_ fields: inout RoadFields, index: Int) {
+        paintMarking(&fields, index: index, red: 0.85, green: 0.65, blue: 0.15)
+    }
+
+    /// True when pixel coordinate `p` lies in a band of `width` px
+    /// centred at `centre` (in px).
+    private static func inBand(_ p: Int, _ centre: Double, _ width: Double) -> Bool {
+        abs(Double(p) - centre) < width / 2.0
+    }
+
+    private static func roadSet(_ fields: RoadFields) -> PBRTextureSet {
+        buildSet(size: 512, albedo: fields.albedo, height: fields.height,
+                 roughness: fields.roughness, normalStrength: 0.8)
+    }
+
+    /// Two lanes along v: dashed white centreline, solid white edges.
+    private static func makeRoadNormal() -> PBRTextureSet {
+        let size = 512
+        var fields = makeRoadFields(seed: 0x20AD_0000_0000_0004)
+        for y in 0 ..< size {
+            for x in 0 ..< size {
+                let index = y * size + x
+                let centreline = inBand(x, 256, 6) && (y % 44) < 24
+                let edge = inBand(x, 0.06 * 512, 6) || inBand(x, 0.94 * 512, 6)
+                if centreline || edge { paintWhite(&fields, index: index) }
+            }
+        }
+        return roadSet(fields)
+    }
+
+    /// Highway: concrete median with yellow edge lines, two lanes
+    /// each side with dashed white dividers and solid shoulders.
+    private static func makeRoadHighway() -> PBRTextureSet {
+        let size = 512
+        var fields = makeRoadFields(seed: 0x20AD_0000_0000_0005)
+        for y in 0 ..< size {
+            for x in 0 ..< size {
+                let index = y * size + x
+                let u = Double(x) / Double(size)
+                // Median strip: lighter concrete-ish grey.
+                if u >= 0.44 && u < 0.56 {
+                    fields.albedo[index * 3] = clamp01(fields.albedo[index * 3] + 0.12)
+                    fields.albedo[index * 3 + 1] = clamp01(fields.albedo[index * 3 + 1] + 0.12)
+                    fields.albedo[index * 3 + 2] = clamp01(fields.albedo[index * 3 + 2] + 0.12)
+                    fields.roughness[index] = 0.9
+                    fields.height[index] = clamp01(fields.height[index] + 0.02)
+                }
+                if inBand(x, 0.44 * 512, 5) || inBand(x, 0.56 * 512, 5) {
+                    paintYellow(&fields, index: index)
+                } else if (inBand(x, 0.22 * 512, 5) || inBand(x, 0.78 * 512, 5)) && (y % 54) < 30 {
+                    paintWhite(&fields, index: index)
+                } else if inBand(x, 0.03 * 512, 5) || inBand(x, 0.97 * 512, 5) {
+                    paintWhite(&fields, index: index)
+                }
+            }
+        }
+        return roadSet(fields)
+    }
+
+    /// Crosswalk: zebra stripes across the full road width, plus the
+    /// usual solid edge lines.
+    private static func makeRoadCrosswalk() -> PBRTextureSet {
+        let size = 512
+        var fields = makeRoadFields(seed: 0x20AD_0000_0000_0006)
+        for y in 0 ..< size {
+            for x in 0 ..< size {
+                let index = y * size + x
+                let u = Double(x) / Double(size)
+                let stripe = (y % 52) < 26 && u >= 0.05 && u < 0.95
+                let edge = inBand(x, 0.04 * 512, 6) || inBand(x, 0.96 * 512, 6)
+                if stripe || edge { paintWhite(&fields, index: index) }
+            }
+        }
+        return roadSet(fields)
+    }
+
+    /// Two roads crossing: vertical road u in [0.28, 0.72], horizontal
+    /// road v in [0.28, 0.72]; darker corner blocks outside the cross,
+    /// stop lines and crosswalks at the four entries, dashed
+    /// centrelines on the approaches.
+    private static func makeRoadIntersection() -> PBRTextureSet {
+        let size = 512
+        var fields = makeRoadFields(seed: 0x20AD_0000_0000_0007)
+        let stripeBands = [56, 78, 100, 400, 422, 444] // 12 px stripes, 3 per entry
+        for y in 0 ..< size {
+            for x in 0 ..< size {
+                let index = y * size + x
+                let u = Double(x) / Double(size)
+                let v = Double(y) / Double(size)
+                let inVertical = u >= 0.28 && u < 0.72
+                let inHorizontal = v >= 0.28 && v < 0.72
+                // Corner blocks: darker, rougher surround asphalt.
+                if !inVertical && !inHorizontal {
+                    fields.albedo[index * 3] *= 0.72
+                    fields.albedo[index * 3 + 1] *= 0.72
+                    fields.albedo[index * 3 + 2] *= 0.72
+                    fields.roughness[index] = clamp01(fields.roughness[index] + 0.03)
+                }
+                // Crosswalk stripes just outside each entry.
+                let zebraAcross = u >= 0.30 && u < 0.70
+                    && stripeBands.contains { y >= $0 && y < $0 + 12 }
+                let zebraAlong = v >= 0.30 && v < 0.70
+                    && stripeBands.contains { x >= $0 && x < $0 + 12 }
+                // Stop lines at the four entries.
+                let stopAcross = u >= 0.30 && u < 0.70
+                    && ((v >= 0.24 && v < 0.28) || (v >= 0.72 && v < 0.76))
+                let stopAlong = v >= 0.30 && v < 0.70
+                    && ((u >= 0.24 && u < 0.28) || (u >= 0.72 && u < 0.76))
+                // Dashed centrelines on the approaches only.
+                let centreV = inBand(x, 256, 5) && !inHorizontal && (y % 44) < 24
+                let centreH = inBand(y, 256, 5) && !inVertical && (x % 44) < 24
+                if zebraAcross || zebraAlong || stopAcross || stopAlong || centreV || centreH {
+                    paintWhite(&fields, index: index)
+                }
+            }
+        }
+        return roadSet(fields)
+    }
+
+    /// Roundabout: raised island, brick-tint apron, circulating
+    /// roadway with a dashed circular lane line, four entry/exit
+    /// stubs, dark surround in the corners.
+    private static func makeRoadRoundabout() -> PBRTextureSet {
+        let size = 512
+        var fields = makeRoadFields(seed: 0x20AD_0000_0000_0008)
+        for y in 0 ..< size {
+            for x in 0 ..< size {
+                let index = y * size + x
+                let dx = Double(x) - 256
+                let dy = Double(y) - 256
+                let r = (dx * dx + dy * dy).squareRoot()
+                let angle = atan2(dy, dx)
+                let onStub = abs(dy) <= 55 || abs(dx) <= 55
+                if r < 78 {
+                    // Island: light concrete, raised.
+                    fields.albedo[index * 3] = 0.55
+                    fields.albedo[index * 3 + 1] = 0.55
+                    fields.albedo[index * 3 + 2] = 0.54
+                    fields.roughness[index] = 0.9
+                    fields.height[index] = 0.62
+                } else if r < 96 {
+                    // Apron ring: brick-ish tint.
+                    fields.albedo[index * 3] = 0.46
+                    fields.albedo[index * 3 + 1] = 0.29
+                    fields.albedo[index * 3 + 2] = 0.23
+                    fields.roughness[index] = 0.9
+                    fields.height[index] = 0.56
+                } else if r > 196 && !onStub {
+                    // Corners: dark asphalt/gravel surround.
+                    fields.albedo[index * 3] = 0.09
+                    fields.albedo[index * 3 + 1] = 0.11
+                    fields.albedo[index * 3 + 2] = 0.08
+                    fields.roughness[index] = 1.0
+                    fields.height[index] = 0.45
+                }
+                // Dashed circular lane line at r = 146 (24-segment dash).
+                let segment = Int(((angle + .pi) / (2.0 * .pi)) * 24.0)
+                if abs(r - 146) < 2.5 && segment % 2 == 0 {
+                    paintWhite(&fields, index: index)
+                }
+                // Outer edge: solid white circle at r = 196.
+                if abs(r - 196) < 2.5 {
+                    paintWhite(&fields, index: index)
+                }
+                // Dashed centrelines on the four stubs.
+                let stubH = abs(dy) < 2.5 && abs(dx) > 196 && (Int(abs(dx)) % 44) < 24
+                let stubV = abs(dx) < 2.5 && abs(dy) > 196 && (Int(abs(dy)) % 44) < 24
+                if stubH || stubV {
+                    paintWhite(&fields, index: index)
+                }
+            }
+        }
+        return roadSet(fields)
+    }
+}
+
+// MARK: - Custom texture store
+//
+// User-painted textures from the Texture Designer live on disk as
+// PNG triplets, one folder per texture:
+//
+//   ProjectStore.texturesRootURL/<uuidString>/
+//     albedo.png  normal.png  data.png  meta.json  ({"name", "size"})
+//
+// The renderer enumerates them with `list()` and loads the set for a
+// material whose texturePreset is "custom:<uuidString>".
+
+enum CustomTextureStore {
+    struct CustomTextureMeta: Identifiable, Equatable {
+        var id: UUID
+        var name: String
+    }
+
+    private struct MetaFile: Codable {
+        var name: String
+        var size: Int
+    }
+
+    private static func dir(_ id: UUID) -> URL {
+        ProjectStore.texturesRootURL.appendingPathComponent(id.uuidString, isDirectory: true)
+    }
+
+    private static func meta(_ id: UUID) -> MetaFile? {
+        let url = dir(id).appendingPathComponent("meta.json")
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(MetaFile.self, from: data)
+    }
+
+    /// All saved custom textures, sorted by name (ties: uuidString).
+    /// Unreadable or malformed entries are skipped.
+    static func list() -> [CustomTextureMeta] {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: ProjectStore.texturesRootURL, includingPropertiesForKeys: nil) else { return [] }
+        var metas: [CustomTextureMeta] = []
+        for entry in entries {
+            guard let id = UUID(uuidString: entry.lastPathComponent),
+                  let m = meta(id) else { continue }
+            metas.append(CustomTextureMeta(id: id, name: m.name))
+        }
+        return metas.sorted {
+            $0.name != $1.name ? $0.name < $1.name : $0.id.uuidString < $1.id.uuidString
+        }
+    }
+
+    /// Loads the saved PNG triplet for `id`; nil on any failure.
+    static func loadSet(id: UUID) -> PBRTextureSet? {
+        let size = meta(id)?.size ?? 512
+        guard size > 0,
+              let albedo = readPNG(dir(id).appendingPathComponent("albedo.png"), size: size),
+              let normal = readPNG(dir(id).appendingPathComponent("normal.png"), size: size),
+              let data = readPNG(dir(id).appendingPathComponent("data.png"), size: size)
+        else { return nil }
+        return PBRTextureSet(size: size, albedo: albedo, normal: normal, data: data)
+    }
+
+    /// Saves `set` under a fresh id; returns the id, or nil on failure
+    /// (the partial folder is removed).
+    static func save(name: String, set: PBRTextureSet) -> UUID? {
+        let id = UUID()
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: dir(id), withIntermediateDirectories: true)
+        } catch { return nil }
+        let ok = writePNG(set.albedo, size: set.size,
+                          to: dir(id).appendingPathComponent("albedo.png"))
+            && writePNG(set.normal, size: set.size,
+                        to: dir(id).appendingPathComponent("normal.png"))
+            && writePNG(set.data, size: set.size,
+                        to: dir(id).appendingPathComponent("data.png"))
+        guard ok,
+              let metaData = try? JSONEncoder().encode(MetaFile(name: name, size: set.size)),
+              (try? metaData.write(to: dir(id).appendingPathComponent("meta.json"),
+                                   options: .atomic)) != nil
+        else {
+            try? fm.removeItem(at: dir(id))
+            return nil
+        }
+        return id
+    }
+
+    static func delete(id: UUID) {
+        try? FileManager.default.removeItem(at: dir(id))
+    }
+
+    // MARK: PNG IO (RGBA8, .premultipliedLast both ways so the
+    // round-trip is symmetric; every texture here has alpha = 255,
+    // so premultiplication is lossless)
+
+    private static func writePNG(_ rgba: Data, size: Int, to url: URL) -> Bool {
+        guard rgba.count == size * size * 4,
+              let provider = CGDataProvider(data: rgba as CFData),
+              let image = CGImage(width: size, height: size,
+                                  bitsPerComponent: 8, bitsPerPixel: 32,
+                                  bytesPerRow: size * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGBitmapInfo(
+                                    rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                                  provider: provider, decode: nil,
+                                  shouldInterpolate: false, intent: .defaultIntent),
+              let dest = CGImageDestinationCreateWithURL(
+                url as CFURL, UTType.png.identifier as CFString, 1, nil)
+        else { return false }
+        CGImageDestinationAddImage(dest, image, nil)
+        return CGImageDestinationFinalize(dest)
+    }
+
+    private static func readPNG(_ url: URL, size: Int) -> Data? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        else { return nil }
+        let storage = NSMutableData(length: size * size * 4)
+        guard let bytes = storage?.mutableBytes,
+              let context = CGContext(data: bytes,
+                                      width: size, height: size,
+                                      bitsPerComponent: 8, bytesPerRow: size * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        // Flip vertically while drawing so the buffer's first row is
+        // the image's top row — the same order writePNG stored.
+        context.translateBy(x: 0, y: CGFloat(size))
+        context.scaleBy(x: 1, y: -1)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: size, height: size))
+        return Data(bytes: bytes, count: size * size * 4)
     }
 }
