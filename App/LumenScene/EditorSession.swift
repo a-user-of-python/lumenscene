@@ -5,6 +5,7 @@
 
 import Foundation
 import SwiftUI
+import MetalKit
 import simd
 
 enum EditorMode { case edit, play }

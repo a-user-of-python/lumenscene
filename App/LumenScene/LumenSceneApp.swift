@@ -5,7 +5,7 @@ import SwiftUI
 
 @main
 struct LumenSceneApp: App {
-    var body: some Scene {
+    var body: some SwiftUI.Scene {
         WindowGroup {
             RootView()
         }
