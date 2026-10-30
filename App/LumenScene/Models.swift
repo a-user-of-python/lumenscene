@@ -130,7 +130,7 @@ struct CameraState: Codable, Equatable {
     var playPitch: Double = 0
 
     /// Orbit camera basis: (origin, forward, right, up).
-    func orbitBasis() -> (SIMD3<Float>, SIMD3<Float>, SIMD3<Float>, SIMD3<Float>) {
+    func orbitBasis() -> (origin: SIMD3<Float>, forward: SIMD3<Float>, right: SIMD3<Float>, up: SIMD3<Float>) {
         let az = Float(azimuth) * .pi / 180
         let el = Float(elevation) * .pi / 180
         let dir = SIMD3<Float>(cos(el) * sin(az), sin(el), cos(el) * cos(az))
@@ -145,7 +145,7 @@ struct CameraState: Codable, Equatable {
     /// Play camera basis from yaw/pitch (yaw 0 = looking -Z... we use
     /// yaw measured so that 180 faces -Z when standing at +Z; forward
     /// is computed directly from yaw/pitch below).
-    func playBasis() -> (SIMD3<Float>, SIMD3<Float>, SIMD3<Float>, SIMD3<Float>) {
+    func playBasis() -> (origin: SIMD3<Float>, forward: SIMD3<Float>, right: SIMD3<Float>, up: SIMD3<Float>) {
         let yaw = Float(playYaw) * .pi / 180
         let pitch = Float(playPitch) * .pi / 180
         // Yaw 0 looks along -Z; positive yaw turns left (toward -X).

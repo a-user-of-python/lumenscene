@@ -276,7 +276,7 @@ final class Renderer {
         geom.indexType = .uint32
         geom.triangleCount = triCount
         geom.opaque = true
-        let desc = MTLAccelerationStructureDescriptor.primitiveAccelerationStructureDescriptor()
+        let desc = MTLPrimitiveAccelerationStructureDescriptor()
         desc.geometryDescriptors = [geom]
         let sizes = device.accelerationStructureSizes(descriptor: desc)
         guard let structure = device.makeAccelerationStructure(size: sizes.accelerationStructureSize),
