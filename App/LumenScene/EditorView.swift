@@ -50,10 +50,23 @@ struct EditorView: View {
         .background(Color(white: 0.09))
         .focusable()
         .focused($kbFocused)
-        .onAppear { kbFocused = true }
+        .onAppear {
+            kbFocused = true
+            session.kickRender()
+        }
         .onKeyPress(phases: .all) { press in handleKey(press) }
         .sheet(isPresented: $showImport) { importSheet }
         .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
+    }
+
+    private var qualityBinding: Binding<Int> {
+        Binding(
+            get: { session.renderer.qualityPreference },
+            set: { newValue in
+                session.renderer.qualityPreference = newValue
+                session.renderer.resetAccumulation()
+                session.kickRender()
+            })
     }
 
     // MARK: Top bar
@@ -86,17 +99,10 @@ struct EditorView: View {
             .buttonStyle(.borderedProminent)
             .help("Play: walk around the scene. Pause: back to editing.")
             Menu {
-                Button("Faster (1 sample/frame)") {
-                    session.renderer.samplesPerFrame = 1
-                    session.renderer.resetAccumulation()
-                }
-                Button("Balanced (2 samples/frame)") {
-                    session.renderer.samplesPerFrame = 2
-                    session.renderer.resetAccumulation()
-                }
-                Button("Smoother (4 samples/frame)") {
-                    session.renderer.samplesPerFrame = 4
-                    session.renderer.resetAccumulation()
+                Picker("Quality", selection: qualityBinding) {
+                    Text("Auto").tag(0)
+                    Text("High detail").tag(1)
+                    Text("Battery saver").tag(2)
                 }
             } label: {
                 Label("Render", systemImage: "wand.and.stars")
@@ -183,7 +189,7 @@ struct EditorView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text(session.mode == .play
                      ? "PLAY — drag to look · WASD to walk · Esc to edit"
-                     : "EDIT — drag orbit · two-finger pan · pinch zoom · WASD/QE move · F focus")
+                     : "EDIT — drag orbit · drag selected object to move it · two-finger pan · pinch zoom · WASD/QE · F focus")
                     .font(.caption.bold())
                     .padding(.horizontal, 8).padding(.vertical, 4)
                     .background(Color.black.opacity(0.55))
@@ -461,7 +467,10 @@ struct ObjectPropertiesView: View {
         HStack(spacing: 8) {
             Text(label).frame(width: 26, alignment: .leading)
             Slider(value: value, in: range) { editing in
-                if editing { session.beginEdit() }
+                // Transform drags run the manipulation preview:
+                // a moved light/glass object renders cheap until
+                // the slider is released.
+                session.transformDragChanged(editing, objectID: objectID)
             }
             Text(String(format: format, value.wrappedValue))
                 .frame(width: 46, alignment: .trailing)
@@ -471,7 +480,8 @@ struct ObjectPropertiesView: View {
     }
 
     private func sliderRow(_ label: String, _ value: Binding<Double>,
-                           _ range: ClosedRange<Double>, _ format: String = "%.2f") -> some View {
+                           _ range: ClosedRange<Double>, _ format: String = "%.2f",
+                           transform: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text(label)
@@ -480,7 +490,11 @@ struct ObjectPropertiesView: View {
             }
             .font(.callout)
             Slider(value: value, in: range) { editing in
-                if editing { session.beginEdit() }
+                if transform {
+                    session.transformDragChanged(editing, objectID: objectID)
+                } else if editing {
+                    session.beginEdit()
+                }
             }
         }
     }
@@ -490,17 +504,17 @@ struct ObjectPropertiesView: View {
         let kind = obj.wrappedValue.primitiveKind
         switch kind {
         case "sphere":
-            sliderRow("Radius", param("r"), 0.05...5)
+            sliderRow("Radius", param("r"), 0.05...5, transform: true)
         case "cylinder":
-            sliderRow("Radius", param("r"), 0.05...5)
-            sliderRow("Height", param("h"), 0.05...10)
+            sliderRow("Radius", param("r"), 0.05...5, transform: true)
+            sliderRow("Height", param("h"), 0.05...10, transform: true)
         case "plane":
-            sliderRow("Width", param("w"), 0.5...30)
-            sliderRow("Depth", param("d"), 0.5...30)
+            sliderRow("Width", param("w"), 0.5...30, transform: true)
+            sliderRow("Depth", param("d"), 0.5...30, transform: true)
         default:
-            sliderRow("Width", param("w"), 0.05...10)
-            sliderRow("Height", param("h"), 0.05...10)
-            sliderRow("Depth", param("d"), 0.05...10)
+            sliderRow("Width", param("w"), 0.05...10, transform: true)
+            sliderRow("Height", param("h"), 0.05...10, transform: true)
+            sliderRow("Depth", param("d"), 0.05...10, transform: true)
         }
     }
 

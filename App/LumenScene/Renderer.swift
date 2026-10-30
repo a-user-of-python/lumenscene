@@ -3,6 +3,26 @@
 // render loop. All scene triangles are baked into world space on
 // the CPU (modest scenes; edits reset accumulation anyway), which
 // keeps the GPU side to one BLAS and one material per object.
+//
+// V2 notes (performance + quality):
+//   * Render-on-change: the view only draws while `frameWanted` —
+//     a static, converged scene costs zero GPU/CPU.
+//   * Rebuild split: material-only edits (colour, emissive, glass
+//     sliders) rewrite the material + emissive-CDF buffers from the
+//     cached CPU geometry and never touch the acceleration
+//     structure — the AS is rebuilt only when geometry changes.
+//   * Temporal reprojection: accumulation lives in ping-pong
+//     textures with a matching pair of "guide" textures (primary
+//     hit world positions). Camera moves reproject the converged
+//     history instead of restarting from noise; the settled image
+//     is rendered at full resolution with a generous sample cap.
+//   * Adaptive quality: resolution scale, samples/frame, bounce
+//     and glass budgets follow motion, the user's quality
+//     preference, and the device thermal state (emergency brake
+//     only — the resting image is always full quality).
+//   * Manipulation preview: `previewObjectID` renders one object
+//     cheap (emissive stops emitting, glass turns opaque) through
+//     the material-only path, so drags stay fluid.
 
 import Foundation
 import Metal
@@ -24,6 +44,18 @@ struct GPUUniforms {
     var emissiveCount: UInt32 = 0
     var totalEmissiveArea: Float = 0
     var envIntensity: Float = 1
+    var historyCap: Float = 768
+    var glassRefractBudget: UInt32 = 4
+}
+
+struct ReprojUniforms {
+    var prevOrigin = SIMD4<Float>(0, 0, 0, 0)
+    var prevRight = SIMD4<Float>(1, 0, 0, 0)
+    var prevUp = SIMD4<Float>(0, 1, 0, 0)
+    var prevForward = SIMD4<Float>(0, 0, -1, 0)
+    var tanFovAspect = SIMD2<Float>(0.7, 1)
+    var reuseCap: Float = 0
+    var pad: Float = 0
 }
 
 struct GPUMaterial {
@@ -52,6 +84,8 @@ final class Renderer {
     let queue: MTLCommandQueue
     let rayTracingSupported: Bool
     private var tracePipeline: MTLComputePipelineState?
+    private var guidePipeline: MTLComputePipelineState?
+    private var reprojectPipeline: MTLComputePipelineState?
     private var tonemapPipeline: MTLRenderPipelineState?
 
     // Scene GPU state.
@@ -69,29 +103,60 @@ final class Renderer {
     private var emissiveCount: Int = 0
     private var totalEmissiveArea: Float = 0
 
-    // CPU copies for picking.
+    // CPU copies for picking + material-only updates.
     private var cpuPositions: [Float] = []
     private var cpuIndices: [UInt32] = []
     private var cpuTriObject: [UUID] = []
+    private var cpuTriMats: [UInt32] = []
+    private var cachedObjectOrder: [UUID] = []
 
     // Procedural texture arrays (built once).
     private var texAlbedo: MTLTexture?
     private var texNormal: MTLTexture?
     private var texData: MTLTexture?
 
-    // Accumulation target for the live view.
-    private var accumTexture: MTLTexture?
+    // Accumulation + guide textures, ping-ponged per frame. The
+    // accumulation alpha channel carries the effective sample
+    // count; guides carry primary-hit world positions (rgba32F).
+    private var accumTex: [MTLTexture?] = [nil, nil]
+    private var guideTex: [MTLTexture?] = [nil, nil]
+    private var curIdx: Int = 0
+    private var historyValid: Bool = false
+    private var prevCamera: CameraBasis?
+    private var prevTanAspect = SIMD2<Float>(0.7, 1)
+    private var frameSeedCounter: UInt32 = 0
+    private var wasMoving: Bool = false
+
     private(set) var sampleCount: UInt32 = 0
-    var samplesPerFrame: Int = 2
-    /// Play mode: clear the accumulation every frame (moving camera).
-    var resetEachFrame: Bool = false
-    var maxBounces: UInt32 = 5
+    private var lastMaxSettle: UInt32 = 768
     var exposure: Float = 1.15
-    var renderScale: Float = 0.75
-    var maxSamples: UInt32 = 512
     var fovY: Float = 55 * .pi / 180
 
-    var converged: Bool { sampleCount >= maxSamples }
+    /// Manipulation preview: this object (if any) renders cheap —
+    /// emissive objects stop emitting, glass renders opaque.
+    var previewObjectID: UUID?
+
+    /// 0 = Auto, 1 = High detail, 2 = Battery saver.
+    var qualityPreference: Int = 0
+    /// ProcessInfo thermal state raw value (0 nominal … 3 critical).
+    private(set) var thermalTier: Int = 0
+    private var thermalObserver: NSObjectProtocol?
+    /// A frame must be (re)presented even if converged (thermal or
+    /// quality change, scene rebuild, first appearance…).
+    private var presentationDirty: Bool = true
+    /// Called when an async event (thermal change) needs a redraw.
+    var onNeedsFrame: (() -> Void)?
+
+    /// True while another draw would change the picture: history
+    /// not built, samples below the settle cap, or a presentation
+    /// is owed. The viewport's frame chain runs only then.
+    var frameWanted: Bool {
+        if presentationDirty { return true }
+        guard accel != nil else { return false }
+        return !historyValid || sampleCount < lastMaxSettle
+    }
+
+    var converged: Bool { sampleCount >= lastMaxSettle }
     var hasGeometry: Bool { accel != nil }
 
     init?() {
@@ -100,9 +165,16 @@ final class Renderer {
         self.device = device
         self.queue = queue
         self.rayTracingSupported = device.supportsRaytracing
+        self.thermalTier = ProcessInfo.processInfo.thermalState.rawValue
         guard let library = device.makeDefaultLibrary() else { return nil }
         if let fn = library.makeFunction(name: "pathTraceKernel") {
             tracePipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "guideKernel") {
+            guidePipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "reprojectKernel") {
+            reprojectPipeline = try? device.makeComputePipelineState(function: fn)
         }
         if let vfn = library.makeFunction(name: "tonemapVertex"),
            let ffn = library.makeFunction(name: "tonemapFragment") {
@@ -112,7 +184,24 @@ final class Renderer {
             desc.colorAttachments[0].pixelFormat = .bgra8Unorm
             tonemapPipeline = try? device.makeRenderPipelineState(descriptor: desc)
         }
+        thermalObserver = NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                guard let self else { return }
+                let tier = ProcessInfo.processInfo.thermalState.rawValue
+                if tier != self.thermalTier {
+                    self.thermalTier = tier
+                    self.presentationDirty = true
+                    self.onNeedsFrame?()
+                }
+            }
         buildTextureArrays()
+    }
+
+    deinit {
+        if let thermalObserver {
+            NotificationCenter.default.removeObserver(thermalObserver)
+        }
     }
 
     // MARK: Texture arrays
@@ -163,6 +252,15 @@ final class Renderer {
     // MARK: Scene building
 
     func rebuild(scene: Scene, meshes: [UUID: MeshData]) {
+        rebuild(scene: scene, meshes: meshes, geometry: true)
+    }
+
+    /// Full geometry rebuild, or — when `geometry` is false — a
+    /// material-only update if the object set is unchanged.
+    func rebuild(scene: Scene, meshes: [UUID: MeshData], geometry: Bool) {
+        if !geometry, updateMaterialsOnly(scene: scene, meshes: meshes) {
+            return
+        }
         var positions: [Float] = []
         var normals: [Float] = []
         var uvArr: [Float] = []
@@ -171,8 +269,7 @@ final class Renderer {
         var triMats: [UInt32] = []
         var materials: [GPUMaterial] = []
         var triObjects: [UUID] = []
-        var emisTris: [UInt32] = []
-        var emisAreas: [Float] = []
+        var objectOrder: [UUID] = []
 
         for obj in scene.objects where obj.visible {
             let local: MeshData
@@ -188,6 +285,7 @@ final class Renderer {
             let world = local.baked(by: obj.transform.matrix)
             let matIndex = UInt32(materials.count)
             materials.append(gpuMaterial(for: obj))
+            objectOrder.append(obj.id)
             let vBase = UInt32(positions.count / 3)
             positions += world.positions
             normals += world.normals
@@ -205,16 +303,66 @@ final class Renderer {
         cpuPositions = positions
         cpuIndices = indices
         cpuTriObject = triObjects
+        cpuTriMats = triMats
+        cachedObjectOrder = objectOrder
 
-        // Emissive triangle list + area CDF (for next-event estimation).
+        uploadEmissiveIndex(materials: materials)
+        matBuffer = makeBuffer(materials)
+
+        posBuffer = makeBuffer(positions)
+        nrmBuffer = makeBuffer(normals)
+        uvBuffer = makeBuffer(uvArr)
+        colBuffer = makeBuffer(colArr)
+        idxBuffer = makeBuffer(indices)
+        triMatBuffer = makeBuffer(triMats)
+
+        buildAccelerationStructure()
+        resetAccumulation()
+    }
+
+    /// Material-only refresh: same objects, same geometry — rewrite
+    /// just the material buffer and the emissive light index (CDF)
+    /// from the cached CPU triangles. Returns false when the object
+    /// set changed and a full rebuild is required.
+    @discardableResult
+    func updateMaterialsOnly(scene: Scene, meshes: [UUID: MeshData]) -> Bool {
+        guard accel != nil, !cpuIndices.isEmpty else { return false }
+        // The included-object list must match the cached geometry
+        // exactly (same inclusion rule as the full rebuild).
+        var candidate: [UUID] = []
+        for obj in scene.objects where obj.visible {
+            if obj.source == "primitive" {
+                candidate.append(obj.id)
+            } else if let m = meshes[obj.id], !m.isEmpty {
+                candidate.append(obj.id)
+            }
+        }
+        guard candidate == cachedObjectOrder else { return false }
+        var materials: [GPUMaterial] = []
+        materials.reserveCapacity(candidate.count)
+        for id in candidate {
+            guard let obj = scene.object(id: id) else { return false }
+            materials.append(gpuMaterial(for: obj))
+        }
+        uploadEmissiveIndex(materials: materials)
+        matBuffer = makeBuffer(materials)
+        resetAccumulation()
+        return true
+    }
+
+    /// Builds the emissive triangle list + area CDF into GPU
+    /// buffers from the cached CPU geometry and a material table.
+    private func uploadEmissiveIndex(materials: [GPUMaterial]) {
+        var emisTris: [UInt32] = []
+        var emisAreas: [Float] = []
         if triCount > 0 {
             for t in 0..<triCount {
-                let m = materials[Int(triMats[t])]
+                let m = materials[Int(cpuTriMats[t])]
                 guard (m.flags & 1) != 0 else { continue }
-                let a = indices[3 * t], b = indices[3 * t + 1], c = indices[3 * t + 2]
-                let p0 = SIMD3<Float>(positions[3 * Int(a)], positions[3 * Int(a) + 1], positions[3 * Int(a) + 2])
-                let p1 = SIMD3<Float>(positions[3 * Int(b)], positions[3 * Int(b) + 1], positions[3 * Int(b) + 2])
-                let p2 = SIMD3<Float>(positions[3 * Int(c)], positions[3 * Int(c) + 1], positions[3 * Int(c) + 2])
+                let a = cpuIndices[3 * t], b = cpuIndices[3 * t + 1], c = cpuIndices[3 * t + 2]
+                let p0 = SIMD3<Float>(cpuPositions[3 * Int(a)], cpuPositions[3 * Int(a) + 1], cpuPositions[3 * Int(a) + 2])
+                let p1 = SIMD3<Float>(cpuPositions[3 * Int(b)], cpuPositions[3 * Int(b) + 1], cpuPositions[3 * Int(b) + 2])
+                let p2 = SIMD3<Float>(cpuPositions[3 * Int(c)], cpuPositions[3 * Int(c) + 1], cpuPositions[3 * Int(c) + 2])
                 let area = 0.5 * simd_length(simd_cross(p1 - p0, p2 - p0))
                 if area > 1e-9 {
                     emisTris.append(UInt32(t))
@@ -227,39 +375,48 @@ final class Renderer {
         var acc: Float = 0
         for a in emisAreas { acc += a; cdf.append(acc) }
         totalEmissiveArea = acc
+        emisTriBuffer = makeBuffer(emisTris)
+        emisCDFBuffer = makeBuffer(cdf)
+    }
 
-        func buf<T>(_ array: [T]) -> MTLBuffer? {
-            if array.isEmpty { return device.makeBuffer(length: 4, options: .storageModeShared) }
-            return array.withUnsafeBytes { raw in
-                device.makeBuffer(bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared)
-            }
+    private func makeBuffer<T>(_ array: [T]) -> MTLBuffer? {
+        if array.isEmpty { return device.makeBuffer(length: 4, options: .storageModeShared) }
+        return array.withUnsafeBytes { raw in
+            device.makeBuffer(bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared)
         }
-        posBuffer = buf(positions)
-        nrmBuffer = buf(normals)
-        uvBuffer = buf(uvArr)
-        colBuffer = buf(colArr)
-        idxBuffer = buf(indices)
-        triMatBuffer = buf(triMats)
-        matBuffer = buf(materials)
-        emisTriBuffer = buf(emisTris)
-        emisCDFBuffer = buf(cdf)
-
-        buildAccelerationStructure()
-        resetAccumulation()
     }
 
     private func gpuMaterial(for obj: SceneObject) -> GPUMaterial {
         let m = obj.material
         var g = GPUMaterial()
-        g.baseColor = SIMD4<Float>(m.baseColor.simd, 0)
+        var base = m.baseColor.simd
+        var flags: UInt32 = 0
+        let previewing = (obj.id == previewObjectID)
+        if m.emissiveOn {
+            if previewing {
+                // Manipulation preview: no light cast; the surface
+                // takes the emissive colour so it still reads as
+                // the same object.
+                base = m.emissiveColor.simd
+            } else {
+                flags |= 1
+            }
+        }
+        if m.glassOn {
+            if previewing {
+                // Manipulation preview: opaque, tinted toward the
+                // glass colour.
+                base = base + (m.tint.simd - base) * 0.4
+            } else {
+                flags |= 2
+            }
+        }
+        if m.triplanar { flags |= 4 }
+        g.baseColor = SIMD4<Float>(base, 0)
         g.emissive = SIMD4<Float>(m.emissiveColor.simd, Float(m.emissiveIntensity))
         g.glassParams = SIMD4<Float>(Float(m.transmission), Float(m.roughness), Float(m.ior), 0)
         g.tint = SIMD4<Float>(m.tint.simd, Float(m.textureScale))
         g.texIndex = Renderer.texIndex(forPreset: m.texturePreset)
-        var flags: UInt32 = 0
-        if m.emissiveOn { flags |= 1 }
-        if m.glassOn { flags |= 2 }
-        if m.triplanar { flags |= 4 }
         g.flags = flags
         return g
     }
@@ -291,11 +448,15 @@ final class Renderer {
         accel = structure
     }
 
-    // MARK: Accumulation / drawing
+    // MARK: Accumulation state
 
+    /// Hard reset: the next frame starts from an empty accumulation
+    /// (scene content changed, quality changed, …). Camera moves do
+    /// NOT call this — they reproject (see draw).
     func resetAccumulation() {
         sampleCount = 0
-        accumTexture = nil // force recreation (clears old samples)
+        historyValid = false
+        presentationDirty = true
     }
 
     private func makeAccumTexture(width: Int, height: Int) -> MTLTexture? {
@@ -307,21 +468,97 @@ final class Renderer {
         return device.makeTexture(descriptor: desc)
     }
 
-    /// Zero the accumulation texture. The trace kernel reads the
-    /// previous contents before adding its sample, so a brand-new
-    /// (uninitialised) texture MUST be cleared first.
+    private func makeGuideTexture(width: Int, height: Int) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba32Float, width: max(width, 1), height: max(height, 1),
+            mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        desc.storageMode = .private
+        return device.makeTexture(descriptor: desc)
+    }
+
+    /// Zero the accumulation texture (alpha = 0: no samples yet).
+    /// The trace kernel reads the previous contents before adding
+    /// its sample, so a brand-new texture MUST be cleared first.
     private func clearAccum(_ accum: MTLTexture, cmd: MTLCommandBuffer) {
         let clearDesc = MTLRenderPassDescriptor()
         clearDesc.colorAttachments[0].texture = accum
         clearDesc.colorAttachments[0].loadAction = .clear
-        clearDesc.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        clearDesc.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         clearDesc.colorAttachments[0].storeAction = .store
         if let cenc = cmd.makeRenderCommandEncoder(descriptor: clearDesc) {
             cenc.endEncoding()
         }
     }
 
-    private func uniforms(camera: CameraBasis, aspect: Float, seed: UInt32) -> GPUUniforms {
+    // MARK: Adaptive quality
+
+    private struct FrameTargets {
+        var scale: Float
+        var spp: Int
+        var bounces: UInt32
+        var glassBudget: UInt32
+        var maxSettle: UInt32
+        /// History weight the reprojection may carry across a
+        /// camera move (at rest: everything — reprojection is the
+        /// identity and accumulation simply continues).
+        var reuseCap: Float
+    }
+
+    private func targets(moving: Bool, play: Bool) -> FrameTargets {
+        var scale: Float = 1.0 // resting: full resolution
+        var spp = 2
+        var bounces: UInt32 = 5
+        var glass: UInt32 = 4
+        var maxSettle: UInt32 = 768
+        switch qualityPreference {
+        case 1: // High detail
+            spp = 3; bounces = 6; glass = 6; maxSettle = 1536
+        case 2: // Battery saver (user-chosen)
+            scale = 0.8; spp = 1; bounces = 4; glass = 3; maxSettle = 256
+        default:
+            break
+        }
+        if play {
+            maxSettle = qualityPreference == 1 ? 128 : (qualityPreference == 2 ? 64 : 96)
+        }
+        var reuseCap = Float(maxSettle)
+        if moving {
+            scale = min(scale, qualityPreference == 2 ? 0.55 : 0.65)
+            spp = qualityPreference == 2 ? 3 : 4
+            bounces = min(bounces, 4)
+            glass = min(glass, 2)
+            reuseCap = play ? 12 : 24
+        }
+        // Thermal state is an emergency brake only.
+        switch thermalTier {
+        case 1:
+            scale *= 0.9
+            maxSettle = min(maxSettle, 512)
+        case 2:
+            scale *= 0.75
+            maxSettle = min(maxSettle, 192)
+            bounces = min(bounces, 4)
+            if !moving { spp = min(spp, 2) }
+        case 3:
+            scale *= 0.6
+            maxSettle = min(maxSettle, 96)
+            bounces = min(bounces, 3)
+            glass = min(glass, 2)
+            spp = min(spp, moving ? 2 : 1)
+        default:
+            break
+        }
+        if moving { reuseCap = min(reuseCap, play ? 12 : 24) }
+        return FrameTargets(scale: scale, spp: spp, bounces: bounces,
+                            glassBudget: glass, maxSettle: maxSettle,
+                            reuseCap: reuseCap)
+    }
+
+    // MARK: Encoding
+
+    private func uniforms(camera: CameraBasis, aspect: Float, seed: UInt32,
+                          bounces: UInt32, cap: Float, glassBudget: UInt32) -> GPUUniforms {
         var u = GPUUniforms()
         u.camOrigin = SIMD4<Float>(camera.origin, 0)
         u.camRight = SIMD4<Float>(camera.right, 0)
@@ -329,18 +566,74 @@ final class Renderer {
         u.camForward = SIMD4<Float>(camera.forward, 0)
         u.tanFovAspect = SIMD2<Float>(tan(fovY / 2), aspect)
         u.frameSeed = seed
-        u.maxBounces = maxBounces
+        u.maxBounces = bounces
         u.triCount = UInt32(triCount)
         u.emissiveCount = UInt32(emissiveCount)
         u.totalEmissiveArea = totalEmissiveArea
         u.envIntensity = 1.0
+        u.historyCap = cap
+        u.glassRefractBudget = glassBudget
         return u
+    }
+
+    private func dispatch(_ enc: MTLComputeCommandEncoder,
+                          pipeline: MTLComputePipelineState,
+                          width: Int, height: Int) {
+        let w = pipeline.threadExecutionWidth
+        let h = pipeline.maxTotalThreadsPerThreadgroup / w
+        enc.dispatchThreads(MTLSize(width: width, height: height, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: w, height: h, depth: 1))
+    }
+
+    private func encodeGuide(guide: MTLTexture, camera: CameraBasis,
+                             cmd: MTLCommandBuffer) -> Bool {
+        guard let guidePipeline, let accel,
+              let posBuffer, let idxBuffer, let triMatBuffer, let matBuffer,
+              let enc = cmd.makeComputeCommandEncoder() else { return false }
+        enc.setComputePipelineState(guidePipeline)
+        enc.setTexture(guide, index: 0)
+        enc.setBuffer(posBuffer, offset: 0, index: 1)
+        enc.setBuffer(idxBuffer, offset: 0, index: 5)
+        enc.setBuffer(triMatBuffer, offset: 0, index: 6)
+        enc.setBuffer(matBuffer, offset: 0, index: 7)
+        enc.setAccelerationStructure(accel, bufferIndex: 10)
+        let aspect = Float(guide.width) / Float(max(guide.height, 1))
+        var u = uniforms(camera: camera, aspect: aspect, seed: 0,
+                         bounces: 0, cap: 0, glassBudget: 0)
+        enc.setBytes(&u, length: MemoryLayout<GPUUniforms>.stride, index: 0)
+        dispatch(enc, pipeline: guidePipeline, width: guide.width, height: guide.height)
+        enc.endEncoding()
+        return true
+    }
+
+    private func encodeReproject(prevAccum: MTLTexture, prevGuide: MTLTexture,
+                                 curGuide: MTLTexture, curAccum: MTLTexture,
+                                 reuseCap: Float, cmd: MTLCommandBuffer) -> Bool {
+        guard let reprojectPipeline, let prevCamera,
+              let enc = cmd.makeComputeCommandEncoder() else { return false }
+        enc.setComputePipelineState(reprojectPipeline)
+        enc.setTexture(prevAccum, index: 0)
+        enc.setTexture(prevGuide, index: 1)
+        enc.setTexture(curGuide, index: 2)
+        enc.setTexture(curAccum, index: 3)
+        var u = ReprojUniforms()
+        u.prevOrigin = SIMD4<Float>(prevCamera.origin, 0)
+        u.prevRight = SIMD4<Float>(prevCamera.right, 0)
+        u.prevUp = SIMD4<Float>(prevCamera.up, 0)
+        u.prevForward = SIMD4<Float>(prevCamera.forward, 0)
+        u.tanFovAspect = prevTanAspect
+        u.reuseCap = reuseCap
+        enc.setBytes(&u, length: MemoryLayout<ReprojUniforms>.stride, index: 0)
+        dispatch(enc, pipeline: reprojectPipeline, width: curGuide.width, height: curGuide.height)
+        enc.endEncoding()
+        return true
     }
 
     /// Encode `count` path-tracing samples into `accum`. Returns false
     /// when there is nothing to trace.
     private func encodeTrace(accum: MTLTexture, camera: CameraBasis,
                              count: Int, seedStart: UInt32,
+                             bounces: UInt32, cap: Float, glassBudget: UInt32,
                              cmd: MTLCommandBuffer) -> Bool {
         guard let tracePipeline, let accel,
               let posBuffer, let nrmBuffer, let uvBuffer, let colBuffer,
@@ -364,65 +657,155 @@ final class Renderer {
         enc.setBuffer(emisCDFBuffer, offset: 0, index: 9)
         enc.setAccelerationStructure(accel, bufferIndex: 10)
         let aspect = Float(accum.width) / Float(max(accum.height, 1))
-        let w = tracePipeline.threadExecutionWidth
-        let h = tracePipeline.maxTotalThreadsPerThreadgroup / w
-        let group = MTLSize(width: w, height: h, depth: 1)
-        let grid = MTLSize(width: accum.width, height: accum.height, depth: 1)
         for i in 0..<count {
-            var u = uniforms(camera: camera, aspect: aspect, seed: seedStart + UInt32(i))
+            var u = uniforms(camera: camera, aspect: aspect,
+                             seed: seedStart + UInt32(i),
+                             bounces: bounces, cap: cap, glassBudget: glassBudget)
             enc.setBytes(&u, length: MemoryLayout<GPUUniforms>.stride, index: 0)
-            enc.dispatchThreads(grid, threadsPerThreadgroup: group)
+            dispatch(enc, pipeline: tracePipeline, width: accum.width, height: accum.height)
         }
         enc.endEncoding()
         return true
     }
 
-    /// One frame for the live MTKView.
-    func draw(view: MTKView, camera: CameraBasis) {
+    private func cameraChanged(_ a: CameraBasis, _ b: CameraBasis) -> Bool {
+        simd_length(a.origin - b.origin) > 1e-5
+            || simd_length(a.forward - b.forward) > 1e-5
+            || simd_length(a.right - b.right) > 1e-5
+            || simd_length(a.up - b.up) > 1e-5
+    }
+
+    /// One frame for the live MTKView. Returns true when another
+    /// frame would still change the picture (the caller chains the
+    /// next draw only then — a converged, untouched scene sleeps).
+    @discardableResult
+    func draw(view: MTKView, camera: CameraBasis, moving: Bool, play: Bool) -> Bool {
+        presentationDirty = false
         guard let drawable = view.currentDrawable,
               let passDesc = view.currentRenderPassDescriptor,
-              let cmd = queue.makeCommandBuffer() else { return }
-        let pixelW = Int(Float(view.drawableSize.width) * renderScale)
-        let pixelH = Int(Float(view.drawableSize.height) * renderScale)
-        if accumTexture == nil || accumTexture!.width != pixelW || accumTexture!.height != pixelH {
-            accumTexture = makeAccumTexture(width: pixelW, height: pixelH)
+              let cmd = queue.makeCommandBuffer(),
+              view.drawableSize.width > 0, view.drawableSize.height > 0
+        else { return false }
+
+        let t = targets(moving: moving, play: play)
+        lastMaxSettle = t.maxSettle
+        let pixelW = max(1, Int(Float(view.drawableSize.width) * t.scale))
+        let pixelH = max(1, Int(Float(view.drawableSize.height) * t.scale))
+        if accumTex[0] == nil || accumTex[0]!.width != pixelW || accumTex[0]!.height != pixelH {
+            accumTex = [makeAccumTexture(width: pixelW, height: pixelH),
+                        makeAccumTexture(width: pixelW, height: pixelH)]
+            guideTex = [makeGuideTexture(width: pixelW, height: pixelH),
+                        makeGuideTexture(width: pixelW, height: pixelH)]
+            historyValid = false
             sampleCount = 0
-            if let accum = accumTexture { clearAccum(accum, cmd: cmd) }
         }
-        if resetEachFrame, let accum = accumTexture {
-            clearAccum(accum, cmd: cmd)
-            sampleCount = 0
-        }
-        if let accum = accumTexture, !converged, sampleCount < maxSamples {
-            let n = min(samplesPerFrame, Int(maxSamples - sampleCount))
-            if encodeTrace(accum: accum, camera: camera, count: n,
-                           seedStart: sampleCount, cmd: cmd) {
-                sampleCount += UInt32(n)
-            } else {
-                sampleCount = maxSamples // nothing to trace; stop trying
+        let dst = curIdx
+        let src = 1 - curIdx
+        guard let curAccum = accumTex[dst], let curGuide = guideTex[dst] else { return false }
+
+        // Settled fast path: history valid, camera identical to
+        // the last presented frame, sample cap reached — just
+        // present the finished image (which lives in the other
+        // ping-pong slot) and sleep.
+        if accel != nil, historyValid, sampleCount >= t.maxSettle,
+           let pc = prevCamera, !cameraChanged(pc, camera),
+           let settled = accumTex[src] {
+            if let tonemapPipeline,
+               let renc = cmd.makeRenderCommandEncoder(descriptor: passDesc) {
+                var params = TonemapParams(samples: max(sampleCount, 1), exposure: exposure)
+                renc.setRenderPipelineState(tonemapPipeline)
+                renc.setFragmentTexture(settled, index: 0)
+                renc.setFragmentBytes(&params, length: MemoryLayout<TonemapParams>.stride, index: 0)
+                renc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+                renc.endEncoding()
             }
+            cmd.present(drawable)
+            cmd.commit()
+            wasMoving = moving
+            return false
         }
-        if let tonemapPipeline, let accum = accumTexture,
+
+        var traced = false
+        if accel != nil {
+            // Guide pass for the current camera (becomes next
+            // frame's "previous"), then history: reproject or clear.
+            _ = encodeGuide(guide: curGuide, camera: camera, cmd: cmd)
+            let camMoved = prevCamera.map { cameraChanged($0, camera) } ?? true
+            if historyValid, let prevAccum = accumTex[src], let prevGuide = guideTex[src],
+               prevCamera != nil {
+                var reuse = t.reuseCap
+                if let pc = prevCamera {
+                    let dOrigin = simd_length(camera.origin - pc.origin)
+                    let cosA = simd_dot(simd_normalize(camera.forward),
+                                        simd_normalize(pc.forward))
+                    if dOrigin > 1.5 || cosA < 0.86 {
+                        reuse = 0 // teleport: no smear
+                        sampleCount = 0 // the image really is fresh
+                    }
+                }
+                _ = encodeReproject(prevAccum: prevAccum, prevGuide: prevGuide,
+                                    curGuide: curGuide, curAccum: curAccum,
+                                    reuseCap: reuse, cmd: cmd)
+                if wasMoving && !moving {
+                    // Settle bookkeeping: per-pixel history after
+                    // motion is roughly the moving reuse cap.
+                    sampleCount = min(sampleCount, play ? 12 : 24)
+                }
+            } else {
+                clearAccum(curAccum, cmd: cmd)
+                sampleCount = 0
+            }
+            // Trace more samples unless settled and the camera
+            // has not moved since the last presented frame.
+            if moving || camMoved || sampleCount < t.maxSettle {
+                if encodeTrace(accum: curAccum, camera: camera, count: t.spp,
+                               seedStart: frameSeedCounter, bounces: t.bounces,
+                               cap: Float(t.maxSettle), glassBudget: t.glassBudget,
+                               cmd: cmd) {
+                    traced = true
+                    sampleCount += UInt32(t.spp)
+                    frameSeedCounter &+= UInt32(t.spp)
+                } else {
+                    sampleCount = t.maxSettle
+                }
+            }
+            prevCamera = camera
+            prevTanAspect = SIMD2<Float>(tan(fovY / 2),
+                                         Float(curAccum.width) / Float(max(curAccum.height, 1)))
+            historyValid = true
+            curIdx = src
+        } else if !historyValid {
+            clearAccum(curAccum, cmd: cmd)
+            historyValid = true // empty scene is now presented
+            sampleCount = 0
+        }
+
+        if let tonemapPipeline,
            let renc = cmd.makeRenderCommandEncoder(descriptor: passDesc) {
             var params = TonemapParams(samples: max(sampleCount, 1), exposure: exposure)
             renc.setRenderPipelineState(tonemapPipeline)
-            renc.setFragmentTexture(accum, index: 0)
+            renc.setFragmentTexture(curAccum, index: 0)
             renc.setFragmentBytes(&params, length: MemoryLayout<TonemapParams>.stride, index: 0)
             renc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             renc.endEncoding()
         }
         cmd.present(drawable)
         cmd.commit()
+        wasMoving = moving
+        guard accel != nil else { return false }
+        return moving || (traced && sampleCount < t.maxSettle)
     }
 
     /// Render the current scene offscreen and return a PNG (used for
-    /// project thumbnails and PNG export).
+    /// project thumbnails and PNG export). Always full quality:
+    /// full bounce depth, generous glass budget, no history cap.
     func renderStillPNG(camera: CameraBasis, width: Int, height: Int, samples: Int) -> Data? {
         guard let accum = makeAccumTexture(width: width, height: height),
               let cmd = queue.makeCommandBuffer() else { return nil }
         clearAccum(accum, cmd: cmd)
         let traced = encodeTrace(accum: accum, camera: camera, count: samples,
-                                 seedStart: 0, cmd: cmd)
+                                 seedStart: 0, bounces: 6, cap: 1_000_000,
+                                 glassBudget: 6, cmd: cmd)
         guard traced else { return nil }
         // Tonemap into a readable BGRA texture.
         let targetDesc = MTLTextureDescriptor.texture2DDescriptor(

@@ -31,6 +31,11 @@ final class EditorSession: ObservableObject {
 
     var pressedKeys: Set<MoveKey> = []
 
+    /// The live viewport (set by the view's coordinator). Draws
+    /// happen only when kicked — see kickRender().
+    weak var viewport: MTKView?
+    private var lastCameraActivity: CFTimeInterval = 0
+
     init(project: Project, renderer: Renderer) {
         self.project = project
         self.renderer = renderer
@@ -40,10 +45,32 @@ final class EditorSession: ObservableObject {
                 meshes[obj.id] = mesh
             }
         }
+        renderer.onNeedsFrame = { [weak self] in self?.kickRender() }
         renderer.rebuild(scene: project.scene, meshes: meshes)
         if !renderer.rayTracingSupported {
             status = "This device does not support Metal ray tracing."
         }
+    }
+
+    // MARK: Render-on-change plumbing
+
+    /// Ask the viewport for one draw. The viewport chains further
+    /// draws itself while `wantsFrame` stays true, so a converged,
+    /// untouched scene costs nothing.
+    func kickRender() {
+        viewport?.setNeedsDisplay()
+    }
+
+    func wantsFrame() -> Bool {
+        renderer.frameWanted || !pressedKeys.isEmpty
+    }
+
+    /// Camera input happened (orbit / pan / zoom / focus / mode
+    /// change): the next frames are "moving" frames and the view
+    /// needs a draw.
+    func noteCameraActivity() {
+        lastCameraActivity = CACurrentMediaTime()
+        kickRender()
     }
 
     var scene: Scene { project.scene }
@@ -96,6 +123,7 @@ final class EditorSession: ObservableObject {
             selection = nil
         }
         renderer.rebuild(scene: project.scene, meshes: meshes)
+        kickRender()
     }
 
     private func syncUndoDepths() {
@@ -113,6 +141,7 @@ final class EditorSession: ObservableObject {
     func mutateScene(_ change: (inout Scene) -> Void) {
         change(&project.scene)
         renderer.rebuild(scene: project.scene, meshes: meshes)
+        kickRender()
     }
 
     func objectBinding(_ id: UUID) -> Binding<SceneObject> {
@@ -124,24 +153,115 @@ final class EditorSession: ObservableObject {
             set: { [self] newValue in
                 guard let idx = project.scene.objects.firstIndex(where: { $0.id == id })
                 else { return }
+                let old = project.scene.objects[idx]
+                if old == newValue { return }
                 project.scene.objects[idx] = newValue
-                scheduleRebuild()
+                // A name-only edit needs no renderer work at all.
+                var a = old, b = newValue
+                a.name = ""; b.name = ""
+                if a == b { return }
+                // Geometry edits (transform/size/visibility) need
+                // the full rebuild; material edits take the cheap
+                // material-only path (no AS rebuild).
+                let geometry = old.transform != newValue.transform
+                    || old.params != newValue.params
+                    || old.visible != newValue.visible
+                    || old.source != newValue.source
+                    || old.primitiveKind != newValue.primitiveKind
+                    || old.meshFile != newValue.meshFile
+                scheduleRebuild(geometry: geometry)
             })
     }
 
     /// Coalesced renderer rebuild for continuous edits (sliders,
     /// colour pickers): at most one rebuild per ~60 ms, always with
     /// the latest scene, so dragging on a heavy import stays fluid.
+    /// Geometry requests dominate material-only ones.
     private var rebuildScheduled = false
-    func scheduleRebuild() {
+    private var rebuildNeedsGeometry = false
+    func scheduleRebuild(geometry: Bool) {
+        rebuildNeedsGeometry = rebuildNeedsGeometry || geometry
         guard !rebuildScheduled else { return }
         rebuildScheduled = true
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: 60_000_000)
             guard let self else { return }
             self.rebuildScheduled = false
-            self.renderer.rebuild(scene: self.project.scene, meshes: self.meshes)
+            let geo = self.rebuildNeedsGeometry
+            self.rebuildNeedsGeometry = false
+            self.renderer.rebuild(scene: self.project.scene, meshes: self.meshes,
+                                  geometry: geo)
+            self.kickRender()
         }
+    }
+
+    // MARK: Manipulation preview + viewport drag-move
+
+    /// While an object is being moved, it renders cheap: an
+    /// emissive object casts no light and a glass object renders
+    /// opaque (Sean's ask). Restores in full when the move ends.
+    /// Goes through the material-only path — no AS rebuild.
+    func setManipulationPreview(_ id: UUID?) {
+        guard renderer.previewObjectID != id else { return }
+        renderer.previewObjectID = id
+        if !renderer.updateMaterialsOnly(scene: project.scene, meshes: meshes) {
+            renderer.rebuild(scene: project.scene, meshes: meshes)
+        }
+        kickRender()
+    }
+
+    /// Hook for transform sliders (position / rotation / scale /
+    /// size): snapshot once at drag start, preview during, full
+    /// material on release.
+    func transformDragChanged(_ editing: Bool, objectID: UUID) {
+        if editing {
+            beginEdit()
+            setManipulationPreview(objectID)
+        } else {
+            setManipulationPreview(nil)
+        }
+    }
+
+    private var dragState: (id: UUID, planeY: Float, grabOffset: SIMD2<Float>)?
+    var isDraggingObject: Bool { dragState != nil }
+
+    /// Start dragging the given object across the horizontal plane
+    /// through its current height. Returns false when the ray
+    /// can't reach that plane (camera level with it).
+    func beginObjectDrag(id: UUID, ndc: SIMD2<Float>, aspect: Float) -> Bool {
+        guard mode == .edit, let obj = project.scene.object(id: id) else { return false }
+        let (origin, dir) = rayFor(ndc: ndc, aspect: aspect)
+        let planeY = Float(obj.transform.position[1])
+        guard abs(dir.y) > 1e-4 else { return false }
+        let t = (planeY - origin.y) / dir.y
+        guard t > 0 else { return false }
+        let grab = origin + dir * t
+        beginEdit()
+        setManipulationPreview(id)
+        dragState = (id, planeY, SIMD2<Float>(Float(obj.transform.position[0]) - grab.x,
+                                              Float(obj.transform.position[2]) - grab.z))
+        return true
+    }
+
+    func dragObjectTo(ndc: SIMD2<Float>, aspect: Float) {
+        guard let ds = dragState,
+              let idx = project.scene.objects.firstIndex(where: { $0.id == ds.id })
+        else { return }
+        let (origin, dir) = rayFor(ndc: ndc, aspect: aspect)
+        guard abs(dir.y) > 1e-4 else { return }
+        let t = (ds.planeY - origin.y) / dir.y
+        guard t > 0 else { return }
+        let grab = origin + dir * t
+        project.scene.objects[idx].transform.position[0] = Double(grab.x + ds.grabOffset.x)
+        project.scene.objects[idx].transform.position[2] = Double(grab.z + ds.grabOffset.y)
+        noteCameraActivity()
+        scheduleRebuild(geometry: true)
+    }
+
+    func endObjectDrag() {
+        guard dragState != nil else { return }
+        dragState = nil
+        setManipulationPreview(nil)
     }
 
     // MARK: Editing operations
@@ -155,6 +275,7 @@ final class EditorSession: ObservableObject {
         project.scene.objects.append(obj)
         selection = obj.id
         renderer.rebuild(scene: project.scene, meshes: meshes)
+        kickRender()
         status = "Added \(obj.name)."
     }
 
@@ -183,6 +304,7 @@ final class EditorSession: ObservableObject {
         project.scene.objects.remove(at: idx)
         selection = nil
         renderer.rebuild(scene: project.scene, meshes: meshes)
+        kickRender()
         status = "Deleted \(name)."
     }
 
@@ -257,6 +379,7 @@ final class EditorSession: ObservableObject {
                 }
                 self.selection = firstID
                 self.renderer.rebuild(scene: self.project.scene, meshes: self.meshes)
+                self.kickRender()
                 self.status = "Imported \(parts.count) part\(parts.count == 1 ? "" : "s") from \(url.lastPathComponent)."
             }
         }
@@ -266,8 +389,8 @@ final class EditorSession: ObservableObject {
 
     func toggleMode() {
         mode = (mode == .edit) ? .play : .edit
-        renderer.resetEachFrame = (mode == .play)
         renderer.resetAccumulation()
+        noteCameraActivity()
         status = mode == .play ? "Play mode — walk around. Pause to edit."
                                 : "Edit mode."
     }
@@ -279,9 +402,13 @@ final class EditorSession: ObservableObject {
         defer { lastTick = now }
         let dt = lastTick.map { Float(now - $0) } ?? 0
         if dt > 0 && dt < 0.25 { applyMovement(dt: dt) }
+        let moving = !pressedKeys.isEmpty
+            || (now - lastCameraActivity) < 0.35
+            || isDraggingObject
         let basis = mode == .play ? project.scene.camera.playBasis()
                                   : project.scene.camera.orbitBasis()
-        renderer.draw(view: view, camera: basis)
+        renderer.draw(view: view, camera: basis,
+                      moving: moving, play: mode == .play)
     }
 
     private var lastTick: CFTimeInterval?
@@ -328,7 +455,7 @@ final class EditorSession: ObservableObject {
         }
         if moved {
             project.scene.camera = cam
-            renderer.resetAccumulation()
+            lastCameraActivity = CACurrentMediaTime()
         }
     }
 
@@ -348,20 +475,30 @@ final class EditorSession: ObservableObject {
         let diag = simd_length(b.max - b.min)
         project.scene.camera.target = [Double(centre.x), Double(centre.y), Double(centre.z)]
         project.scene.camera.distance = Double(max(1.2, diag * 1.35))
-        renderer.resetAccumulation()
+        noteCameraActivity()
     }
 
     // MARK: Picking
 
-    func handleTap(ndc: SIMD2<Float>, aspect: Float) {
-        guard mode == .edit else { return }
-        let cam = project.scene.camera
-        let basis = cam.orbitBasis()
+    /// World-space ray through an edit-mode viewport point
+    /// (ndc: x right, y up, both -1...1).
+    func rayFor(ndc: SIMD2<Float>, aspect: Float) -> (origin: SIMD3<Float>, dir: SIMD3<Float>) {
+        let basis = project.scene.camera.orbitBasis()
         let tanH = tan(renderer.fovY / 2)
         let dir = simd_normalize(basis.forward
                                  + basis.right * (ndc.x * tanH * aspect)
                                  + basis.up * (ndc.y * tanH))
-        if let hit = renderer.pick(origin: basis.origin, dir: dir) {
+        return (basis.origin, dir)
+    }
+
+    func pickAt(ndc: SIMD2<Float>, aspect: Float) -> UUID? {
+        let r = rayFor(ndc: ndc, aspect: aspect)
+        return renderer.pick(origin: r.origin, dir: r.dir)
+    }
+
+    func handleTap(ndc: SIMD2<Float>, aspect: Float) {
+        guard mode == .edit else { return }
+        if let hit = pickAt(ndc: ndc, aspect: aspect) {
             selection = hit
             if let name = project.scene.objects.first(where: { $0.id == hit })?.name {
                 status = "Selected \(name)."
@@ -375,7 +512,10 @@ final class EditorSession: ObservableObject {
 
     func save() {
         project.modifiedAt = Date()
-        let basis = project.scene.camera.orbitBasis()
+        // The thumbnail is the view the user is actually looking
+        // at — orbit camera in edit mode, first-person in Play.
+        let basis = mode == .play ? project.scene.camera.playBasis()
+                                  : project.scene.camera.orbitBasis()
         let thumb = renderer.renderStillPNG(camera: basis, width: 640, height: 480, samples: 48)
         ProjectStore.saveProject(project, thumbnailPNG: thumb)
         status = "Saved."

@@ -13,16 +13,35 @@
 //     radiance directly.
 //   * Glass is a dielectric: Fresnel (Schlick, from IOR) chooses
 //     reflection vs refraction; roughness jitters both directions
-//     (clear -> frosted as roughness rises); the tint colours the
-//     transmitted light.
+//     (clear -> frosted as roughness rises); light travelling
+//     INSIDE the glass is attenuated by Beer-Lambert absorption
+//     (tint raised to the travelled distance), so thick glass
+//     darkens and colours more than thin glass. A per-path
+//     refraction budget disciplines transmission work: past the
+//     budget, deeper glass layers shade as tinted diffuse instead
+//     of spawning more transmissive paths (glass-heavy views stay
+//     interactive; the budget is generous at rest).
 //   * Textures are procedural PBR sets (albedo / tangent normal /
 //     roughness+height) sampled per material slice, with one-step
-//     parallax from the height channel; STEP imports (no UVs) use
-//     triplanar world-space sampling instead.
+//     parallax from the height channel; imported models (no UVs)
+//     use triplanar world-space sampling INCLUDING triplanar
+//     normal mapping, so texture depth works there too.
 //   * Everything else is Lambertian with cosine-weighted bounces
-//     and Russian roulette. One sample per dispatch is accumulated
-//     into a float texture; the tonemap pass divides by the sample
-//     count, applies ACES and gamma.
+//     and Russian roulette.
+//
+// Temporal reprojection (v2): the accumulation texture's alpha
+// channel stores each pixel's effective sample count. A cheap
+// guide pass writes every pixel's primary-hit world position;
+// when the camera moves, reprojectKernel seeds the new frame's
+// accumulation from the previous frame wherever the world position
+// seen through the old camera matches the one seen now — diffuse
+// and emissive first hits only (glass and environment are
+// view-dependent and always restart). Motion therefore keeps most
+// of the converged image instead of restarting from noise. While
+// still, reprojection is the identity map and accumulation simply
+// continues, so the settled image is the full-quality one. At the
+// sample cap the accumulator becomes a moving average (oldest
+// weight decays), which keeps Play mode smooth instead of noisy.
 
 #include <metal_stdlib>
 #include <metal_raytracing>
@@ -42,6 +61,8 @@ struct Uniforms {
     uint emissiveCount;
     float totalEmissiveArea;
     float envIntensity;
+    float historyCap;          // max effective samples kept per pixel
+    uint glassRefractBudget;   // max refraction events per path
 };
 
 struct Material {
@@ -158,12 +179,21 @@ kernel void pathTraceKernel(
     float3 throughput = float3(1);
     float3 radiance = float3(0);
     bool prevSpecular = true; // primary ray: emissive hits count directly
+    // Beer-Lambert medium state: while the path travels inside
+    // glass, each segment attenuates by tint^distance.
+    bool inMedium = false;
+    float3 mediumLog = float3(0); // log(tint) of the enclosing glass
+    uint refracts = 0;
 
     for (uint bounce = 0; bounce <= u.maxBounces; ++bounce) {
         auto hit = isect.intersect(ray, accel);
         if (hit.type == intersection_type::none) {
             radiance += throughput * envColor(ray.direction, u.envIntensity);
             break;
+        }
+        // Attenuate the segment just travelled inside glass.
+        if (inMedium) {
+            throughput *= exp(mediumLog * hit.distance);
         }
 
         uint tri = hit.primitive_id;
@@ -223,6 +253,19 @@ kernel void pathTraceKernel(
                           + texData.sample(texSampler, wp.xy, slice, level(0.0f)).r * w.z;
                 albedo *= a;
                 texRough = rgh;
+                // Triplanar normal mapping: sample the tangent-space
+                // normal on each axis plane, swizzle into world
+                // space (sign from the geometric normal), blend with
+                // the same weights — the texture's relief now rakes
+                // under light on imported models too.
+                float3 tnx = texNormal.sample(texSampler, wp.zy, slice, level(0.0f)).rgb * 2.0f - 1.0f;
+                float3 tny = texNormal.sample(texSampler, wp.xz, slice, level(0.0f)).rgb * 2.0f - 1.0f;
+                float3 tnz = texNormal.sample(texSampler, wp.xy, slice, level(0.0f)).rgb * 2.0f - 1.0f;
+                float3 wnx = float3(tnx.z * (nInterp.x >= 0 ? 1.0f : -1.0f), tnx.y, tnx.x);
+                float3 wny = float3(tny.x, tny.z * (nInterp.y >= 0 ? 1.0f : -1.0f), tny.y);
+                float3 wnz = float3(tnz.x, tnz.y, tnz.z * (nInterp.z >= 0 ? 1.0f : -1.0f));
+                float3 blended = normalize(wnx * w.x + wny * w.y + wnz * w.z);
+                if (dot(blended, geoN) > 0.05f) shadingN = blended;
             } else {
                 float2 tuv = vUV * scale;
                 // One-step parallax from the height channel, then
@@ -249,8 +292,13 @@ kernel void pathTraceKernel(
         }
         (void)texRough;
 
-        // ---- Glass: reflect / refract with Fresnel.
-        if ((mat.flags & FLAG_GLASS) && rng.nextFloat() < mat.glassParams.x) {
+        // ---- Glass: reflect / refract with Fresnel. Past the
+        // refraction budget the surface falls through to diffuse
+        // shading (tinted), which bounds transmission cost in
+        // glass-heavy views.
+        bool glassPath = (mat.flags & FLAG_GLASS) && refracts < u.glassRefractBudget
+                         && rng.nextFloat() < mat.glassParams.x;
+        if (glassPath) {
             float ior = mat.glassParams.z;
             float eta = front ? (1.0f / ior) : ior;
             float f0 = (ior - 1.0f) / (ior + 1.0f);
@@ -268,8 +316,17 @@ kernel void pathTraceKernel(
                     newDir = reflect(ray.direction, ns);
                 } else {
                     newDir = jitterDirection(normalize(newDir), mat.glassParams.y * 0.45f, rng);
+                    // Crossing the boundary toggles the medium;
+                    // the travelled distance is charged at the
+                    // NEXT hit via Beer-Lambert (see loop top).
+                    refracts += 1;
+                    if (front) {
+                        inMedium = true;
+                        mediumLog = log(max(mat.tint.rgb, float3(1e-4f)));
+                    } else {
+                        inMedium = false;
+                    }
                 }
-                throughput *= mat.tint.rgb;
             }
             float3 off = dot(newDir, geoN) >= 0 ? geoN : -geoN;
             ray.origin = hitPos + off * 0.0015f;
@@ -277,6 +334,11 @@ kernel void pathTraceKernel(
             ray.min_distance = 0.0f;
             prevSpecular = true;
             continue;
+        }
+        // A glass surface that took the diffuse fall-through (budget
+        // spent or transmission roll failed) shades with its tint.
+        if (mat.flags & FLAG_GLASS) {
+            albedo *= mat.tint.rgb;
         }
 
         // ---- Diffuse: next-event estimation toward emissive tris.
@@ -334,8 +396,144 @@ kernel void pathTraceKernel(
         }
     }
 
-    float4 prev = accum.read(pixel);
-    accum.write(float4(prev.rgb + radiance, 1.0f), pixel);
+    // Accumulate: alpha tracks the effective sample count. At the
+    // history cap, decay the stored sum so it becomes a moving
+    // average over the last `historyCap` samples (Play mode and
+    // in-motion frames stay smooth instead of freezing or noising).
+    float4 prevA = accum.read(pixel);
+    float a = prevA.a;
+    float3 rgb = prevA.rgb;
+    if (a >= u.historyCap) {
+        float s = (u.historyCap - 1.0f) / u.historyCap;
+        rgb *= s;
+        a = u.historyCap - 1.0f;
+    }
+    accum.write(float4(rgb + radiance, a + 1.0f), pixel);
+}
+
+// MARK: - Guide kernel (primary-hit world positions, for reprojection)
+//
+// One jitterless primary ray per pixel. Writes (worldPos, reusable)
+// where reusable = 1 for diffuse and emissive first hits (their
+// radiance is view-independent) and 0 for glass, environment, and
+// misses (view-dependent: always traced fresh).
+
+kernel void guideKernel(
+    texture2d<float, access::write> guide [[texture(0)]],
+    constant Uniforms& u [[buffer(0)]],
+    device const float* positions [[buffer(1)]],
+    device const uint* indices [[buffer(5)]],
+    device const uint* triMat [[buffer(6)]],
+    device const Material* materials [[buffer(7)]],
+    acceleration_structure<> accel [[buffer(10)]],
+    uint2 pixel [[thread_position_in_grid]])
+{
+    uint width = guide.get_width();
+    uint height = guide.get_height();
+    if (pixel.x >= width || pixel.y >= height) return;
+
+    float2 ndc = float2((float(pixel.x) + 0.5f) / float(width),
+                        (float(pixel.y) + 0.5f) / float(height));
+    float2 d = (ndc * 2.0f - 1.0f) * float2(u.tanFovAspect.y, 1.0f) * u.tanFovAspect.x;
+    raytracing::ray ray;
+    ray.origin = u.camOrigin;
+    ray.direction = normalize(u.camForward + u.camRight * d.x + u.camUp * (-d.y));
+    ray.min_distance = 0.0f;
+    ray.max_distance = 1e30f;
+
+    intersector<triangle_data> isect;
+    isect.assume_geometry_type(geometry_type::triangle);
+    isect.accept_any_intersection(false);
+    auto hit = isect.intersect(ray, accel);
+    if (hit.type == intersection_type::none) {
+        guide.write(float4(0, 0, 0, 0), pixel);
+        return;
+    }
+    uint tri = hit.primitive_id;
+    uint i0 = indices[3 * tri], i1 = indices[3 * tri + 1], i2 = indices[3 * tri + 2];
+    float3 p0 = float3(positions[3 * i0], positions[3 * i0 + 1], positions[3 * i0 + 2]);
+    float3 p1 = float3(positions[3 * i1], positions[3 * i1 + 1], positions[3 * i1 + 2]);
+    float3 p2 = float3(positions[3 * i2], positions[3 * i2 + 1], positions[3 * i2 + 2]);
+    float bc1 = hit.triangle_barycentric_coord.x;
+    float bc2 = hit.triangle_barycentric_coord.y;
+    float bc0 = 1.0f - bc1 - bc2;
+    float3 hitPos = p0 * bc0 + p1 * bc1 + p2 * bc2;
+    Material mat = materials[triMat[tri]];
+    float reusable = (mat.flags & FLAG_GLASS) ? 0.0f : 1.0f;
+    guide.write(float4(hitPos, reusable), pixel);
+}
+
+// MARK: - Reprojection kernel (seed current accumulation from history)
+//
+// For each pixel, project its current world position into the
+// previous frame's camera. If the previous frame saw (nearly) the
+// same world point through that pixel and it was a reusable
+// surface, carry its accumulated radiance over with weight
+// min(prevSamples, reuseCap) in the alpha channel. Anything else
+// starts fresh at zero.
+
+struct ReprojUniforms {
+    float3 prevOrigin;
+    float3 prevRight;
+    float3 prevUp;
+    float3 prevForward;
+    float2 tanFovAspect; // x: tan(half fov), y: aspect — of the PREVIOUS frame
+    float reuseCap;
+    float pad;
+};
+
+kernel void reprojectKernel(
+    texture2d<float, access::read> prevAccum [[texture(0)]],
+    texture2d<float, access::read> prevGuide [[texture(1)]],
+    texture2d<float, access::read> curGuide [[texture(2)]],
+    texture2d<float, access::write> curAccum [[texture(3)]],
+    constant ReprojUniforms& u [[buffer(0)]],
+    uint2 pixel [[thread_position_in_grid]])
+{
+    uint width = curGuide.get_width();
+    uint height = curGuide.get_height();
+    if (pixel.x >= width || pixel.y >= height) return;
+
+    float4 g = curGuide.read(pixel);
+    if (g.w < 0.5f || u.reuseCap <= 0.0f) {
+        curAccum.write(float4(0, 0, 0, 0), pixel);
+        return;
+    }
+    float3 rel = g.xyz - u.prevOrigin;
+    float z = dot(rel, u.prevForward);
+    if (z <= 1e-4f) {
+        curAccum.write(float4(0, 0, 0, 0), pixel);
+        return;
+    }
+    float x = dot(rel, u.prevRight);
+    float y = dot(rel, u.prevUp);
+    // Invert the primary-ray construction of the trace kernel:
+    // dir ∝ fwd + right*(ndc.x*tan*aspect) + up*(-(ndc.y*tan)).
+    float2 ndc = float2((x / z) / (u.tanFovAspect.x * u.tanFovAspect.y),
+                        -(y / z) / u.tanFovAspect.x);
+    float2 uv = ndc * 0.5f + 0.5f;
+    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
+        curAccum.write(float4(0, 0, 0, 0), pixel);
+        return;
+    }
+    uint pw = prevGuide.get_width();
+    uint ph = prevGuide.get_height();
+    uint2 pp = uint2(min(uint(uv.x * float(pw)), pw - 1),
+                     min(uint(uv.y * float(ph)), ph - 1));
+    float4 pg = prevGuide.read(pp);
+    if (pg.w < 0.5f) {
+        curAccum.write(float4(0, 0, 0, 0), pixel);
+        return;
+    }
+    float eps = max(0.02f, 0.002f * length(rel));
+    if (distance(pg.xyz, g.xyz) > eps) {
+        curAccum.write(float4(0, 0, 0, 0), pixel);
+        return;
+    }
+    float4 h = prevAccum.read(pp);
+    float wgt = min(h.a, u.reuseCap);
+    float3 rgb = h.a > 0.001f ? h.rgb * (wgt / h.a) : float3(0);
+    curAccum.write(float4(rgb, wgt), pixel);
 }
 
 // MARK: - Tonemap / display
@@ -366,7 +564,11 @@ fragment float4 tonemapFragment(VSOut in [[stage_in]],
                                 texture2d<float> accum [[texture(0)]],
                                 constant TonemapParams& p [[buffer(0)]]) {
     constexpr sampler s(address::clamp_to_edge, filter::linear);
-    float3 c = accum.sample(s, in.uv).rgb / max(1.0f, float(p.samples));
+    float4 a = accum.sample(s, in.uv);
+    // Alpha carries the per-pixel effective sample count (v2);
+    // fall back to the uniform count where alpha is unset.
+    float n = a.a > 0.5f ? a.a : max(1.0f, float(p.samples));
+    float3 c = a.rgb / n;
     c = aces(c * p.exposure);
     c = pow(c, float3(1.0f / 2.2f));
     return float4(c, 1.0f);
