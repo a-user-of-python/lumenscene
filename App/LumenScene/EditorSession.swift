@@ -33,7 +33,7 @@ final class EditorSession: ObservableObject {
     init(project: Project, renderer: Renderer) {
         self.project = project
         self.renderer = renderer
-        for obj in project.scene.objects where obj.source == "step" {
+        for obj in project.scene.objects where obj.source == "model" {
             if let file = obj.meshFile,
                let mesh = ProjectStore.readMesh(projectID: project.id, fileName: file) {
                 meshes[obj.id] = mesh
@@ -194,9 +194,9 @@ final class EditorSession: ObservableObject {
         }
     }
 
-    // MARK: STEP import
+    // MARK: Model import (STL / OBJ / USD via ModelIO)
 
-    func importStepFile(_ url: URL) {
+    func importModelFile(_ url: URL) {
         status = "Importing \(url.lastPathComponent)…"
         let projectID = project.id
         // Keep the original file inside the project first.
@@ -204,7 +204,7 @@ final class EditorSession: ObservableObject {
         let assetPath = assetName.map { ProjectStore.assetURL(projectID: projectID, fileName: $0).path } ?? url.path
         Task { [weak self] in
             let result = await Task.detached(priority: .userInitiated) {
-                Result { try StepImporter.importFile(path: assetPath) }
+                Result { try ModelImporter.importFile(path: assetPath) }
             }.value
             guard let self else { return }
             switch result {
@@ -224,7 +224,8 @@ final class EditorSession: ObservableObject {
                     mesh.indices = part.indices
                     mesh.uvs = [Float](repeating: 0, count: part.positions.count / 3 * 2)
                     mesh.colors = [Float](repeating: 1, count: part.positions.count)
-                    // Bake the STEP face colour into the vertices.
+                    // Bake the file's material colour into the
+                    // vertices; per-vertex colours multiply on top.
                     if part.hasColor {
                         for v in 0..<mesh.vertexCount {
                             mesh.colors[3 * v] = Float(part.red)
@@ -232,7 +233,12 @@ final class EditorSession: ObservableObject {
                             mesh.colors[3 * v + 2] = Float(part.blue)
                         }
                     }
-                    var obj = SceneObject(name: self.uniqueName(for: part.name), source: "step")
+                    if let vc = part.vertexColors, vc.count == mesh.colors.count {
+                        for i in 0..<mesh.colors.count {
+                            mesh.colors[i] *= vc[i]
+                        }
+                    }
+                    var obj = SceneObject(name: self.uniqueName(for: part.name), source: "model")
                     obj.material.triplanar = true
                     let file = ProjectStore.writeMesh(projectID: projectID, objectID: obj.id, mesh: mesh)
                     obj.meshFile = file

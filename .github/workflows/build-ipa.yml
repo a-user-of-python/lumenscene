@@ -5,69 +5,11 @@ on:
   push:
 
 jobs:
-  engine:
-    name: Cascade engine (OCCT + façade)
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v4
-      # The Cascade engine build is the slow part (the OCCT subset
-      # compile). It only changes when the pinned cascade-ios commit
-      # changes, so the assembled engine-dist folder is cached on
-      # that pin and reused by every app iteration.
-      - name: Cache engine dist
-        id: engine-cache
-        uses: actions/cache@v4
-        with:
-          path: engine-dist
-          key: cascade-engine-061875afb5384227db5f39cba81266cf889257a4-v2
-      - name: Fetch Cascade engine (pinned cascade-ios)
-        if: steps.engine-cache.outputs.cache-hit != 'true'
-        run: |
-          git init cascade-engine
-          cd cascade-engine
-          git remote add origin https://github.com/a-user-of-python/cascade-ios.git
-          git fetch --depth 1 origin 061875afb5384227db5f39cba81266cf889257a4
-          git checkout FETCH_HEAD
-          ls OCCT/src | head -3
-          test -f Facade/occt_facade.cpp
-      - name: Build CascadeKit (engine only)
-        if: steps.engine-cache.outputs.cache-hit != 'true'
-        run: |
-          python3 App/gen_project.py --engine-only
-          xcodebuild -project App/LumenScene.xcodeproj \
-            -scheme CascadeKit \
-            -sdk iphoneos \
-            -configuration Release \
-            -derivedDataPath build/eng \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            GCC_GENERATE_DEBUGGING_SYMBOLS=NO \
-            build
-          mkdir -p engine-dist
-          cp build/eng/Build/Products/Release-iphoneos/libCascadeKit.a engine-dist/
-          cp cascade-engine/Facade/occt_facade.h engine-dist/
-          cp cascade-engine/OCCT/LICENSE_LGPL_21.txt engine-dist/
-          cp cascade-engine/OCCT/OCCT_LGPL_EXCEPTION.txt engine-dist/
-          ls -lh engine-dist
-      - name: Upload engine dist
-        uses: actions/upload-artifact@v4
-        with:
-          name: cascade-engine-dist
-          path: engine-dist
-
   build:
     name: Unsigned IPA
-    needs: engine
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch engine dist
-        uses: actions/download-artifact@v4
-        with:
-          name: cascade-engine-dist
-          path: engine-dist
-      - name: Generate Xcode project (prebuilt engine)
-        run: LUMEN_ENGINE_DIST="$GITHUB_WORKSPACE/engine-dist" python3 App/gen_project.py
       - name: Build app (unsigned)
         run: |
           xcodebuild -project App/LumenScene.xcodeproj \

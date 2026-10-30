@@ -133,7 +133,7 @@ struct EditorView: View {
                     Button("Cylinder") { session.addPrimitive("cylinder") }
                     Button("Plane") { session.addPrimitive("plane") }
                     Divider()
-                    Button("Import STEP…") { showImport = true }
+                    Button("Import Model…") { showImport = true }
                 } label: {
                     Label("Add", systemImage: "plus")
                 }
@@ -142,7 +142,7 @@ struct EditorView: View {
             List(selection: $session.selection) {
                 ForEach(session.project.scene.objects) { obj in
                     HStack(spacing: 8) {
-                        Image(systemName: obj.source == "step" ? "cube" : icon(for: obj.primitiveKind))
+                        Image(systemName: obj.source == "model" ? "cube" : icon(for: obj.primitiveKind))
                             .foregroundStyle(.secondary)
                         Text(obj.name).lineLimit(1)
                         Spacer()
@@ -226,15 +226,15 @@ struct EditorView: View {
     // MARK: Import sheet (app folder, no system picker)
 
     private var importSheet: some View {
-        let files = ProjectStore.appFolderSTEPFiles()
+        let files = ProjectStore.appFolderModelFiles()
         return NavigationStack {
             Group {
                 if files.isEmpty {
                     VStack(spacing: 10) {
                         Image(systemName: "folder.badge.plus").font(.largeTitle)
-                        Text("No STEP files in the app folder yet.")
+                        Text("No model files in the app folder yet.")
                             .font(.headline)
-                        Text("In the Files app, copy a .step or .stp file into the LumenScene folder (On My iPad → LumenScene), then reopen this sheet.")
+                        Text("In the Files app, copy a .stl, .obj, .usd or .usdz model file into the LumenScene folder (On My iPad → LumenScene), then reopen this sheet.")
                             .multilineTextAlignment(.center)
                             .foregroundStyle(.secondary)
                     }
@@ -257,7 +257,7 @@ struct EditorView: View {
                     }
                 }
             }
-            .navigationTitle("Import STEP from App Folder")
+            .navigationTitle("Import Model from App Folder")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { showImport = false }

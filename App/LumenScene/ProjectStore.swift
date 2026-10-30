@@ -3,13 +3,13 @@
 //   Application Support/LumenScene/Projects/<id>/
 //     project.json   the Project value (scene + camera)
 //     thumb.png      viewport render from the last Save
-//     assets/        original STEP files copied in at import time
+//     assets/        original model files copied in at import time
 //     meshes/        tessellated geometry (.meshbin, LSM1 format)
 //
 // Imported meshes and assets are written at IMPORT time (not save
 // time) so undo snapshots, which reference them by file name, are
 // always consistent. The Documents folder (visible in Files via
-// UIFileSharingEnabled) is the drop zone Sean puts STEP files in;
+// UIFileSharingEnabled) is the drop zone for model files (STL/OBJ/USD);
 // it is only ever read by the import sheet.
 
 import Foundation
@@ -126,12 +126,12 @@ enum ProjectStore {
 
     // MARK: The app-folder drop zone (Documents)
 
-    /// STEP files Sean dropped into the app folder via Files.
-    static func appFolderSTEPFiles() -> [URL] {
+    /// Model files dropped into the app folder via Files (STL / OBJ / USD / USDZ).
+    static func appFolderModelFiles() -> [URL] {
         let fm = FileManager.default
         guard let items = try? fm.contentsOfDirectory(
             at: documentsURL, includingPropertiesForKeys: nil) else { return [] }
-        return items.filter { ["step", "stp"].contains($0.pathExtension.lowercased()) }
+        return items.filter { ["stl", "obj", "usd", "usdz"].contains($0.pathExtension.lowercased()) }
             .sorted { $0.lastPathComponent.lowercased() < $1.lastPathComponent.lowercased() }
     }
 

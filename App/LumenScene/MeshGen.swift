@@ -1,6 +1,6 @@
 // MeshGen.swift — CPU-side triangle meshes: primitive generation,
 // transform baking, and the binary mesh-file format used to persist
-// imported (STEP) geometry inside a project folder.
+// imported model geometry inside a project folder.
 
 import Foundation
 import simd
@@ -9,7 +9,7 @@ struct MeshData {
     var positions: [Float] = []   // 3 per vertex, metres, Y-up
     var normals: [Float] = []     // 3 per vertex
     var uvs: [Float] = []         // 2 per vertex
-    var colors: [Float] = []      // 3 per vertex (STEP face colours; white otherwise)
+    var colors: [Float] = []      // 3 per vertex (imported material colours; white otherwise)
     var indices: [UInt32] = []
 
     var vertexCount: Int { positions.count / 3 }

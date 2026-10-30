@@ -55,7 +55,7 @@ struct Transform3: Codable, Equatable {
 // MARK: - Material
 
 struct MaterialProps: Codable, Equatable {
-    /// Base colour. For STEP imports this multiplies the per-face
+    /// Base colour. For imported models this multiplies the per-part
     /// colours baked into the mesh vertices (white = untouched).
     var baseColor: RGB = .white
     /// Emissive (light-emitting) surface. The emitted light takes
@@ -76,7 +76,7 @@ struct MaterialProps: Codable, Equatable {
     /// Tiling: UV repeats per object face, or tiles per metre for
     /// triplanar-mapped imports.
     var textureScale: Double = 1.0
-    /// True for STEP imports (no UVs in the tessellation): the
+    /// True for imported models (no UVs in the file): the
     /// renderer samples textures triplanar from world position.
     var triplanar: Bool = false
 }
@@ -86,17 +86,17 @@ struct MaterialProps: Codable, Equatable {
 struct SceneObject: Codable, Equatable, Identifiable {
     var id: UUID = UUID()
     var name: String
-    /// "primitive" or "step".
+    /// "primitive" or "model".
     var source: String
     /// For source == "primitive": "box" | "sphere" | "cylinder" | "plane".
     var primitiveKind: String = "box"
     /// Primitive dimensions in metres (box: w/h/d, sphere: r,
     /// cylinder: r/h, plane: w/d).
     var params: [String: Double] = [:]
-    /// For source == "step": file inside the project's meshes/ folder.
+    /// For source == "model": file inside the project's meshes/ folder.
     var meshFile: String? = nil
-    /// For source == "step": file inside the project's assets/ folder
-    /// (the original STEP, kept with the project).
+    /// For source == "model": file inside the project's assets/ folder
+    /// (the original model file, kept with the project).
     var assetFile: String? = nil
     var visible: Bool = true
     var transform: Transform3 = Transform3()

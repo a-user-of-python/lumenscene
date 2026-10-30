@@ -1,0 +1,265 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0B52951886E9C3B04FA51AE4 = {isa = PBXBuildFile; fileRef = DCF005040B19B07ADF85A695; };
+		A904B8543F73773FB1295230 = {isa = PBXBuildFile; fileRef = 90F2135D54D5051705A89E02; };
+		C4781F8E52C1F965A5EB86D2 = {isa = PBXBuildFile; fileRef = 4DFCD58051D887066255E740; };
+		638F830D78CE000A8632CD65 = {isa = PBXBuildFile; fileRef = 6F33012E3960788C40996C10; };
+		1000FCCA591C31D4DB598724 = {isa = PBXBuildFile; fileRef = D6516E12433338656CD6A2DB; };
+		B8F1399A997E101A0E6ED260 = {isa = PBXBuildFile; fileRef = DF60D18132B58BE4B28A3F04; };
+		EE2FBE449BAFF745C9342FB1 = {isa = PBXBuildFile; fileRef = 6BD6339ED9B58938EF85C3F6; };
+		CB737B58312A2FF9C97FDF23 = {isa = PBXBuildFile; fileRef = E3B9980D7768BB8E4872D596; };
+		077395F6BE856F8091509B6F = {isa = PBXBuildFile; fileRef = 89C5051FC8FCC7B09E667D42; };
+		B6E2B1DE234F8112BD77296F = {isa = PBXBuildFile; fileRef = 211D272A41D8842DC6A5AFC3; };
+		876B72DAC2A68607F9B4356F = {isa = PBXBuildFile; fileRef = 819DDBD39FD56D6F039A2E53; };
+		CBDA1F03B17C013A9FF9ED34 = {isa = PBXBuildFile; fileRef = 9F9EB49438D3A1D64AEE6FA7; };
+		F7412A7B3A25A790A38D988D = {isa = PBXBuildFile; fileRef = B576055B9D4E9035A4AFF13C; };
+		851C8F29C73114171B96FB17 = {isa = PBXBuildFile; fileRef = 17CD06A31553B02130CC0006; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		DCF005040B19B07ADF85A695 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DemoScene.swift; sourceTree = "<group>"; };
+		90F2135D54D5051705A89E02 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorSession.swift; sourceTree = "<group>"; };
+		4DFCD58051D887066255E740 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorView.swift; sourceTree = "<group>"; };
+		6F33012E3960788C40996C10 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+		D6516E12433338656CD6A2DB = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LumenSceneApp.swift; sourceTree = "<group>"; };
+		DF60D18132B58BE4B28A3F04 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshGen.swift; sourceTree = "<group>"; };
+		6BD6339ED9B58938EF85C3F6 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelImport.swift; sourceTree = "<group>"; };
+		E3B9980D7768BB8E4872D596 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		89C5051FC8FCC7B09E667D42 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectStore.swift; sourceTree = "<group>"; };
+		211D272A41D8842DC6A5AFC3 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Renderer.swift; sourceTree = "<group>"; };
+		819DDBD39FD56D6F039A2E53 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Textures.swift; sourceTree = "<group>"; };
+		9F9EB49438D3A1D64AEE6FA7 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Viewport.swift; sourceTree = "<group>"; };
+		B576055B9D4E9035A4AFF13C = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Shaders.metal; sourceTree = "<group>"; };
+		35F7358B8C0EA9A13451AFD1 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LumenScene.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A7E6938D864437149217D339 = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		17CD06A31553B02130CC0006 = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		076EB3F9AB5C3215342C187A = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0603F378EC755C9F3C7D71BC = {
+			isa = PBXGroup;
+			children = (
+				4281DDC591882CB6EAE5B96F,
+				A7C8B2065D2A25858CA767B0,
+			);
+			sourceTree = "<group>";
+		};
+		A7C8B2065D2A25858CA767B0 = {
+			isa = PBXGroup;
+			children = (
+				35F7358B8C0EA9A13451AFD1,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		4281DDC591882CB6EAE5B96F = {
+			isa = PBXGroup;
+			children = (
+				DCF005040B19B07ADF85A695,
+				90F2135D54D5051705A89E02,
+				4DFCD58051D887066255E740,
+				6F33012E3960788C40996C10,
+				D6516E12433338656CD6A2DB,
+				DF60D18132B58BE4B28A3F04,
+				6BD6339ED9B58938EF85C3F6,
+				E3B9980D7768BB8E4872D596,
+				89C5051FC8FCC7B09E667D42,
+				211D272A41D8842DC6A5AFC3,
+				819DDBD39FD56D6F039A2E53,
+				9F9EB49438D3A1D64AEE6FA7,
+				B576055B9D4E9035A4AFF13C,
+				A7E6938D864437149217D339,
+				17CD06A31553B02130CC0006,
+			);
+			path = LumenScene;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		2746A0380B64C3D959026C6E = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 2FC98B801D9B352C767508BB;
+			buildPhases = (
+				139C82580923D1A30BA6B193,
+				076EB3F9AB5C3215342C187A,
+				3D6B84D5D9E8B86E6B1DE98C,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = LumenScene;
+			productReference = 35F7358B8C0EA9A13451AFD1;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		694CE9F8A81751E3D3A2E5DF = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					2746A0380B64C3D959026C6E = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = E366451DFA660146213B0607;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 0603F378EC755C9F3C7D71BC;
+			productRefGroup = A7C8B2065D2A25858CA767B0;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				2746A0380B64C3D959026C6E,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		3D6B84D5D9E8B86E6B1DE98C = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				851C8F29C73114171B96FB17,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		139C82580923D1A30BA6B193 = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0B52951886E9C3B04FA51AE4,
+				A904B8543F73773FB1295230,
+				C4781F8E52C1F965A5EB86D2,
+				638F830D78CE000A8632CD65,
+				1000FCCA591C31D4DB598724,
+				B8F1399A997E101A0E6ED260,
+				EE2FBE449BAFF745C9342FB1,
+				CB737B58312A2FF9C97FDF23,
+				077395F6BE856F8091509B6F,
+				B6E2B1DE234F8112BD77296F,
+				876B72DAC2A68607F9B4356F,
+				CBDA1F03B17C013A9FF9ED34,
+				F7412A7B3A25A790A38D988D,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		446B6CD86F75BE2CCF5492E7 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+			};
+			name = Debug;
+		};
+		6C455E3BDE4C617873971952 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+			};
+			name = Release;
+		};
+		8C0C1E8EFF24C1DFD0D8178D = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = LumenScene/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.user.lumenscene;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Debug;
+		};
+		88956B26FD8BE71EBB7C7EF4 = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = LumenScene/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.user.lumenscene;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_STRICT_CONCURRENCY = minimal;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 2;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		E366451DFA660146213B0607 = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				446B6CD86F75BE2CCF5492E7,
+				6C455E3BDE4C617873971952,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		2FC98B801D9B352C767508BB = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				8C0C1E8EFF24C1DFD0D8178D,
+				88956B26FD8BE71EBB7C7EF4,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 694CE9F8A81751E3D3A2E5DF;
+}
