@@ -18,11 +18,14 @@ and roughness data so light rakes across their depth.
 - **Glass** — dielectric Fresnel reflection/refraction with
   adjustable transmission, matte (roughness), tint and IOR; matte
   frosts both the reflection and the transmitted light.
-- **STEP import** — `.step` / `.stp` files copied into the app's
-  Files folder are imported in-app (no system document picker),
-  tessellated with Open CASCADE and split into scene objects by the
-  colours stored in the file. Imported surfaces support triplanar
-  procedural texturing.
+- **Model import** — STL, OBJ and USD/USDZ files copied into the
+  app's Files folder are imported in-app (no system document
+  picker) using Apple's ModelIO framework, split into scene
+  objects per submesh with per-submesh material colours where the
+  format carries them (STL carries none). Imported surfaces
+  support triplanar procedural texturing. STEP import is not
+  supported: no iOS library reads STEP without a separate CAD
+  engine, and this app does not include one.
 - **Procedural PBR textures** — concrete, cement and brick sets
   (albedo + tangent-space normal + roughness/height) generated
   on-device; tiled UVs on primitives with normal mapping and
@@ -35,30 +38,27 @@ and roughness data so light rakes across their depth.
   Edit mode flies with the same keys, Q/E for down/up, F focuses
   the selection.
 - **Save / export** — projects persist as JSON plus their source
-  STEP assets and meshes; export a project package (.zip) or a
+  model assets and meshes; export a project package (.zip) or a
   high-sample PNG render via the share sheet.
 
 ## Building
 
-The Xcode project is generated, not stored:
+The Xcode project is a static project stored in the repo at
+`App/LumenScene.xcodeproj` — there is no project generator and no
+external engine to build first:
 
 ```
-python3 App/gen_project.py            # needs cascade-engine/ next to App/
-xcodebuild -project LumenScene.xcodeproj -scheme LumenScene ...
+xcodebuild -project App/LumenScene.xcodeproj -scheme LumenScene ...
 ```
 
-CI (`.github/workflows/build-ipa.yml`) does the whole job on a
-standard macOS runner: it builds the CascadeKit engine (Open
-CASCADE iOS port, pinned by commit) once, caches it, then builds
-the unsigned app. `gen_project.py --engine-only` produces just the
-engine project; `LUMEN_ENGINE_DIST=<dir with libCascadeKit.a +
-occt_facade.h>` builds the app against a prebuilt engine.
+CI (`.github/workflows/build-ipa.yml`) is a single job on a
+standard macos-26 runner that builds the unsigned app and
+packages the IPA.
 
 The app requires iOS 17+ and a Metal ray-tracing-capable iPad.
 
 ## Third-party code
 
-- Open CASCADE Technology (OCCT) 8.0.1, LGPL 2.1 with the OCCT
-  exception — used for STEP import only. The license texts ship in
-  the app bundle.
+- Model import uses ModelIO, an Apple system framework; there is
+  no third-party CAD engine in the app.
 - Everything else is original to this project.

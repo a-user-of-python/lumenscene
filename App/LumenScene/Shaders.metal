@@ -124,7 +124,7 @@ kernel void pathTraceKernel(
     device const Material* materials [[buffer(7)]],
     device const uint* emissiveTris [[buffer(8)]],
     device const float* emissiveCDF [[buffer(9)]],
-    acceleration_structure<primitive_data> accel [[buffer(10)]],
+    acceleration_structure<> accel [[buffer(10)]],
     uint2 pixel [[thread_position_in_grid]])
 {
     uint width = accum.get_width();
@@ -148,10 +148,10 @@ kernel void pathTraceKernel(
     ray.min_distance = 0.0f;
     ray.max_distance = 1e30f;
 
-    intersector<triangle_data, primitive_data> isect;
+    intersector<triangle_data> isect;
     isect.assume_geometry_type(geometry_type::triangle);
     isect.accept_any_intersection(false);
-    intersector<triangle_data, primitive_data> shadowIsect;
+    intersector<triangle_data> shadowIsect;
     shadowIsect.assume_geometry_type(geometry_type::triangle);
     shadowIsect.accept_any_intersection(true);
 
@@ -166,13 +166,13 @@ kernel void pathTraceKernel(
             break;
         }
 
-        uint tri = hit.primitive_index;
+        uint tri = hit.primitive_id;
         uint i0 = indices[3 * tri], i1 = indices[3 * tri + 1], i2 = indices[3 * tri + 2];
         float3 p0 = float3(positions[3 * i0], positions[3 * i0 + 1], positions[3 * i0 + 2]);
         float3 p1 = float3(positions[3 * i1], positions[3 * i1 + 1], positions[3 * i1 + 2]);
         float3 p2 = float3(positions[3 * i2], positions[3 * i2 + 1], positions[3 * i2 + 2]);
-        float bc1 = hit.barycentric_coordinates.x;
-        float bc2 = hit.barycentric_coordinates.y;
+        float bc1 = hit.triangle_barycentric_coord.x;
+        float bc2 = hit.triangle_barycentric_coord.y;
         float bc0 = 1.0f - bc1 - bc2;
         float3 hitPos = p0 * bc0 + p1 * bc1 + p2 * bc2;
         float3 nInterp = normalize(
