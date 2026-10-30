@@ -57,6 +57,7 @@
 			isa = PBXGroup;
 			children = (
 				4281DDC591882CB6EAE5B96F,
+				17CD06A31553B02130CC0006,
 				A7C8B2065D2A25858CA767B0,
 			);
 			sourceTree = "<group>";
@@ -86,7 +87,6 @@
 				9F9EB49438D3A1D64AEE6FA7,
 				B576055B9D4E9035A4AFF13C,
 				A7E6938D864437149217D339,
-				17CD06A31553B02130CC0006,
 			);
 			path = LumenScene;
 			sourceTree = "<group>";
