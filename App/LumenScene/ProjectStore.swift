@@ -124,6 +124,11 @@ enum ProjectStore {
         projectDir(projectID).appendingPathComponent("assets/\(fileName)")
     }
 
+    static func removeAsset(projectID: UUID, fileName: String) {
+        try? FileManager.default.removeItem(
+            at: assetURL(projectID: projectID, fileName: fileName))
+    }
+
     // MARK: The app-folder drop zone (Documents)
 
     /// Model files dropped into the app folder via Files (STL / OBJ / USD / USDZ).

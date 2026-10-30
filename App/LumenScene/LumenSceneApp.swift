@@ -41,6 +41,20 @@ struct RootView: View {
             if ProjectStore.listProjects().isEmpty {
                 let demo = DemoScene.makeProject()
                 ProjectStore.saveProject(demo, thumbnailPNG: nil)
+                // Give the demo a real thumbnail immediately —
+                // the home screen shouldn't show a placeholder
+                // for it until someone happens to save. No editor
+                // is open yet and opening a project rebuilds the
+                // renderer, so borrowing it here is safe. The
+                // demo is all primitives, hence the empty mesh map.
+                if let renderer = Renderer.shared {
+                    renderer.rebuild(scene: demo.scene, meshes: [:])
+                    if let thumb = renderer.renderStillPNG(
+                        camera: demo.scene.camera.orbitBasis(),
+                        width: 640, height: 480, samples: 48) {
+                        ProjectStore.saveProject(demo, thumbnailPNG: thumb)
+                    }
+                }
             }
         }
     }

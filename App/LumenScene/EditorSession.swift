@@ -332,9 +332,16 @@ final class EditorSession: ObservableObject {
             guard let self else { return }
             switch result {
             case .failure(let error):
+                // Don't leave the copied original behind.
+                if let assetName {
+                    ProjectStore.removeAsset(projectID: projectID, fileName: assetName)
+                }
                 self.status = "Import failed: \(error.localizedDescription)"
             case .success(let parts):
                 guard !parts.isEmpty else {
+                    if let assetName {
+                        ProjectStore.removeAsset(projectID: projectID, fileName: assetName)
+                    }
                     self.status = "Import failed: the file contained no geometry."
                     return
                 }
@@ -388,6 +395,7 @@ final class EditorSession: ObservableObject {
     // MARK: Play mode
 
     func toggleMode() {
+        pressedKeys.removeAll() // a held key must not survive the switch
         mode = (mode == .edit) ? .play : .edit
         renderer.resetAccumulation()
         noteCameraActivity()

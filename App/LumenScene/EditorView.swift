@@ -54,6 +54,13 @@ struct EditorView: View {
             kbFocused = true
             session.kickRender()
         }
+        .onDisappear { session.pressedKeys.removeAll() }
+        .onChange(of: kbFocused) { _, focused in
+            // If focus is lost mid-keypress the key-up can be
+            // missed; a stuck movement key would drift the camera
+            // and keep the renderer awake forever.
+            if !focused { session.pressedKeys.removeAll() }
+        }
         .onKeyPress(phases: .all) { press in handleKey(press) }
         .sheet(isPresented: $showImport) { importSheet }
         .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
