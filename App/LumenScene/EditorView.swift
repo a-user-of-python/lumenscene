@@ -243,7 +243,7 @@ struct EditorView: View {
                     List(files, id: \.path) { url in
                         Button {
                             showImport = false
-                            session.importStepFile(url)
+                            session.importModelFile(url)
                         } label: {
                             HStack {
                                 Image(systemName: "cube")
