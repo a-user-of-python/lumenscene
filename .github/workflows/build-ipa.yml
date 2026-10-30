@@ -19,7 +19,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: engine-dist
-          key: cascade-engine-061875afb5384227db5f39cba81266cf889257a4-v1
+          key: cascade-engine-061875afb5384227db5f39cba81266cf889257a4-v2
       - name: Fetch Cascade engine (pinned cascade-ios)
         if: steps.engine-cache.outputs.cache-hit != 'true'
         run: |
@@ -41,6 +41,7 @@ jobs:
             -derivedDataPath build/eng \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            GCC_GENERATE_DEBUGGING_SYMBOLS=NO \
             build
           mkdir -p engine-dist
           cp build/eng/Build/Products/Release-iphoneos/libCascadeKit.a engine-dist/
