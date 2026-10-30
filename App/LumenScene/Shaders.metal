@@ -795,7 +795,8 @@ vertex PrecipOut precipVertex(uint vid [[vertex_id]],
                          precipHash(inst * 5u + 1u),
                          precipHash(inst * 5u + 2u));
     float3 p = base * box;
-    p.y = mod(p.y - u.time * speed, box.y);
+    p.y = fmod(p.y - u.time * speed, box.y);
+    if (p.y < 0.0f) p.y += box.y;
     if (!rain) {
         float phase = precipHash(inst * 5u + 4u) * 6.2831853f;
         p.x += sin(u.time * 0.8f + phase) * 0.35f;
