@@ -6,6 +6,7 @@
 import Foundation
 import SwiftUI
 import MetalKit
+import Photos
 import simd
 
 enum EditorMode { case edit, play }
@@ -188,9 +189,11 @@ final class EditorSession: ObservableObject {
                      liveSnowAmount, w.maxDepth)
             : nil
         footer.update(
-            hint: multiSelectMode
+            hint: isIdleFrozen
+                ? "Scene frozen — tap, press a key, or move to resume."
+                : (multiSelectMode
                 ? "Multi Select is on: tap objects in the view or the list to add or remove them. Drag any selected object to move them all. Tap empty space to clear."
-                : "Tap an object in the view to select it.",
+                : "Tap an object in the view to select it."),
             weather: showWeather ? parts.joined(separator: " · ") : nil,
             snowDepth: snowDepth,
             temperature: temperatureStatusText)
@@ -402,10 +405,260 @@ final class EditorSession: ObservableObject {
     weak var viewport: MTKView?
     private var lastCameraActivity: CFTimeInterval = 0
 
+    // MARK: v4.10 Idle freeze (WS1) + Final render (WS2) state
+
+    /// Wall-clock time of the last user input (see
+    /// noteUserInput). Initialised in init.
+    private var lastInputAt: CFTimeInterval = 0
+    /// True while the scene is idle-frozen: frameTick returns
+    /// before every scene-time consumer, the frame chain is
+    /// dead (wantsFrame false), and renderer.draw is not called.
+    private(set) var isIdleFrozen = false
+    private var frozenSince: CFTimeInterval = 0
+    /// A kickRender() that arrived while frozen collapses into
+    /// this flag; the wake path always kicks once, which is
+    /// that collapsed kick made real.
+    private var pendingKickWhileFrozen = false
+
+    /// v4.10 (WS1): the idle-freeze delay, held on the renderer
+    /// exactly like waterReflectionScale (in-memory preference,
+    /// not project data). 0 = Off. Changing it takes effect
+    /// immediately — frameTick compares it against the elapsed
+    /// idle time every frame, so a shorter delay can engage on
+    /// the very next frame of an idle period already under way,
+    /// and a longer one (or Off) simply never engages.
+    var idleFreezeSeconds: Double {
+        get { renderer.idleFreezeSeconds }
+        set { renderer.idleFreezeSeconds = newValue }
+    }
+
+    /// Every input path funnels here: viewport gestures, the
+    /// window-level touch observer, camera activity, hardware
+    /// keys, the Play joystick, and the discrete menu/button
+    /// funnels (save / exports / Play-Pause / weather / undo /
+    /// redo). Records the input; if the scene is frozen, wakes
+    /// it (see wakeFromIdleFreeze for the no-time-jump rules).
+    func noteUserInput() {
+        lastInputAt = CACurrentMediaTime()
+        if isIdleFrozen { wakeFromIdleFreeze() }
+    }
+
+    /// Wake from an idle freeze with NO scene-time jump:
+    /// - lastTick is set to nil, so the wake frame's dt is 0 —
+    ///   the raw dt that frameTick hands runtime.tick can never
+    ///   contain frozen time (movement/weather blocks also see
+    ///   dt == 0 on that frame).
+    /// - Wall-clock scene clocks are rebased by the frozen
+    ///   span: the camera shake's end time and the Play
+    ///   banner's expiry shift by the span, and the renderer
+    ///   rebases its precip phase + weather-sim clocks
+    ///   (noteSceneResumed). The banner expiry is a Date, so
+    ///   it shifts by the same span in wall time.
+    private func wakeFromIdleFreeze() {
+        guard isIdleFrozen else { return }
+        isIdleFrozen = false
+        let span = CACurrentMediaTime() - frozenSince
+        if shakeEndsAt > frozenSince { shakeEndsAt += span }
+        if let expiry = bannerExpiry {
+            bannerExpiry = expiry.addingTimeInterval(span)
+        }
+        frozenSince = 0
+        lastTick = nil
+        renderer.noteSceneResumed(frozenSpan: span)
+        pendingKickWhileFrozen = false
+        refreshFooter()
+        kickRender()
+    }
+
+    /// Operations that must never be frozen across: a static
+    /// AS build completing mid-freeze would swap geometry the
+    /// frozen frame cannot show (and its completion drives
+    /// frame requests the freeze would swallow), and a final
+    /// render reads the scene on a background queue. Save /
+    /// export / load / thumbnail are NOT listed: they are
+    /// main-thread synchronous and input-initiated —
+    /// noteUserInput precedes them, so they can never coincide
+    /// with the engage check, which only runs inside frameTick.
+    private func protectedOperationInFlight() -> Bool {
+        renderer.staticBuildInFlight || finalRenderActive
+    }
+
+    // MARK: v4.10 Final render state machine (WS2)
+
+    enum FinalRenderPhase { case idle, rendering, done, failed }
+    @Published var finalRenderPhase: FinalRenderPhase = .idle
+    @Published var finalRenderSamplesDone: Int = 0
+    @Published var finalRenderTotalSamples: Int = 4096
+    @Published var finalRenderPreview: CGImage? = nil
+    @Published var finalRenderImage: CGImage? = nil
+    @Published var finalRenderStatusText: String = ""
+    /// Drives the Render Image sheet (showNodes pattern).
+    @Published var finalRenderPresented: Bool = false
+    @Published var finalRenderWasCancelled: Bool = false
+    /// True while a final render runs — feeds the idle-freeze
+    /// protected list and frameTick's scene-time pause.
+    var finalRenderActive: Bool { finalRenderPhase == .rendering }
+    private let finalRenderCancelLock = NSLock()
+    private var finalRenderCancelFlag = false
+    private func setFinalRenderCancelFlag(_ value: Bool) {
+        finalRenderCancelLock.lock(); finalRenderCancelFlag = value
+        finalRenderCancelLock.unlock()
+    }
+    private func finalRenderIsCancelled() -> Bool {
+        finalRenderCancelLock.lock(); defer { finalRenderCancelLock.unlock() }
+        return finalRenderCancelFlag
+    }
+
+    /// Start a final render of the current view. Wakes a
+    /// frozen scene first (the render shows the frozen state
+    /// as it stands); the scene stays paused for the render's
+    /// whole duration (frameTick early-returns while
+    /// finalRenderActive), and the render itself runs on a
+    /// background queue with progress hopping to main.
+    func startFinalRender() {
+        noteUserInput()
+        guard finalRenderPhase != .rendering else {
+            finalRenderPresented = true
+            return
+        }
+        let basis = mode == .play ? project.scene.camera.playBasis()
+                                  : project.scene.camera.orbitBasis()
+        let size = viewport?.drawableSize ?? CGSize(width: 2360, height: 1640)
+        let width = max(1, Int(size.width))
+        let height = max(1, Int(size.height))
+        setFinalRenderCancelFlag(false)
+        finalRenderSamplesDone = 0
+        finalRenderTotalSamples = 4096
+        finalRenderPreview = nil
+        finalRenderImage = nil
+        finalRenderWasCancelled = false
+        finalRenderStatusText = "Rendering…"
+        finalRenderPhase = .rendering
+        finalRenderPresented = true
+        let renderer = self.renderer
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // bounces 16 (vs the interactive 5–6): a ray can
+            // survive ~5 full mirror→glass→mirror round trips
+            // before the budget ends it, where the interactive
+            // budget truncates such chains visibly. glassBudget
+            // 16 matches: 16 transmission crossings per path.
+            let image = renderer.renderFinalImage(
+                camera: basis, width: width, height: height,
+                totalSamples: 4096, bounces: 16, glassBudget: 16,
+                chunkSamples: 128,
+                shouldCancel: { [weak self] in self?.finalRenderIsCancelled() ?? true },
+                onProgress: { [weak self] done, snapshot in
+                    DispatchQueue.main.async {
+                        guard let self, self.finalRenderPhase == .rendering else { return }
+                        self.finalRenderSamplesDone = done
+                        if let snapshot { self.finalRenderPreview = snapshot }
+                    }
+                })
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.finalRenderWasCancelled = self.finalRenderIsCancelled()
+                if let image {
+                    self.finalRenderImage = image
+                    self.finalRenderPreview = image
+                    self.finalRenderPhase = .done
+                    self.finalRenderStatusText = self.finalRenderWasCancelled
+                        ? "Cancelled at \(self.finalRenderSamplesDone) samples — best image kept"
+                        : "Render complete — \(self.finalRenderTotalSamples) samples"
+                } else {
+                    self.finalRenderPhase = .failed
+                    self.finalRenderStatusText = "Render failed — no image was produced."
+                }
+                self.kickRender()
+            }
+        }
+    }
+
+    /// Cancel the running render: the render loop notices
+    /// between chunks (bounded by one 128-sample chunk) and
+    /// finishes with the best image accumulated so far, which
+    /// the completion path above keeps as the final image.
+    func cancelFinalRender() {
+        setFinalRenderCancelFlag(true)
+    }
+
+    /// PNG data for the finished render (renderStillPNG's
+    /// encoding, via the renderer's shared helper).
+    func finalRenderPNGData() -> Data? {
+        guard let image = finalRenderImage else { return nil }
+        return renderer.pngData(from: image)
+    }
+
+    /// Save the finished render into the Photos library
+    /// (add-only authorization; NSPhotoLibraryAddUsageDescription
+    /// is in the app's Info.plist).
+    func saveFinalRenderToPhotos() {
+        guard let data = finalRenderPNGData() else {
+            finalRenderStatusText = "No finished render to save yet."
+            return
+        }
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] auth in
+            guard auth == .authorized || auth == .limited else {
+                DispatchQueue.main.async {
+                    self?.finalRenderStatusText = "Photos access not allowed — Save to Files or Share instead."
+                }
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                let request = PHAssetCreationRequest.forAsset()
+                request.addResource(with: .photo, data: data, options: nil)
+            } completionHandler: { success, _ in
+                DispatchQueue.main.async {
+                    self?.finalRenderStatusText = success ? "Saved to Photos." : "Saving to Photos failed."
+                }
+            }
+        }
+    }
+
+    /// Write the finished render as a PNG into
+    /// Documents/Renders/<project name>-render.png — visible
+    /// in the Files app via the app's file sharing.
+    @discardableResult
+    func saveFinalRenderToFiles() -> URL? {
+        guard let data = finalRenderPNGData() else {
+            finalRenderStatusText = "No finished render to save yet."
+            return nil
+        }
+        do {
+            let docs = FileManager.default.urls(for: .documentDirectory,
+                                                in: .userDomainMask)[0]
+            let folder = docs.appendingPathComponent("Renders", isDirectory: true)
+            try FileManager.default.createDirectory(at: folder,
+                                                    withIntermediateDirectories: true)
+            let name = project.name.replacingOccurrences(of: "/", with: "-")
+            let url = folder.appendingPathComponent("\(name.isEmpty ? "Untitled" : name)-render.png")
+            try data.write(to: url, options: .atomic)
+            finalRenderStatusText = "Saved to Files: Renders/\(url.lastPathComponent)"
+            return url
+        } catch {
+            finalRenderStatusText = "Saving to Files failed."
+            return nil
+        }
+    }
+
+    /// Temp PNG for the Share sheet (exportPNGURL's pattern).
+    func finalRenderShareURL() -> URL? {
+        guard let data = finalRenderPNGData() else { return nil }
+        let name = project.name.replacingOccurrences(of: "/", with: "-")
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(name.isEmpty ? "Untitled" : name)-render.png")
+        do {
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch { return nil }
+    }
+
     init(project: Project, renderer: Renderer) {
         self.runtime = GameRuntime()
         self.project = project
         self.renderer = renderer
+        // v4.10 (WS1): the idle clock starts at session birth,
+        // so a freshly opened scene gets a full delay of grace.
+        lastInputAt = CACurrentMediaTime()
         runtime.session = self
         for obj in project.scene.objects where obj.source == "model" {
             if let file = obj.meshFile,
@@ -475,11 +728,17 @@ final class EditorSession: ObservableObject {
     /// draws itself while `wantsFrame` stays true, so a converged,
     /// untouched scene costs nothing.
     func kickRender() {
+        // v4.10 (WS1): while frozen, kicks collapse into a flag
+        // — the wake path issues the one real kick.
+        if isIdleFrozen { pendingKickWhileFrozen = true; return }
         viewport?.setNeedsDisplay()
     }
 
     func wantsFrame() -> Bool {
-        renderer.frameWanted || !pressedKeys.isEmpty || touchActive
+        // v4.10 (WS1): a frozen scene never wants a frame — the
+        // viewport's chained-draw loop dies at the freeze.
+        if isIdleFrozen { return false }
+        return renderer.frameWanted || !pressedKeys.isEmpty || touchActive
             || project.scene.weather.mode != 0
             // v4.0: the node runtime asks for frames while it has
             // live work (tweens, timers, particles); a showing
@@ -493,6 +752,9 @@ final class EditorSession: ObservableObject {
     /// change): the next frames are "moving" frames and the view
     /// needs a draw.
     func noteCameraActivity() {
+        // v4.10 (WS1): camera activity IS user input — it
+        // records the input time and wakes a frozen scene.
+        noteUserInput()
         lastCameraActivity = CACurrentMediaTime()
         kickRender()
     }
@@ -527,6 +789,7 @@ final class EditorSession: ObservableObject {
     }
 
     func undo() {
+        noteUserInput()
         guard let last = undoStack.popLast() else { return }
         if let cur = snapshot() { redoStack.append(cur) }
         restore(last)
@@ -534,6 +797,7 @@ final class EditorSession: ObservableObject {
     }
 
     func redo() {
+        noteUserInput()
         guard let last = redoStack.popLast() else { return }
         if let cur = snapshot() { undoStack.append(cur) }
         restore(last)
@@ -1038,6 +1302,7 @@ final class EditorSession: ObservableObject {
     // MARK: Play mode
 
     func toggleMode() {
+        noteUserInput()
         pressedKeys.removeAll() // a held key must not survive the switch
         touchVector = .zero // a stuck joystick must not survive either
         // v4.6: multi-select is an edit-mode tool — entering
@@ -1724,6 +1989,7 @@ final class EditorSession: ObservableObject {
     /// state, but NOT undoable — undo snapshots only cover objects,
     /// so no beginEdit() here.
     func setWeatherMode(_ mode: Int) {
+        noteUserInput()
         // Accumulators stay the source of truth — do not reset
         // them on a mode change (they were initialised from the
         // project and are kept in sync with it).
@@ -2164,6 +2430,31 @@ final class EditorSession: ObservableObject {
     func frameTick(view: MTKView) {
         let now = CACurrentMediaTime()
         defer { lastTick = now }
+        // v4.10 (WS1): idle-freeze engage check, at the TOP of
+        // frameTick — before the dt computation below and
+        // therefore before EVERY dt consumer (movement, weather
+        // build-up, runtime.tick, the player-figure driver) and
+        // before renderer.draw. Engaging requires the full
+        // delay elapsed since the last input and no protected
+        // operation in flight; if a protected operation is in
+        // flight the check simply re-runs next frame, so the
+        // freeze engages on the first clear frame past delay.
+        if !isIdleFrozen, renderer.idleFreezeSeconds > 0,
+           (now - lastInputAt) >= renderer.idleFreezeSeconds,
+           !protectedOperationInFlight() {
+            isIdleFrozen = true
+            frozenSince = now
+            refreshFooter()
+        }
+        // Frozen, or a final render is running: scene time is
+        // paused. The defer above still rebases lastTick to
+        // now, so even a stray draw cannot accumulate a dt
+        // debt; the real wake additionally sets lastTick = nil
+        // (dt == 0 on the wake frame, guaranteed). While a
+        // final render runs this gate also keeps the idle
+        // timer from engaging mid-render (belt and braces with
+        // the protected list, which independently blocks it).
+        if isIdleFrozen || finalRenderActive { return }
         let dt = lastTick.map { Float(now - $0) } ?? 0
         if dt > 0 && dt < 0.25 { applyMovement(dt: dt) }
         // Weather build-up advances with real time: rain wets
@@ -2670,6 +2961,7 @@ final class EditorSession: ObservableObject {
     // MARK: Save / export
 
     func save() {
+        noteUserInput()
         syncWeatherToProject()
         project.modifiedAt = Date()
         // The thumbnail is the view the user is actually looking
@@ -2687,12 +2979,14 @@ final class EditorSession: ObservableObject {
     }
 
     func exportPackageURL() -> URL? {
+        noteUserInput()
         syncWeatherToProject()
         save()
         return ProjectStore.exportPackage(projectID: project.id)
     }
 
     func exportPNGURL() -> URL? {
+        noteUserInput()
         syncWeatherToProject()
         let basis = mode == .play ? project.scene.camera.playBasis()
                                   : project.scene.camera.orbitBasis()

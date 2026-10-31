@@ -238,6 +238,18 @@ final class Renderer {
     private var tonemapPipeline: MTLRenderPipelineState?
     private var precipPipeline: MTLRenderPipelineState?
     private var precipSeedBuffer: MTLBuffer?
+    /// v4.10 (WS2 steering): the seed field in CPU form (the
+    /// same deterministic LCG array the GPU buffer holds), and
+    /// a snapshot of the LAST precipitation pass actually
+    /// encoded — time / intensity / wind / draw count as the
+    /// user last saw them. The final render rebuilds its rain
+    /// drops from exactly this snapshot, so the still's drops
+    /// sit where the frozen live view showed them.
+    private var precipSeeds: [SIMD4<Float>] = []
+    private var lastPrecipTime: Float? = nil
+    private var lastPrecipIntensity: Float = 1
+    private var lastPrecipWind = SIMD2<Float>(1.2, 0.4)
+    private var lastPrecipCount: Int = 0
     private var linePipeline: MTLRenderPipelineState?
     private var fieldPipeline: MTLComputePipelineState?
     /// Baked weather field (v3.3): level-independent, baked
@@ -287,6 +299,10 @@ final class Renderer {
     }
     private var pendingStatic: PreparedStatic?
     private var deferredStatic: PreparedStatic?
+    /// v4.10 (WS1): read-only query for the session's idle-freeze
+    /// protected-operations check — a static build is in flight
+    /// while a stage is pending (building) or deferred behind it.
+    var staticBuildInFlight: Bool { pendingStatic != nil || deferredStatic != nil }
     private var staticEverSwapped = false
     /// The last presented frame's command buffer: the bounded
     /// fence for CPU writes into shared buffers (see
@@ -643,6 +659,16 @@ final class Renderer {
     /// renderer-side setting chosen in the UI, not project
     /// data); the session setter is setWaterReflectionScale.
     var waterReflectionScale: Float = 1.0
+    /// v4.10 (WS1): idle-freeze delay in seconds (0 = Off).
+    /// Held exactly like qualityPreference / waterReflectionScale
+    /// — a renderer-side, in-memory preference chosen in the UI,
+    /// NOT project data and NOT UserDefaults.
+    var idleFreezeSeconds: Double = 60
+    /// v4.10 (WS1): cumulative wall-clock span removed from the
+    /// precipitation overlay's phase clock on every wake from an
+    /// idle freeze, so frozen spans do not move the rain/snow
+    /// phase. See noteSceneResumed(frozenSpan:).
+    var precipTimeOffset: CFTimeInterval = 0
     /// Incremented once per presented frame; feeds the
     /// rotating reflection-selection pattern in the trace
     /// kernel so sub-full scales cycle coverage across frames.
@@ -852,6 +878,7 @@ final class Renderer {
                 let w = Float(state >> 8) * (1.0 / 16777216.0)
                 seeds.append(SIMD4<Float>(x, y, z, w))
             }
+            precipSeeds = seeds
             precipSeedBuffer = seeds.withUnsafeBytes { raw in
                 guard let base = raw.baseAddress else { return nil }
                 return device.makeBuffer(bytes: base, length: raw.count, options: .storageModeShared)
@@ -3346,6 +3373,27 @@ final class Renderer {
         simWaterContent = false
     }
 
+    /// v4.10 (WS1): the session woke from an idle freeze spanning
+    /// `frozenSpan` wall-clock seconds. Rebase every wall-clock
+    /// scene clock the renderer owns so that span does not leak
+    /// into the simulation or the precipitation phase:
+    /// - precipTimeOffset grows by the span (encodePrecip
+    ///   subtracts it), so rain/snow hang exactly where they
+    ///   froze instead of jumping ahead.
+    /// - simLastTick = 0 makes the next tickWeatherSim call take
+    ///   its rebase branch (it sets simLastTick = now and steps
+    ///   nothing), so none of the up-to-4 substeps that a raw dt
+    ///   could otherwise produce run for frozen time.
+    /// - simLastSettleScan = 0 likewise restarts the settle-scan
+    ///   cadence from the wake frame.
+    /// Nothing else changes: rates, substep size and all sim
+    /// math are untouched.
+    func noteSceneResumed(frozenSpan: CFTimeInterval) {
+        precipTimeOffset += frozenSpan
+        simLastTick = 0
+        simLastSettleScan = 0
+    }
+
     /// Step the simulation from the render loop. Fixed substeps
     /// of 1/30 s, at most 4 per frame (excess time is dropped,
     /// never spiralled); 1 source/sink dispatch + 3 flow passes
@@ -5385,7 +5433,7 @@ final class Renderer {
                 pu.tanFovAspect = SIMD2<Float>(
                     tan(fovY / 2),
                     Float(view.drawableSize.width) / Float(max(view.drawableSize.height, 1)))
-                pu.time = Float(CACurrentMediaTime().truncatingRemainder(dividingBy: 3600))
+                pu.time = Float((CACurrentMediaTime() - precipTimeOffset).truncatingRemainder(dividingBy: 3600))
                 pu.mode = UInt32(weatherMode)
                 pu.intensity = weatherDynIntensity
                 pu.windXZ = weatherWind
@@ -5397,6 +5445,13 @@ final class Renderer {
                 let inten = max(0.35, min(weatherDynIntensity, 1.15))
                 let baseCount = weatherMode == 1 ? 1600 : 1200
                 let particleCount = Int(Float(baseCount) * (0.45 + 0.55 * inten))
+                // v4.10 (WS2 steering): remember the pass just
+                // encoded — the final render's rain drops are
+                // rebuilt from this exact snapshot.
+                lastPrecipTime = pu.time
+                lastPrecipIntensity = pu.intensity
+                lastPrecipWind = pu.windXZ
+                lastPrecipCount = particleCount
                 penc.drawPrimitives(type: .triangle, vertexStart: 0,
                                     vertexCount: particleCount * 6)
                 penc.endEncoding()
@@ -5813,6 +5868,339 @@ final class Renderer {
         lastSnow = weatherSnow
         guard accel != nil else { return false }
         return moving || weatherMode != 0 || (traced && sampleCount < t.maxSettle)
+    }
+
+    // MARK: v4.10 Final render (WS2)
+
+    /// Shared BGRA readback target for still tonemapping.
+    private func makeStillTarget(width: Int, height: Int) -> MTLTexture? {
+        let targetDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+        targetDesc.usage = [.renderTarget, .shaderRead]
+        targetDesc.storageMode = .shared
+        return device.makeTexture(descriptor: targetDesc)
+    }
+
+    /// Tonemap `source` (an accumulation-format texture whose
+    /// alpha is its sample count) into `target` and read it back
+    /// as a CGImage. This is renderStillPNG's tonemap + readback
+    /// tail, factored out so the final render can snapshot its
+    /// progressive accumulation after every chunk and produce
+    /// its final image through exactly the same path.
+    private func cgImageByTonemapping(source: MTLTexture, samples: Int,
+                                      width: Int, height: Int,
+                                      target: MTLTexture) -> CGImage? {
+        guard let tonemapPipeline, let cmd = queue.makeCommandBuffer() else { return nil }
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        pass.colorAttachments[0].storeAction = .store
+        guard let renc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return nil }
+        var params = TonemapParams(samples: UInt32(max(samples, 1)), exposure: exposure)
+        renc.setRenderPipelineState(tonemapPipeline)
+        renc.setFragmentTexture(source, index: 0)
+        // Inert placeholders, exactly as in renderStillPNG: the
+        // fragment's shimmer block is gated on shimmerRain > 0
+        // (0 here) and never samples indices 1-3 for stills.
+        renc.setFragmentTexture(weatherFieldTex, index: 1)
+        renc.setFragmentTexture(weatherFieldTex, index: 2)
+        renc.setFragmentTexture(weatherFieldTex, index: 3)
+        renc.setFragmentBytes(&params, length: MemoryLayout<TonemapParams>.stride, index: 0)
+        renc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        renc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        let gotBytes: Bool = bytes.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return false }
+            target.getBytes(base, bytesPerRow: width * 4,
+                            from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+            return true
+        }
+        guard gotBytes else { return nil }
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                      | CGBitmapInfo.byteOrder32Little.rawValue)
+        return CGImage(width: width, height: height, bitsPerComponent: 8,
+                       bitsPerPixel: 32, bytesPerRow: width * 4,
+                       space: cs, bitmapInfo: bitmapInfo,
+                       provider: provider, decode: nil,
+                       shouldInterpolate: false, intent: .defaultIntent)
+    }
+
+    /// Encode a CGImage as PNG (renderStillPNG's tail encoding,
+    /// shared with the session's final-render output actions).
+    func pngData(from image: CGImage) -> Data? {
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(
+            out, UTType.png.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, image, nil)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return out as Data
+    }
+
+    /// v4.10 (WS2 steering): refractive rain drops for the
+    /// final render — HOW MANY and HOW BIG, stated plainly:
+    /// at most 384 drops (the nearest to the camera of the
+    /// drops the live overlay was actually drawing), each a
+    /// 36-triangle lathe (6 sides, 3 rings + 2 poles) at the
+    /// live streak's own size (0.6 m long, 0.032 m wide), so a
+    /// full drop set is 13,824 triangles — inside the dynamic
+    /// layer's 90,000-triangle budget alongside the scene's
+    /// own dynamic entries. Positions are a Swift port of
+    /// precipVertex's placement for mode 1, evaluated with
+    /// the LAST ENCODED pass's time / intensity / wind /
+    /// draw count (the frozen view the user is looking at)
+    /// around the render camera, keeping only drops the
+    /// overlay would show (centre in front, z >= 0.3, and
+    /// within the 30 m far-fade distance where its fade
+    /// reaches zero). Snow mode gets NO geometry (rain only).
+    private static let finalRenderDropCap = 384
+
+    private func finalRenderRainDropMesh(camera: CameraBasis) -> MeshData? {
+        guard weatherMode == 1, let time = lastPrecipTime,
+              !precipSeeds.isEmpty else { return nil }
+        let count = min(lastPrecipCount, precipSeeds.count, 1600)
+        guard count > 0 else { return nil }
+        let box = SIMD3<Float>(36, 22, 36)
+        let wind = SIMD3<Float>(lastPrecipWind.x, 0, lastPrecipWind.y)
+        var drops: [(centre: SIMD3<Float>, speed: Float, dist: Float)] = []
+        for i in 0..<count {
+            let seed = precipSeeds[i]
+            // precipVertex (rain): speed from the seed's w.
+            let speed = (10 + seed.w * 4) * (0.85 + 0.30 * lastPrecipIntensity)
+            var p = SIMD3<Float>(seed.x * box.x, seed.y * box.y, seed.z * box.z)
+            p.y = (p.y - time * speed).truncatingRemainder(dividingBy: box.y)
+            if p.y < 0 { p.y += box.y }
+            // Wind carry, rain factor 0.25 (precipVertex).
+            p.x = (p.x + time * wind.x * 0.25).truncatingRemainder(dividingBy: box.x)
+            if p.x < 0 { p.x += box.x }
+            p.z = (p.z + time * wind.z * 0.25).truncatingRemainder(dividingBy: box.z)
+            if p.z < 0 { p.z += box.z }
+            let centre = SIMD3<Float>(camera.origin.x + (p.x - box.x * 0.5),
+                                      camera.origin.y - 2 + p.y,
+                                      camera.origin.z + (p.z - box.z * 0.5))
+            let rel = centre - camera.origin
+            let dist = simd_length(rel)
+            guard simd_dot(rel, camera.forward) >= 0.3, dist <= 30 else { continue }
+            drops.append((centre, speed, dist))
+        }
+        drops.sort { $0.dist < $1.dist }
+        let chosen = drops.prefix(Self.finalRenderDropCap)
+        guard !chosen.isEmpty else { return nil }
+        // One lathe per drop, baked in world space. Winding
+        // follows MeshGen's cylinder verbatim (bands
+        // (a,b,c)/(b,d,c) along the axis, cap fans
+        // (pole,k,k+1) at the tail and (pole,k+1,k) at the
+        // head), so front-facing determination matches the
+        // shipped glass primitives exactly.
+        var mesh = MeshData()
+        let radial = 6
+        let halfLen: Float = 0.3
+        let maxR: Float = 0.016
+        // Ring profile along the fall axis: (offset, radius
+        // factor) — a stretched teardrop, fuller at the
+        // leading (lower, +axis) end.
+        let profile: [(s: Float, r: Float)] = [(-0.18, 0.70), (0.0, 1.0), (0.18, 0.74)]
+        for drop in chosen {
+            var axis = SIMD3<Float>(wind.x, -drop.speed, wind.z)
+            axis = simd_normalize(axis)
+            let helper = abs(axis.y) < 0.9 ? SIMD3<Float>(0, 1, 0) : SIMD3<Float>(1, 0, 0)
+            let side = simd_normalize(simd_cross(helper, axis))
+            let other = simd_normalize(simd_cross(axis, side))
+            let pole0 = mesh.vertexCount
+            mesh.addVertex(drop.centre - axis * halfLen, -axis, SIMD2<Float>(0, 0))
+            var ringStart: [Int] = []
+            for prof in profile {
+                ringStart.append(mesh.vertexCount)
+                for k in 0..<radial {
+                    let th = Float(k) / Float(radial) * 2 * .pi
+                    let dir = side * cos(th) + other * sin(th)
+                    mesh.addVertex(drop.centre + axis * prof.s + dir * (maxR * prof.r),
+                                   dir, SIMD2<Float>(0, 0))
+                }
+            }
+            let pole1 = mesh.vertexCount
+            mesh.addVertex(drop.centre + axis * halfLen, axis, SIMD2<Float>(0, 0))
+            for k in 0..<radial {
+                let k1 = (k + 1) % radial
+                // Tail fan (cylinder bottom-cap convention).
+                mesh.indices += [UInt32(pole0), UInt32(ringStart[0] + k), UInt32(ringStart[0] + k1)]
+                // Head fan (cylinder top-cap convention).
+                let last = ringStart[ringStart.count - 1]
+                mesh.indices += [UInt32(pole1), UInt32(last + k1), UInt32(last + k)]
+            }
+            for band in 0..<(ringStart.count - 1) {
+                let a0 = ringStart[band], b0 = ringStart[band + 1]
+                for k in 0..<radial {
+                    let k1 = (k + 1) % radial
+                    let a = a0 + k, b = b0 + k, c = a0 + k1, d = b0 + k1
+                    mesh.indices += [UInt32(a), UInt32(b), UInt32(c),
+                                     UInt32(b), UInt32(d), UInt32(c)]
+                }
+            }
+        }
+        return mesh
+    }
+
+    /// The drop material: a glass-class GPUMaterial the
+    /// EXISTING transmission machinery traces (FLAG_GLASS,
+    /// transmission 1, roughness 0, IOR 1.33 — water — and a
+    /// white tint, so Beer–Lambert absorption is zero and the
+    /// drop is clear water). No new shader path exists.
+    private func finalRenderDropMaterial() -> GPUMaterial {
+        var g = GPUMaterial()
+        g.baseColor = SIMD4<Float>(1, 1, 1, 0)
+        g.emissive = SIMD4<Float>(0, 0, 0, 0)
+        g.glassParams = SIMD4<Float>(1, 0, 1.33, 0)
+        g.tint = SIMD4<Float>(1, 1, 1, 1)
+        g.texIndex = 0
+        g.flags = 2 // FLAG_GLASS
+        g.pad = SIMD2<UInt32>(0x3F800000, 0) // exposure 1.0
+        return g
+    }
+
+    /// v4.10 (WS2): progressive offline-quality still — the
+    /// "Blender render" of the current view. Built on
+    /// renderStillPNG's pattern: pending static builds and the
+    /// material table are flushed first, the FULL emissive set
+    /// is force-restored for the whole render (light culling
+    /// off) and re-activated by defer on every exit path, and
+    /// samples accumulate chunk by chunk into ONE accumulation
+    /// texture via repeated encodeTrace calls with advancing
+    /// seedStart (encodeTrace dispatches `count` samples with
+    /// seeds seedStart+i into the existing accum). One command
+    /// buffer per chunk; after each chunk the accumulation is
+    /// tonemapped into the shared BGRA target and reported via
+    /// onProgress as a CGImage snapshot. shouldCancel() is
+    /// checked between chunks, so a cancel is bounded by one
+    /// chunk (128 samples) and keeps the best image so far.
+    /// At finish — complete OR cancelled — the accumulation is
+    /// denoised (see below) and tonemapped for the returned
+    /// image; if the denoise textures/pipeline are unavailable
+    /// the raw accumulation is tonemapped instead (fallback
+    /// path). Returns nil only on hard failure (no textures,
+    /// no guide, or the first trace chunk fails to encode).
+    func renderFinalImage(camera: CameraBasis, width: Int, height: Int,
+                          totalSamples: Int, bounces: UInt32, glassBudget: UInt32,
+                          chunkSamples: Int, shouldCancel: () -> Bool,
+                          onProgress: (Int, CGImage?) -> Void) -> CGImage? {
+        flushPendingStaticBuild()
+        flushMaterialTable()
+        guard width > 0, height > 0, totalSamples > 0,
+              let accum = makeAccumTexture(width: width, height: height),
+              let guide = makeGuideTexture(width: width, height: height),
+              let guideNormal = makeGuideNormalTexture(width: width, height: height),
+              let target = makeStillTarget(width: width, height: height)
+        else { return nil }
+        // Full emissive set for the whole render, exactly as
+        // renderStillPNG: force-restore now, defer re-activate
+        // the culled set on every exit path (after the waits
+        // below on success paths; uncommitted on failure paths).
+        let wasCulling = cullingActive
+        if wasCulling { restoreFullEmissive() }
+        defer { if wasCulling { activateCulledEmissive() } }
+        // v4.10 (WS2 steering): TRUE REFRACTIVE RAIN. When the
+        // effective weather mode is rain, the drops are built
+        // as real glass-class geometry in the DYNAMIC layer
+        // (its own AS, which encodeTrace / encodeGuide already
+        // intersect alongside the static AS, with materials
+        // from the same table) for the duration of this render
+        // only. They are static across every sample — the
+        // placement snapshot never changes during the loop —
+        // so each drop refracts the scene behind it at water
+        // IOR 1.33 through the existing transmission path
+        // (the render's glassBudget of 16 covers the two
+        // crossings per drop plus scene glass). RESTORE
+        // DISCIPLINE: the pre-render dynamic entry list is
+        // saved here and restored verbatim by the defer below
+        // (LIFO: drops come out before the culling restore),
+        // recomposing the dynamic layer to exactly its
+        // pre-render state on EVERY exit path — success,
+        // cancel, or failure. The only lasting side effect is
+        // the accumulation reset composeDynamic performs,
+        // the same transient the culling restore already
+        // causes in renderStillPNG: the live view simply
+        // re-accumulates afterwards. Snow gets no geometry.
+        let savedDynEntriesForDrops = dynEntries
+        var dropsInstalled = false
+        if let dropMesh = finalRenderRainDropMesh(camera: camera) {
+            dynEntries = savedDynEntriesForDrops + [DynEntry(
+                key: UUID(), mesh: dropMesh, matrix: float4x4(),
+                material: finalRenderDropMaterial(), objectID: nil)]
+            composeDynamic(structureChanged: true)
+            // composeDynamic only STAGES the material table —
+            // flush it so the drop's glass material slot is in
+            // the buffer encodeTrace actually reads (no draw
+            // intervenes during a still to flush it for us).
+            flushMaterialTable()
+            dropsInstalled = true
+        }
+        defer {
+            if dropsInstalled {
+                dynEntries = savedDynEntriesForDrops
+                composeDynamic(structureChanged: true)
+                flushMaterialTable()
+            }
+        }
+        // Guide pass once (the camera never moves during a
+        // still) + a cleared accumulation to start from.
+        guard let guideCmd = queue.makeCommandBuffer() else { return nil }
+        guard encodeGuide(guide: guide, guideNormal: guideNormal,
+                          camera: camera, cmd: guideCmd) else { return nil }
+        clearAccum(accum, cmd: guideCmd)
+        guideCmd.commit()
+        guideCmd.waitUntilCompleted()
+        var done = 0
+        let chunkSize = max(1, chunkSamples)
+        while done < totalSamples {
+            if done > 0, shouldCancel() { break }
+            let chunk = min(chunkSize, totalSamples - done)
+            guard let cmd = queue.makeCommandBuffer() else { return nil }
+            let traced = encodeTrace(accum: accum, camera: camera, count: chunk,
+                                     seedStart: UInt32(done), bounces: bounces,
+                                     cap: 1_000_000, glassBudget: glassBudget,
+                                     cmd: cmd)
+            guard traced else { return done > 0 ? cgImageByTonemapping(
+                source: accum, samples: done, width: width, height: height,
+                target: target) : nil }
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            done += chunk
+            let snapshot = cgImageByTonemapping(source: accum, samples: done,
+                                                width: width, height: height,
+                                                target: target)
+            onProgress(done, snapshot)
+            if shouldCancel() { break }
+        }
+        guard done > 0 else { return nil }
+        // Final denoise, mirroring the LIVE settled denoise
+        // invocation in draw(): a still, non-Play frame uses
+        // strength 0.8, fadeEnd = cap * 0.6, fadeEndSpec = cap
+        // with the Auto settle cap (768) as the cap. (At the
+        // final render's 4,096 samples the per-pixel fade in
+        // the kernel has already handed over to the raw
+        // accumulation for both classes, so this pass is the
+        // same no-op-at-maturity the live path applies; on a
+        // cancelled early render it cleans the young image
+        // exactly as the live denoise would.) If the denoise
+        // output texture or pipeline is unavailable, fall back
+        // to tonemapping the raw accumulation.
+        var finalSource = accum
+        if let display = makeAccumTexture(width: width, height: height),
+           let cmd = queue.makeCommandBuffer(),
+           encodeDenoise(accum: accum, guide: guide, guideNormal: guideNormal,
+                         output: display, strength: 0.8,
+                         fadeEnd: 768 * 0.6, fadeEndSpec: 768,
+                         camera: camera, cmd: cmd) {
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            finalSource = display
+        }
+        return cgImageByTonemapping(source: finalSource, samples: done,
+                                    width: width, height: height, target: target)
     }
 
     /// Render the current scene offscreen and return a PNG (used for

@@ -14,6 +14,27 @@ import SwiftUI
 import MetalKit
 import simd
 
+/// v4.10 (WS1): window-level touch observer — a gesture
+/// recognizer that only LISTENS. It overrides touchesBegan /
+/// touchesMoved to report the touch and NEVER transitions
+/// state (it stays .possible, cancels nothing, prevents
+/// nothing), so every touch anywhere in the editor window —
+/// panels, menus, sheets, buttons — counts as user input for
+/// the idle freeze, without interfering with any real
+/// recognizer or control. One known boundary, stated
+/// honestly: the on-screen keyboard lives in a SEPARATE
+/// window, so its keystrokes are not observed here; hardware
+/// keys reach EditorView.handleKey, which also reports input.
+final class WindowTouchObserver: UIGestureRecognizer {
+    var onTouch: (() -> Void)?
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        onTouch?()
+    }
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        onTouch?()
+    }
+}
+
 struct MetalViewport: UIViewRepresentable {
     @ObservedObject var session: EditorSession
 
@@ -51,7 +72,24 @@ struct MetalViewport: UIViewRepresentable {
             session.kickRender()
         }
 
+        private var windowObserverInstalled = false
+
+        /// v4.10 (WS1): install the window touch observer once
+        /// the view has a window (first draw — the window
+        /// exists by then; guarded against double-install).
+        private func installWindowTouchObserverIfNeeded(in view: MTKView) {
+            guard !windowObserverInstalled, let window = view.window else { return }
+            windowObserverInstalled = true
+            let observer = WindowTouchObserver()
+            observer.cancelsTouchesInView = false
+            observer.delaysTouchesBegan = false
+            observer.delaysTouchesEnded = false
+            observer.onTouch = { [weak self] in self?.session.noteUserInput() }
+            window.addGestureRecognizer(observer)
+        }
+
         func draw(in view: MTKView) {
+            installWindowTouchObserverIfNeeded(in: view)
             session.frameTick(view: view)
             // Chain the next frame only while one is wanted —
             // paced to ~60/s, and the chain dies on its own when
@@ -102,6 +140,7 @@ struct MetalViewport: UIViewRepresentable {
         }
 
         @objc private func handleOrbit(_ g: UIPanGestureRecognizer) {
+            session.noteUserInput()
             guard let view = g.view else { return }
             // Edit mode: a drag that starts on the selected object
             // moves the object instead of orbiting. v4.6: with a
@@ -141,6 +180,7 @@ struct MetalViewport: UIViewRepresentable {
         }
 
         @objc private func handlePan(_ g: UIPanGestureRecognizer) {
+            session.noteUserInput()
             guard session.mode == .edit, let view = g.view else { return }
             let t = g.translation(in: view)
             g.setTranslation(.zero, in: view)
@@ -159,6 +199,7 @@ struct MetalViewport: UIViewRepresentable {
         }
 
         @objc private func handlePinch(_ g: UIPinchGestureRecognizer) {
+            session.noteUserInput()
             guard session.mode == .edit else { return }
             if g.state == .began { lastPinchScale = g.scale }
             guard g.state == .changed else { return }
@@ -171,6 +212,7 @@ struct MetalViewport: UIViewRepresentable {
         }
 
         @objc private func handleTap(_ g: UITapGestureRecognizer) {
+            session.noteUserInput()
             guard let view = g.view, let (ndc, aspect) = ndc(for: g, in: view) else { return }
             session.handleTap(ndc: ndc, aspect: aspect)
         }

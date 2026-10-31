@@ -65,6 +65,13 @@ struct EditorView: View {
         .onKeyPress(phases: .all) { press in handleKey(press) }
         .sheet(isPresented: $showImport) { importSheet }
         .sheet(isPresented: $showNodes) { NodeEditorView(session: session) }
+        .sheet(isPresented: $session.finalRenderPresented, onDismiss: {
+            // v4.10 (WS2): swiping the sheet away mid-render is
+            // Cancel-then-dismiss — the loop notices between
+            // chunks and stops; the in-progress image is
+            // discarded with the sheet.
+            if session.finalRenderPhase == .rendering { session.cancelFinalRender() }
+        }) { FinalRenderSheetView(session: session) }
         .sheet(isPresented: $showSnowSettings) { snowSettingsSheet }
         .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
     }
@@ -159,6 +166,28 @@ struct EditorView: View {
             },
             set: { newValue in
                 session.setWaterReflectionScale([1.0, 0.5, 0.25][newValue])
+            })
+    }
+
+    /// v4.10 (WS1): idle-freeze delay — Off / 15 s / 30 s /
+    /// 1 min / 2 min / 5 min, tags 0-5 mapped to seconds.
+    /// The underlying value lives on the renderer (in-memory
+    /// preference, like Quality and Water reflections).
+    private var idleFreezeBinding: Binding<Int> {
+        Binding(
+            get: {
+                switch session.idleFreezeSeconds {
+                case 15: return 1
+                case 30: return 2
+                case 60: return 3
+                case 120: return 4
+                case 300: return 5
+                default: return 0
+                }
+            },
+            set: { newValue in
+                let steps: [Double] = [0, 15, 30, 60, 120, 300]
+                session.idleFreezeSeconds = steps[min(max(newValue, 0), 5)]
             })
     }
 
@@ -267,7 +296,16 @@ struct EditorView: View {
                     Text("Half").tag(1)
                     Text("Quarter").tag(2)
                 }
+                Picker("Idle freeze", selection: idleFreezeBinding) {
+                    Text("Off").tag(0)
+                    Text("15 s").tag(1)
+                    Text("30 s").tag(2)
+                    Text("1 min").tag(3)
+                    Text("2 min").tag(4)
+                    Text("5 min").tag(5)
+                }
                 Divider()
+                Button("Render Image…") { session.startFinalRender() }
                 Button("Export project package (.zip)") {
                     if let url = session.exportPackageURL() { shareItem = ShareItem(url: url) }
                 }
@@ -696,6 +734,10 @@ struct EditorView: View {
     // MARK: Keyboard
 
     private func handleKey(_ press: KeyPress) -> KeyPress.Result {
+        // v4.10 (WS1): ANY key press (down or up) is user
+        // input — it wakes a frozen scene and resets the idle
+        // clock, before any handling below.
+        session.noteUserInput()
         if fieldFocus != nil { return .ignored }
         // `characters` is used for letters (not `key`) so Shift —
         // which uppercases the character — still matches.
@@ -754,6 +796,99 @@ struct EditorView: View {
             return .handled
         }
         return .ignored
+    }
+}
+
+// MARK: - Final render sheet (v4.10, WS2)
+
+/// The Render Image sheet: a live preview of the progressive
+/// final render with sample progress and Cancel while it runs;
+/// when done (or cancelled — the best image so far is kept),
+/// the finished image with Save to Photos / Share / Save to
+/// Files / Done. Natural proportions throughout, every label
+/// lineLimit(1) + fixedSize per the v4.8 panel discipline.
+struct FinalRenderSheetView: View {
+    @ObservedObject var session: EditorSession
+    @State private var shareItem: ShareItem?
+
+    private var progressPercent: Int {
+        guard session.finalRenderTotalSamples > 0 else { return 0 }
+        return Int((Double(session.finalRenderSamplesDone)
+                    / Double(session.finalRenderTotalSamples) * 100).rounded())
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                if let image = session.finalRenderImage ?? session.finalRenderPreview {
+                    Image(image, scale: 1.0, label: Text("Final render"))
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    VStack(spacing: 10) {
+                        ProgressView()
+                        Text("Rendering…")
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                if session.finalRenderPhase == .rendering {
+                    ProgressView(value: Double(session.finalRenderSamplesDone),
+                                 total: Double(max(session.finalRenderTotalSamples, 1)))
+                    HStack {
+                        Text("\(session.finalRenderSamplesDone.formatted()) / \(session.finalRenderTotalSamples.formatted()) samples")
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                        Spacer()
+                        Text("\(progressPercent)%")
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    Button("Cancel Render") { session.cancelFinalRender() }
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                if !session.finalRenderStatusText.isEmpty {
+                    Text(session.finalRenderStatusText)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                if session.finalRenderPhase == .done {
+                    HStack(spacing: 12) {
+                        Button("Save to Photos") { session.saveFinalRenderToPhotos() }
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                        Button("Share") {
+                            if let url = session.finalRenderShareURL() {
+                                shareItem = ShareItem(url: url)
+                            }
+                        }
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        Button("Save to Files") { session.saveFinalRenderToFiles() }
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                        Spacer()
+                        Button("Done") { session.finalRenderPresented = false }
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                } else if session.finalRenderPhase == .failed {
+                    Button("Done") { session.finalRenderPresented = false }
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+            }
+            .padding(20)
+            .navigationTitle("Render Image")
+        }
+        .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
     }
 }
 
@@ -839,6 +974,7 @@ struct JoystickView: View {
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { value in
+                    session.noteUserInput()
                     var dx = value.translation.width
                     var dy = value.translation.height
                     let len = sqrt(dx * dx + dy * dy)
@@ -851,6 +987,7 @@ struct JoystickView: View {
                                                        Float(-dy / maxTravel))
                 }
                 .onEnded { _ in
+                    session.noteUserInput()
                     offset = .zero
                     session.touchVector = .zero
                 }
