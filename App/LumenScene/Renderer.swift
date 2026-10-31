@@ -480,6 +480,46 @@ final class Renderer {
     /// (the session caps the list). Consumed by the imprint
     /// pass in appendSnowSheet at rebuild time.
     var snowFootprints: [SnowFootprint] = []
+    /// v4.6: the snow DISPLACEMENT layer — the first piece of
+    /// snow STATE (everything before it was a pure function of
+    /// transforms + weather). Keyed by cell on a FIXED world
+    /// grid (0.20 m cells, cell (0, 0) spans x ∈ [0, 0.20),
+    /// z ∈ [0, 0.20)); the value is the signed height delta
+    /// (metres) a plow left in the cell plus the ambient
+    /// accumulation A when it was last touched. The plow
+    /// recorder in appendSnowSheet writes it whenever an
+    /// intruder moves through snow it touches; the sheet pass
+    /// applies it (faded by |A_now − a|) under the repose
+    /// relaxation, so trails and berms are real geometry that
+    /// persists across rebuilds — and, via the session, across
+    /// saves (WeatherState.plowCells). The session pushes the
+    /// saved layer in at load and pulls it back out on save.
+    var snowPlow: [Int64: (d: Float, a: Float)] = [:]
+
+    /// Pack a displacement-layer cell coordinate into its
+    /// dictionary key (mirrors supportKey's packing).
+    static func snowPlowKey(_ gx: Int, _ gz: Int) -> Int64 {
+        (Int64(gx) << 32) ^ Int64(UInt32(bitPattern: Int32(gz)))
+    }
+
+    /// The layer as sparse Codable cells for the project file
+    /// (sorted for a deterministic save; cells whose faded
+    /// delta is negligible at the CURRENT accumulation are
+    /// dropped — the trail has weathered away).
+    func exportSnowPlow() -> [SnowPlowCell] {
+        let aNow = weatherSnowAmount
+        var out: [SnowPlowCell] = []
+        out.reserveCapacity(snowPlow.count)
+        for (key, cell) in snowPlow {
+            let fade = max(0, 1 - abs(aNow - cell.a) / 0.25)
+            if abs(cell.d) * fade < 0.002 { continue }
+            out.append(SnowPlowCell(gx: Int32(truncatingIfNeeded: key >> 32),
+                                    gz: Int32(bitPattern: UInt32(truncatingIfNeeded: key)),
+                                    d: Double(cell.d), a: Double(cell.a)))
+        }
+        out.sort { ($0.gx, $0.gz) < ($1.gx, $1.gz) }
+        return out
+    }
     /// True when the last geometry rebuild emitted water sheets —
     /// the material table then carries the sheet material last,
     /// and updateMaterialsOnly must reproduce it exactly.
@@ -1654,12 +1694,63 @@ final class Renderer {
     // appear for free because a drag rebuilds at the object's
     // live transform, and nothing sculpted is ever stored.
 
+    /// v4.6: one intruder's footprint as the plow recorder
+    /// last saw it. The recorder is rebuild-to-rebuild
+    /// memory: an intruder whose world footprint CENTRE moved
+    /// since the previous rebuild AND whose body reaches the
+    /// snow plows the span between the two positions.
+    private struct PlowPrev {
+        /// World bottom at the previous rebuild.
+        var bottomY: Float
+        /// Snow-top ceiling at the previous rebuild: the
+        /// intruder could only move snow at/below this height
+        /// (its top then), which keeps a block resting ON a
+        /// support from carving the snow sheet of a support
+        /// ABOVE its top.
+        var ceilY: Float
+        /// Footprint in LOCAL space: 4 corners (rect) or the
+        /// centre + radius (circle), as offsets from the
+        /// footprint centre.
+        var corners: [SIMD2<Float>]
+        /// Local-space footprint centre (rect/circle share).
+        var centre: SIMD2<Float>
+        var isCircle: Bool
+        /// World-space footprint centre at the previous
+        /// rebuild (motion is measured on this).
+        var worldCentre: SIMD2<Float>
+        /// Footprint radius (circle radius / rect
+        /// half-diagonal) — the teleport cap is measured
+        /// against it.
+        var radius: Float
+    }
+
+    /// v4.6: the previous rebuild's intruder footprints, keyed
+    /// by intruder identity (see plowIdentityKey). Replaced
+    /// wholesale at the end of every sheet pass.
+    private var prevPlowIntruders: [Int: PlowPrev] = [:]
+
+    /// Identity for the plow recorder: statics by their
+    /// object id; dynamic entries by the hash of the key the
+    /// session gave them — an entry whose key changes between
+    /// rebuilds simply starts fresh (no trail that step).
+    private func plowIdentityKey(_ intr: SnowIntruder) -> Int {
+        if let sid = intr.staticID { return sid.hashValue }
+        if let key = intr.plowKey { return key.hashValue }
+        return 0
+    }
+
     private struct SnowIntruder {
         /// Scene object id for static intruders (the host
         /// excludes ITSELF by this id); nil for dynamic
         /// entries and the player figure, which are never
         /// static hosts and so intrude on every host.
         var staticID: UUID?
+        /// v4.6: identity key source for DYNAMIC intruders
+        /// (the session's DynEntry key); nil for statics (they
+        /// use staticID) and for the player figure (the
+        /// recorder skips it — its transient footprint stamps
+        /// are its snow interaction, unchanged).
+        var plowKey: String?
         var inverse: float4x4
         /// World-space bottom of the intruder (min y).
         var bottomY: Float
@@ -1675,7 +1766,7 @@ final class Renderer {
 
     private func makeSnowIntruder(staticID: UUID?, local: MeshData,
                                   matrix: float4x4, world: MeshData?,
-                                  isCircle: Bool) -> SnowIntruder? {
+                                  isCircle: Bool, plowKey: String? = nil) -> SnowIntruder? {
         guard local.vertexCount > 0 else { return nil }
         let lb = local.bounds
         let wMin: SIMD3<Float>
@@ -1701,6 +1792,7 @@ final class Renderer {
         }
         return SnowIntruder(
             staticID: staticID,
+            plowKey: plowKey,
             inverse: matrix.inverse,
             bottomY: wMin.y,
             worldMin: wMin, worldMax: wMax,
@@ -1730,7 +1822,8 @@ final class Renderer {
         for entry in dynEntries {
             if let intr = makeSnowIntruder(
                 staticID: nil, local: entry.mesh,
-                matrix: entry.matrix, world: nil, isCircle: false) {
+                matrix: entry.matrix, world: nil, isCircle: false,
+                plowKey: entry.key) {
                 out.append(intr)
             }
         }
@@ -1746,6 +1839,545 @@ final class Renderer {
         return out
     }
 
+    // MARK: - Snow plowing (v4.6: displacement with memory)
+    //
+    // The imprint system above is a pure function of CURRENT
+    // transforms: snow conforms to a block's footprint and
+    // heals to pristine field the moment the block leaves.
+    // Sean (2026-10-31 16:55): a dragged block must PUSH the
+    // snow out of the way — a bow wave while it moves and a
+    // carved trail with side berms after it passes. That is
+    // displacement WITH MEMORY, so v4.6 adds the one piece of
+    // snow state: the displacement layer (`snowPlow`).
+    //
+    // The recorder runs once per sheet pass, BEFORE the
+    // columns are computed (so a trail is visible in the same
+    // rebuild that carves it). For each intruder it compares
+    // the footprint centre against the previous rebuild's
+    // (prevPlowIntruders). An intruder plows when it moved
+    // (≥ 2 cm), when its body overlaps some snow column of
+    // the sheet extent, and when that snow is actually in its
+    // way: it can only move snow at or below the snow-top
+    // CEILING recorded last rebuild (its top then — a block
+    // resting on a floor cannot carve the snow sheet of a
+    // table standing over it; a carried block, whose body was
+    // above every column last rebuild, carves nothing).
+    //
+    // Carving works on the sheet lattice itself. For every
+    // lattice vertex inside the SWEPT footprint (the shape
+    // the footprint swept between the two rebuilds — a
+    // polygon through both positions' corners, or a capsule
+    // for a circle), the snow above the intruder's underside
+    // is removed: the vertex's layer delta is driven so the
+    // total height equals the plow depth (underside − 0.02,
+    // the same resting depth the imprint uses). The removed
+    // VOLUME is then deposited: 50 % into a band ahead of the
+    // footprint's leading edge (the bow wave), 25 % + 25 %
+    // into bands along the swept path's two side edges (the
+    // berms) — direction from the motion vector; a step along
+    // the path's own axis puts nearly everything ahead. The
+    // sheet's repose relaxation runs AFTER the layer is
+    // applied, so berms slump to natural slopes exactly like
+    // any other snow. The layer stores ONLY recorder writes
+    // (relaxation never feeds back into it — see the note at
+    // the relaxation), so the trail is a true fixed point.
+    // Volume is conserved at the recorder level: removal is
+    // measured against the base WITHOUT the mover's own
+    // transient banking, and the full removed volume is
+    // distributed over the front/side bands (no caps — the
+    // relaxation does the shaping).
+    /// The recorder's view of this rebuild's sheet extent:
+    /// the lattice parameters appendSnowSheet will use
+    /// (kept in ONE place so the recorder and the sheet can
+    /// never disagree about the grid).
+    private func sheetExtent(included: [(obj: SceneObject, local: MeshData, world: MeshData)])
+        -> (ox: Float, oz: Float, cs: Float, nx: Int, nz: Int)? {
+        var lo = SIMD2<Float>(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude)
+        var hi = -lo
+        for (_, _, world) in included {
+            let b = world.bounds
+            lo = simd_min(lo, SIMD2<Float>(b.min.x, b.min.z))
+            hi = simd_max(hi, SIMD2<Float>(b.max.x, b.max.z))
+        }
+        lo = simd_max(lo, SIMD2<Float>(-40, -40))
+        hi = simd_min(hi, SIMD2<Float>(40, 40))
+        let extX = hi.x - lo.x, extZ = hi.y - lo.y
+        guard extX > 0.01, extZ > 0.01 else { return nil }
+        var cs: Float = 0.20
+        if 2 * (extX / cs) * (extZ / cs) > 190_000 {
+            cs = sqrtf(2 * extX * extZ / 190_000)
+        }
+        let nx = max(1, Int((extX / cs).rounded(.up)))
+        let nz = max(1, Int((extZ / cs).rounded(.up)))
+        return (lo.x, lo.y, cs, nx, nz)
+    }
+
+    /// The layer delta stored for a world point: the value
+    /// of the FIXED 0.20 m cell containing the point, faded
+    /// by |A_now − a_touch| (gone at 0.25 m of weather change
+    /// — snowfall refills, melt lowers). This is the ONLY
+    /// read the sheet makes of the layer, per vertex.
+    ///
+    /// The read is deliberately NEAREST-CELL, not bilinear:
+    /// the audit's first design interpolated over the four
+    /// surrounding cells and wrote them back with splat
+    /// solves — overlapping writes coupled through the shared
+    /// corners and the carve/write-back loop diverged (layer
+    /// values reached 10²⁵ m in the host port). Nearest-cell
+    /// reads make every write exact and local: a cell's value
+    /// is what every vertex inside it reads, full stop. The
+    /// 0.20 m quantisation never reaches the screen raw — the
+    /// layer sums with the smooth drift field and the repose
+    /// relaxation smooths the sum every rebuild.
+    private func plowDeltaAt(x: Float, z: Float) -> Float {
+        if snowPlow.isEmpty { return 0 }
+        let gx = Int((x / 0.20).rounded(.down))
+        let gz = Int((z / 0.20).rounded(.down))
+        guard let c = snowPlow[Renderer.snowPlowKey(gx, gz)] else { return 0 }
+        let fade = max(0, 1 - abs(weatherSnowAmount - c.a) / 0.25)
+        return c.d * fade
+    }
+
+    /// v4.6: set the layer cell containing (x, z) to `value`
+    /// (raw delta, stamped at aNow so its fade is 1). Cells
+    /// under 2 mm are removed — the layer stays sparse.
+    private func setPlowCell(x: Float, z: Float, value: Float, aNow: Float) {
+        let key = Renderer.snowPlowKey(Int((x / 0.20).rounded(.down)),
+                                       Int((z / 0.20).rounded(.down)))
+        if abs(value) < 0.002 {
+            snowPlow.removeValue(forKey: key)
+        } else {
+            snowPlow[key] = (d: value, a: aNow)
+        }
+    }
+
+    /// v4.6: add `increment` to the layer cell containing
+    /// (x, z), composing on the cell's FADED current value
+    /// (depositing never resurrects weathered snow).
+    private func addPlowCell(x: Float, z: Float, increment: Float, aNow: Float) {
+        if increment == 0 { return }
+        let key = Renderer.snowPlowKey(Int((x / 0.20).rounded(.down)),
+                                       Int((z / 0.20).rounded(.down)))
+        let fadedOld = snowPlow[key].map {
+            $0.d * max(0, 1 - abs(aNow - $0.a) / 0.25) } ?? 0
+        setPlowCell(x: x, z: z, value: fadedOld + increment, aNow: aNow)
+    }
+
+    /// Snapshot one intruder's footprint for the NEXT
+    /// rebuild's recorder (local-space corners/centre + the
+    /// world anchors the gates read).
+    private func plowSnapshot(_ intr: SnowIntruder) -> PlowPrev {
+        let inv = intr.inverse
+        let wc4 = inv.inverse * SIMD4<Float>(intr.centre.x, 0, intr.centre.y, 1)
+        var corners: [SIMD2<Float>] = []
+        if !intr.isCircle {
+            let hx = intr.half.x, hz = intr.half.y
+            corners = [SIMD2<Float>(-hx, -hz), SIMD2<Float>(hx, -hz),
+                       SIMD2<Float>(hx, hz), SIMD2<Float>(-hx, hz)]
+        }
+        let radius = intr.isCircle ? intr.half.x
+            : simd_length(SIMD2<Float>(intr.half.x, intr.half.y))
+        return PlowPrev(bottomY: intr.bottomY, ceilY: intr.worldMax.y,
+                        corners: corners, centre: intr.centre,
+                        isCircle: intr.isCircle,
+                        worldCentre: SIMD2<Float>(wc4.x, wc4.z),
+                        radius: radius)
+    }
+
+    /// Run the plow recorder for this rebuild. `baseH` /
+    /// `supportY` / `hasSupport` describe the lattice BEFORE
+    /// the layer is applied (field + imprints + footprints,
+    /// exactly the v4.5 column heights) — the recorder reads
+    /// removal from them and writes only the layer. Mutates
+    /// `snowPlow` and `prevPlowIntruders`.
+    /// Returns the lattice indices carved THIS pass — the
+    /// sheet pins them for this pass's relaxation (blade-
+    /// compacted snow; see the call site in appendSnowSheet).
+    private func recordPlowing(
+        intruders: [SnowIntruder],
+        grid: [Int64: [SnowSupportTri]],
+        ox: Float, oz: Float, cs: Float, nx: Int, nz: Int,
+        baseH: [Float], supportY: [Float], hasSupport: [Bool]) -> Set<Int> {
+        var carved = Set<Int>()
+        let vx = nx + 1
+        let aNow = weatherSnowAmount
+        let cellArea = cs * cs
+        var nextPrev: [Int: PlowPrev] = [:]
+        nextPrev.reserveCapacity(intruders.count)
+        for intr in intruders {
+            // The player figure never plows: its snow
+            // interaction is the transient footprint stamps
+            // (unchanged, per the v4.6 brief).
+            if intr.staticID == nil && intr.plowKey == nil { continue }
+            let key = plowIdentityKey(intr)
+            let snap = plowSnapshot(intr)
+            nextPrev[key] = snap
+            guard let prev = prevPlowIntruders[key] else { continue }
+            let motion = snap.worldCentre - prev.worldCentre
+            let stepLen = simd_length(motion)
+            // A nudge under 2 cm carves nothing (also guards
+            // rebuild jitter: identical transforms re-recorded
+            // by weather steps must not churn the layer).
+            guard stepLen >= 0.02 else { continue }
+            // TELEPORT CAP: a step longer than ~2.5 footprint
+            // radii (and at least 1 m) in ONE rebuild interval
+            // is not a drag — it is a spawn-at-player, an undo
+            // restore, a behaviour teleport. The snapshot
+            // above already advanced, so the object starts
+            // fresh at its new home and no phantom diagonal
+            // swath is plowed across the scene (the host audit
+            // caught exactly this: a "move away" jump carved
+            // a 40 m diagonal through everything).
+            guard stepLen <= max(1.0, 2.5 * prev.radius) else { continue }
+            let dir = motion / stepLen
+            // Swept shape in WORLD XZ. The recorder works in
+            // world space end to end (the layer and the
+            // lattice are world-anchored, so nothing else
+            // makes sense): current footprint corners from the
+            // CURRENT matrix, previous corners reconstructed
+            // from the stored local offsets by the rigid XZ
+            // motion between the two footprint frames. Pure
+            // translation — the editor drag case — is exact;
+            // a yaw change between rebuilds sweeps the union
+            // approximately (the hull still covers both
+            // footprints).
+            let mNow = intr.inverse.inverse
+            var hullPts: [SIMD2<Float>] = []
+            // Centreline anchors (both shapes): the side
+            // bands and the leading edge are measured against
+            // the segment previous-centre → current-centre.
+            let capA = prev.worldCentre
+            let capB = snap.worldCentre
+            var capR: Float = 0
+            if intr.isCircle {
+                capR = intr.half.x
+            } else {
+                let cNow = snap.centre
+                let cPrev = prev.centre
+                // Yaw of each footprint frame (from its local
+                // +X axis in world XZ).
+                func yawOf(_ m: float4x4) -> Float {
+                    atan2f(-m.columns.0.z, m.columns.0.x)
+                }
+                let yawNow = yawOf(mNow)
+                // The previous frame's matrix is gone; its yaw
+                // is the current yaw minus the centre-motion
+                // frame change — for pure translation this is
+                // exact, and editor drags never rotate.
+                let yawPrev = yawNow
+                func rot(_ v: SIMD2<Float>, _ a: Float) -> SIMD2<Float> {
+                    let c = cosf(a), s = sinf(a)
+                    return SIMD2<Float>(v.x * c - v.y * s, v.x * s + v.y * c)
+                }
+                for off in snap.corners {
+                    hullPts.append(snap.worldCentre + rot(off - cNow, yawNow))
+                }
+                for off in prev.corners {
+                    hullPts.append(prev.worldCentre + rot(off - cPrev, yawPrev))
+                }
+                // Convex hull (monotone chain) of the 8
+                // corners = the swept quad for translation.
+                hullPts.sort { $0.x != $1.x ? $0.x < $1.x : $0.y < $1.y }
+                var lower: [SIMD2<Float>] = [], upper: [SIMD2<Float>] = []
+                func cross(_ o: SIMD2<Float>, _ a: SIMD2<Float>, _ b: SIMD2<Float>) -> Float {
+                    (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+                }
+                for p in hullPts {
+                    while lower.count >= 2, cross(lower[lower.count - 2], lower[lower.count - 1], p) <= 0 { lower.removeLast() }
+                    lower.append(p)
+                }
+                for p in hullPts.reversed() {
+                    while upper.count >= 2, cross(upper[upper.count - 2], upper[upper.count - 1], p) <= 0 { upper.removeLast() }
+                    upper.append(p)
+                }
+                hullPts = Array(lower.dropLast()) + Array(upper.dropLast())
+            }
+            func inSweep(_ p: SIMD2<Float>) -> Bool {
+                if intr.isCircle {
+                    // Capsule: distance to the centre segment.
+                    let ab = capB - capA
+                    let l2 = simd_dot(ab, ab)
+                    var t: Float = 0
+                    if l2 > 1e-9 { t = wgfClamp(simd_dot(p - capA, ab) / l2, 0, 1) }
+                    let q = capA + ab * t
+                    let d = p - q
+                    return simd_dot(d, d) <= capR * capR
+                }
+                // Convex polygon: same-side test.
+                var sign: Float = 0
+                for e in hullPts.indices {
+                    let a = hullPts[e], b = hullPts[(e + 1) % hullPts.count]
+                    let c = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)
+                    if c != 0 {
+                        if sign == 0 { sign = c } else if (c < 0) != (sign < 0) { return false }
+                    }
+                }
+                return true
+            }
+            // Lattice window covering the sweep (+1 cell).
+            var wMin = SIMD2<Float>(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude)
+            var wMax = -wMin
+            if intr.isCircle {
+                wMin = simd_min(capA, capB) - SIMD2<Float>(capR, capR)
+                wMax = simd_max(capA, capB) + SIMD2<Float>(capR, capR)
+            } else {
+                for p in hullPts { wMin = simd_min(wMin, p); wMax = simd_max(wMax, p) }
+            }
+            let gi0 = max(0, Int(((wMin.x - ox) / cs).rounded(.down)) - 1)
+            let gi1 = min(nx, Int(((wMax.x - ox) / cs).rounded(.down)) + 1)
+            let gj0 = max(0, Int(((wMin.y - oz) / cs).rounded(.down)) - 1)
+            let gj1 = min(nz, Int(((wMax.y - oz) / cs).rounded(.down)) + 1)
+            guard gi1 > gi0, gj1 > gj0 else { continue }
+            // The plow depth (snow height over the support)
+            // the underside leaves behind: same −0.02 resting
+            // margin as the imprint, per vertex support.
+            // Removal pass. Contact gate per vertex: the
+            // column's snow top last rebuild must have reached
+            // the intruder (bottom then below the top now…
+            // precisely: the top last rebuild, support + base,
+            // above the PREVIOUS bottom, and the support's
+            // snow ceiling — the previous top — lets the
+            // column belong to a surface the intruder could
+            // touch: supportY + baseH ≤ prevCeil + field
+            // depth cap enforced via baseH alone below).
+            var removedVol: Float = 0
+            for gj in gj0...gj1 {
+                for gi in gi0...gi1 {
+                    let vi = gj * vx + gi
+                    if !hasSupport[vi] { continue }
+                    let x = ox + Float(gi) * cs, z = oz + Float(gj) * cs
+                    if !inSweep(SIMD2<Float>(x, z)) { continue }
+                    let base = baseH[vi]
+                    if base <= 0.001 { continue }
+                    let sup = supportY[vi]
+                    // Column snow top BEFORE the layer, last
+                    // rebuild == this rebuild's base (the base
+                    // is transform-derived; the intruder's own
+                    // presence in it is the CURRENT imprint).
+                    // Gate A (reach): the intruder's body at
+                    // its PREVIOUS position overlapped this
+                    // column's height band: previous bottom
+                    // below the column top and previous top
+                    // above the support. Gate B (ceiling): the
+                    // column's support is not above the
+                    // previous top — snow on a support higher
+                    // than the block ever reached is not its
+                    // to move (the carried-block case: bottom
+                    // then was above the ground columns → gate
+                    // A fails there; a shelf's own sheet has
+                    // support ≥ its underside).
+                    if !(prev.bottomY < sup + base + 0.001) { continue }
+                    if !(prev.ceilY > sup + 0.001) { continue }
+                    // Under the CURRENT footprint the imprint
+                    // owns the snow (and the pinned relaxation
+                    // holds it); the recorder carves only the
+                    // swept span the block has LEFT or is
+                    // crossing — tested against the current
+                    // footprint like imprintedSnowHeight does.
+                    let lp = intr.inverse * SIMD4<Float>(x, sup, z, 1)
+                    let lx = lp.x - intr.centre.x, lz = lp.z - intr.centre.y
+                    let underNow: Bool
+                    if intr.isCircle {
+                        underNow = lx * lx + lz * lz < intr.half.x * intr.half.x
+                    } else {
+                        underNow = abs(lx) < intr.half.x && abs(lz) < intr.half.y
+                    }
+                    if underNow { continue }
+                    // Measure against the base WITHOUT the
+                    // mover's own banking (bankExclude): the
+                    // bank is transient heap against the block,
+                    // not snow volume that was there to
+                    // displace — counting it inflated removal
+                    // ~2.5× in the audit and starved the berms
+                    // of any honest budget. Recomputed per
+                    // candidate vertex from the support grid
+                    // (the sheet's own column math); vertices
+                    // whose support came from gap dilation have
+                    // no direct sample and fall back to baseH.
+                    var baseNB = base
+                    if let s = sampleSupport(grid: grid, x: x, z: z),
+                       abs(s.y - sup) < 0.01 {
+                        let taper: Float = s.flatNY > 0.5
+                            ? wgfSmooth(0.55, 0.75, s.ny) : 0
+                        let fH = wgfSnowHeight(x, z, amount: s.amount) * taper
+                        baseNB = imprintedSnowHeight(
+                            x: x, z: z, hostY: s.y, hostID: s.hostID,
+                            fieldH: fH, intruders: intruders,
+                            bankExclude: intr)
+                    }
+                    let target = wgfClamp(prev.bottomY - 0.02 - sup, 0, baseNB)
+                    // Plowable band: only snow at or above
+                    // the PREVIOUS plow depth can still be
+                    // displaced — the block's underside passed
+                    // at bottomY_prev, so anything deeper was
+                    // never in its way. Each column therefore
+                    // carves at most once per pass, down to
+                    // (prev underside − 0.02). Without this
+                    // band the recorder re-carves its own berm
+                    // shoulders forever: relaxation keeps
+                    // redistributing their tops upward while
+                    // the layer integral runs away (host audit
+                    // v4.6: −57 m³ of phantom removal against
+                    // ~6 m³ genuine before this band existed).
+                    if baseNB < target - 0.001 { continue }
+                    let existing = plowDeltaAt(x: x, z: z)
+                    let total = baseNB + existing
+                    if total <= target + 0.001 { continue }
+                    // Set the containing cell so the total
+                    // here becomes the target (nearest-cell
+                    // reads make this exact for every vertex
+                    // in the cell; several swept vertices can
+                    // share a cell — they all ask for the same
+                    // plow depth over the same support, so
+                    // last-write-wins is consistent). The set
+                    // value is against baseNB: while the block
+                    // is still beside the column, its banking
+                    // renders on top (real heap against the
+                    // block); when it leaves, the trail sits
+                    // exactly at the plow depth.
+                    removedVol += (total - target) * cellArea
+                    setPlowCell(x: x, z: z, value: target - baseNB, aNow: aNow)
+                    carved.insert(vi)
+                }
+            }
+            if removedVol <= 1e-6 { continue }
+            // Deposition. Direction split from the motion
+            // vector against the footprint's world axes:
+            // facing = |dir · forward| (forward = local +Z
+            // toward the motion for a box dragged face-first;
+            // for a diagonal drag the front share blends).
+            // FRONT share = 0.15 + 0.25 × facing (0.15–0.40),
+            // the rest splits evenly to the two sides: a blade
+            // in CONTINUOUS motion sheds most of its snow
+            // sideways — the front pile is the residue at the
+            // leading edge (it dominates at the stop point,
+            // where the last steps' front deposits stack).
+            // The audit's first split (up to 70% front) left
+            // the side bands too starved to stand against the
+            // trough's own 37° slump valley: berms must beat
+            // the valley profile (~depth × 1.3 wide) or the
+            // relaxation erases them into the trail.
+            // Deposit bands: FRONT = cells whose centre
+            // projects ahead of the leading edge within 0.8 m
+            // and within the footprint's width (+0.2 m);
+            // SIDES = cells within 0.5 m laterally of the
+            // swept span, alongside it. Weights fall off with
+            // distance.
+            let fwd = SIMD2<Float>(-mNow.columns.2.x, -mNow.columns.2.z)
+            let fwdN = simd_length(fwd) > 1e-5 ? fwd / simd_length(fwd) : dir
+            let facing = abs(simd_dot(dir, fwdN))
+            let frontShare = 0.15 + 0.25 * facing
+            let sideShare = (1 - frontShare) / 2
+            let right = SIMD2<Float>(dir.y, -dir.x)
+            // Leading edge anchor: the swept shape's extreme
+            // point along dir, and the path centreline ends.
+            var lead: Float = -Float.greatestFiniteMagnitude
+            if intr.isCircle {
+                lead = simd_dot(capB, dir) + capR
+            } else {
+                for p in hullPts { lead = max(lead, simd_dot(p, dir)) }
+            }
+            struct DepCell { var gi: Int; var gj: Int; var w: Float; var kind: Int }
+            var frontCells: [DepCell] = [], sideCellsL: [DepCell] = [], sideCellsR: [DepCell] = []
+            let dgi0 = max(0, gi0 - 4), dgi1 = min(nx, gi1 + 4)
+            let dgj0 = max(0, gj0 - 4), dgj1 = min(nz, gj1 + 4)
+            for gj in dgj0...dgj1 {
+                for gi in dgi0...dgi1 {
+                    let vi = gj * vx + gi
+                    if !hasSupport[vi] { continue }
+                    let x = ox + Float(gi) * cs, z = oz + Float(gj) * cs
+                    let p = SIMD2<Float>(x, z)
+                    if inSweep(p) { continue }
+                    let along = simd_dot(p, dir)
+                    let lat = simd_dot(p - capA, right)
+                    let ahead = along - lead
+                    if ahead > 0, ahead <= 0.8 {
+                        // Front band: laterally within the
+                        // swept width about the centreline
+                        // through the CURRENT centre.
+                        let latC = simd_dot(p - snap.worldCentre, right)
+                        let halfW = intr.isCircle ? capR
+                            : abs(right.x) * intr.half.x + abs(right.y) * intr.half.y
+                        if abs(latC) <= halfW + 0.2 {
+                            frontCells.append(DepCell(gi: gi, gj: gj, w: 1 - ahead / 0.8, kind: 0))
+                        }
+                    } else {
+                        // Side bands: alongside the WHOLE
+                        // swept span — the projection window
+                        // spans both footprint CENTRES extended
+                        // by the footprint's half-length along
+                        // the motion. (Audit round 4: the
+                        // window originally spanned only the
+                        // 0.1 m step between centres, so the
+                        // side bands were nearly EMPTY and ~60%
+                        // of every step's removed volume
+                        // silently vanished — berms never had a
+                        // budget. The front band was unaffected,
+                        // which is why the bow wave looked right
+                        // while the sides starved.)
+                        let t0 = simd_dot(capA, dir), t1 = simd_dot(capB, dir)
+                        let halfLen = intr.isCircle ? capR
+                            : abs(dir.x) * intr.half.x + abs(dir.y) * intr.half.y
+                        if along >= min(t0, t1) - halfLen, along <= max(t0, t1) + halfLen {
+                            // Lateral distance beyond the
+                            // swept span's edge, measured from
+                            // the centreline minus the span's
+                            // half width across the motion
+                            // (circle: radius; rect: the
+                            // footprint's projected half
+                            // extent — an approximation that
+                            // errs wide for diagonal drags,
+                            // which only widens the berm
+                            // slightly).
+                            let halfW = intr.isCircle ? capR
+                                : abs(right.x) * intr.half.x + abs(right.y) * intr.half.y
+                            let dd = abs(lat) - halfW
+                            if dd > 0, dd <= 0.5 {
+                                let dc = DepCell(gi: gi, gj: gj, w: 1 - dd / 0.5,
+                                                 kind: lat >= 0 ? 1 : 2)
+                                if lat >= 0 { sideCellsL.append(dc) } else { sideCellsR.append(dc) }
+                            }
+                        }
+                    }
+                }
+            }
+            // Deposit the band's full share, weighted by the
+            // band falloffs. There is deliberately NO repose
+            // cap here: the first design capped each cell at
+            // the repose ceiling over its lowest neighbour,
+            // which throttled berms to ~+0.15 m per rebuild
+            // step while the trough beside them kept
+            // deepening — the deposited snow then slumped
+            // into the trough in the same pass and the
+            // write-back recorded a berm-less bowl (audit:
+            // 28% volume balance, shoulders BELOW field).
+            // Berms are now deposited whole and the sheet's
+            // own repose relaxation shapes them to ≤ 37° like
+            // any other snow (rendering only — it never feeds
+            // back into the layer). Volume is conserved
+            // exactly at the recorder level: every removed
+            // cubic metre is distributed over the three bands.
+            func deposit(_ cells: [DepCell], volume: Float) {
+                if cells.isEmpty || volume <= 0 { return }
+                let wSum = cells.reduce(Float(0)) { $0 + $1.w }
+                if wSum <= 0 { return }
+                for c in cells {
+                    let share = volume * (c.w / wSum)
+                    if share <= 0 { continue }
+                    let x = ox + Float(c.gi) * cs, z = oz + Float(c.gj) * cs
+                    addPlowCell(x: x, z: z,
+                                increment: share / cellArea,
+                                aNow: aNow)
+                }
+            }
+            deposit(frontCells, volume: removedVol * frontShare)
+            deposit(sideCellsL, volume: removedVol * sideShare)
+            deposit(sideCellsR, volume: removedVol * sideShare)
+        }
+        prevPlowIntruders = nextPrev
+        return carved
+    }
+
     /// The snow height at one point AFTER imprints: `fieldH`
     /// is the un-imprinted field height AT THIS POINT (the
     /// caller evaluates wgfSnowHeight per tap, so the gradient
@@ -1758,7 +2390,8 @@ final class Renderer {
     /// multiplicatively, with no rim.
     private func imprintedSnowHeight(x: Float, z: Float, hostY: Float,
                                      hostID: UUID, fieldH: Float,
-                                     intruders: [SnowIntruder]) -> Float {
+                                     intruders: [SnowIntruder],
+                                     bankExclude: SnowIntruder? = nil) -> Float {
         var h = fieldH
         if h <= 0 { return h }
         let fieldH0 = fieldH
@@ -1834,7 +2467,14 @@ final class Renderer {
                 // buries the intruder (its top below the
                 // un-imprinted snow top — no wall to bank
                 // against; the sheet just passes over).
-                if hostY + fieldH0 <= intr.worldMax.y + 0.001 {
+                // v4.6: the plow recorder can exclude ONE
+                // intruder's banking (the mover's own) when
+                // measuring the snow really there to displace
+                // — banking is transient heap, not volume.
+                let bankExcluded = bankExclude.map {
+                    $0.centre == intr.centre && $0.half == intr.half
+                        && $0.bottomY == intr.bottomY } ?? false
+                if !bankExcluded, hostY + fieldH0 <= intr.worldMax.y + 0.001 {
                     let fall = 1 - wgfSmooth(0, 0.8, outsideDist)
                     h += fieldH0 * 0.18 * fall
                 }
@@ -2046,31 +2686,30 @@ final class Renderer {
             || objectSnowAmounts.values.contains { $0 > 0.001 }
         guard wet > 0.001 || snowPossible else { return }
         let grid = buildSupportIndex(included: included)
-        guard !grid.isEmpty else { return }
+        if grid.isEmpty {
+            // v4.6: no sheet this rebuild — but the plow
+            // recorder's motion memory must still advance (an
+            // object teleported while no snow was on screen
+            // must not plow a phantom sweep on its return).
+            // Positions only; nothing can be carved without a
+            // sheet.
+            var snap: [Int: PlowPrev] = [:]
+            for intr in intruders
+            where !(intr.staticID == nil && intr.plowKey == nil) {
+                snap[plowIdentityKey(intr)] = plowSnapshot(intr)
+            }
+            prevPlowIntruders = snap
+            return
+        }
         // Extent: union of the included objects' world XZ
-        // bounds, clipped to the field's domain.
-        var lo = SIMD2<Float>(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude)
-        var hi = -lo
-        for (_, _, world) in included {
-            let b = world.bounds
-            lo = simd_min(lo, SIMD2<Float>(b.min.x, b.min.z))
-            hi = simd_max(hi, SIMD2<Float>(b.max.x, b.max.z))
-        }
-        lo = simd_max(lo, SIMD2<Float>(-40, -40))
-        hi = simd_min(hi, SIMD2<Float>(40, 40))
-        let extX = hi.x - lo.x, extZ = hi.y - lo.y
-        guard extX > 0.01, extZ > 0.01 else { return }
-        // Cell size: 0.20 m — fine enough that drift features
-        // (~0.4 m and up) read as smooth piles. It coarsens
-        // only when the support extent would break the
-        // triangle envelope (~190k of the shared 220k).
-        var cs: Float = 0.20
-        if 2 * (extX / cs) * (extZ / cs) > 190_000 {
-            cs = sqrtf(2 * extX * extZ / 190_000)
-        }
-        let nx = max(1, Int((extX / cs).rounded(.up)))
-        let nz = max(1, Int((extZ / cs).rounded(.up)))
-        let ox = lo.x, oz = lo.y
+        // bounds, clipped to the field's domain. Cell size:
+        // 0.20 m — fine enough that drift features (~0.4 m
+        // and up) read as smooth piles. It coarsens only when
+        // the support extent would break the triangle
+        // envelope (~190k of the shared 220k). (v4.6: computed
+        // by sheetExtent so the plow recorder shares it.)
+        guard let ext = sheetExtent(included: included) else { return }
+        let ox = ext.ox, oz = ext.oz, cs = ext.cs, nx = ext.nx, nz = ext.nz
         let vx = nx + 1, vz = nz + 1
 
         struct SheetVert {
@@ -2158,6 +2797,72 @@ final class Renderer {
                 }
             }
         }
+        // v4.6: the layer delta actually applied per vertex
+        // (signed), for the pinning test in (c2).
+        var layerDelta = [Float](repeating: 0, count: vx * vz)
+        var layerApplied = [Bool](repeating: false, count: vx * vz)
+        /// v4.6: lattice indices the recorder carved THIS
+        /// pass — pinned for this pass's relaxation only
+        /// (blade-compacted snow; stops the cumulative
+        /// slump-ratchet across a 50-step drag).
+        var carvedThisPass = Set<Int>()
+
+
+        // (c0/c1) v4.6: PLOW RECORDER + DISPLACEMENT LAYER.
+        // The recorder reads the columns exactly as v4.5
+        // computed them (field + imprints + footprints — the
+        // "base") and writes trails/berms into the layer;
+        // then every column's total becomes base + layer
+        // delta, BEFORE pinning and relaxation, so the repose
+        // pass slumps berms and trail walls like any snow.
+        // When the layer is empty and nothing moved, both
+        // steps are exact no-ops and the sheet is v4.5's.
+        if snowPossible {
+            var baseH = [Float](repeating: 0, count: vx * vz)
+            var supportY = [Float](repeating: 0, count: vx * vz)
+            var hasSupport = [Bool](repeating: false, count: vx * vz)
+            for idx in verts.indices {
+                if let s = verts[idx].support {
+                    hasSupport[idx] = true
+                    supportY[idx] = s.y
+                    baseH[idx] = verts[idx].snowH
+                }
+            }
+            carvedThisPass = recordPlowing(intruders: intruders, grid: grid,
+                          ox: ox, oz: oz, cs: cs, nx: nx, nz: nz,
+                          baseH: baseH, supportY: supportY,
+                          hasSupport: hasSupport)
+            if !snowPlow.isEmpty {
+                for j in 0..<vz {
+                    for i in 0..<vx {
+                        let idx = vIdx(i, j)
+                        guard let s = verts[idx].support else { continue }
+                        let d = plowDeltaAt(x: vX(i), z: vZ(j))
+                        if d != 0 {
+                            // The layer moves SNOW, never the
+                            // support: depth clamps at 0 (a
+                            // trail cannot dig below the
+                            // surface it was carved in).
+                            // Remember the SIGNED delta for the
+                            // pinning test in (c2).
+                            layerDelta[idx] = d
+                            layerApplied[idx] = true
+                            verts[idx].snowH = max(0, verts[idx].snowH + d)
+                            verts[idx].topY = s.y + verts[idx].snowH
+                        }
+                    }
+                }
+            }
+        } else {
+            // No snow to plow (rain-only or dry rebuild):
+            // advance the motion memory without recording.
+            var snap: [Int: PlowPrev] = [:]
+            for intr in intruders
+            where !(intr.staticID == nil && intr.plowKey == nil) {
+                snap[plowIdentityKey(intr)] = plowSnapshot(intr)
+            }
+            prevPlowIntruders = snap
+        }
         // (c2) v4.5: PINNED columns + REPOSE RELAXATION.
         //
         // A column is PINNED when a contacting intruder's
@@ -2203,8 +2908,18 @@ final class Renderer {
                             || z < intr.worldMin.z - 0.5 || z > intr.worldMax.z + 0.5 {
                             continue
                         }
+                        // v4.6: the underside test reads the
+                        // column top WITHOUT the displacement
+                        // layer — a berm the plow just deposited
+                        // beside (or the trail under) the
+                        // footprint must slump like any snow,
+                        // not be pinned by the layer's own
+                        // height. layerTop was captured before
+                        // step (c1) overwrote topY.
+                        let layerTop = s.y + verts[idx].snowH
+                            - (layerApplied[idx] ? layerDelta[idx] : 0)
                         guard intr.worldMax.y > s.y + 0.001,
-                              intr.bottomY - 0.02 <= verts[idx].topY + 0.01 else { continue }
+                              intr.bottomY - 0.02 <= layerTop + 0.01 else { continue }
                         let lp = intr.inverse * SIMD4<Float>(x, s.y, z, 1)
                         let lx = lp.x - intr.centre.x
                         let lz = lp.z - intr.centre.y
@@ -2216,6 +2931,27 @@ final class Renderer {
                         }
                         if inside { pinned[idx] = true; break }
                     }
+                }
+            }
+            // v4.6: freshly carved columns are blade-
+            // compacted — pinned for THIS pass too (the
+            // persistent rule below covers them from the next
+            // pass on; this covers the carving pass itself).
+            for vi in carvedThisPass { pinned[vi] = true }
+            // v4.6: and PERSISTENTLY — any column whose
+            // stored layer delta is a real carve (≤ −0.10 m)
+            // is compacted snow: pinned in every pass, like
+            // snow an object is standing on. The repose pass
+            // otherwise treats a narrow deep trail exactly
+            // like the v4.5 imprint pit and slumps it to a
+            // wide V in a single solve (audit round 6: stored
+            // carve −1.45 m rendered as a 0.49 m trough).
+            // Loose snow — berms (positive deltas), field,
+            // pits — relaxes as always; only the blade-packed
+            // floor holds.
+            if !snowPlow.isEmpty {
+                for idx in verts.indices where layerApplied[idx] {
+                    if layerDelta[idx] <= -0.10 { pinned[idx] = true }
                 }
             }
             let maxStep = Float(0.7536) * cs // tan(37°) × cell
@@ -2253,6 +2989,21 @@ final class Renderer {
                     verts[idx].snowH = max(0, verts[idx].topY - s.y)
                 }
             }
+            // v4.6 NOTE — no slump write-back, deliberately.
+            // The audit tried absorbing the relaxation's
+            // changes into the layer three ways (absolute,
+            // change-form, voted); every variant ratcheted:
+            // each rebuild's relaxation slumps the trail walls
+            // a little more and storing that state compounds
+            // across a 50-step drag until a 1.4 m plow depth
+            // reads as a 0.4 m swale and the berms are eaten
+            // into moats. The layer therefore stores ONLY what
+            // the recorder wrote (carve + deposit); the
+            // relaxation remains a per-pass RENDERING of that
+            // state (softening walls and berm crests for the
+            // eye) without feeding back into it. Same stored
+            // state → same rendered surface, every rebuild:
+            // the trail is a true fixed point.
         }
         // (c3) v4.5: normals from the RELAXED lattice —
         // central differences of verts.topY (one-sided where a

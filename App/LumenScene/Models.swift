@@ -255,6 +255,29 @@ struct WeatherState: Codable, Equatable {
     /// normalised drift factor. nil in old files, where it is
     /// derived as `snow * maxDepth` on load.
     var snowAmount: Double? = nil
+    /// v4.6: the snow DISPLACEMENT layer — trails plowed by
+    /// dragging objects through snow (see SnowPlowCell). Sparse:
+    /// only cells a plow has touched are stored. nil in old
+    /// files = no trails (pristine snow).
+    var plowCells: [SnowPlowCell]? = nil
+}
+
+/// v4.6: one touched cell of the snow displacement layer.
+/// `d` is the signed height delta (metres) the plow left in
+/// this cell relative to the undisturbed imprinted field —
+/// negative in a carved trail, positive in the berms.
+/// `a` is the ambient accumulation A (metres) when the cell
+/// was last touched; each rebuild the delta fades linearly
+/// with |A_now − a| and is gone once the weather has moved
+/// 0.25 m either way (fresh snowfall refills the trail; a
+/// melt lowers it away too). Cells live on a FIXED world
+/// grid: cell size 0.20 m, cell (0, 0) spans x ∈ [0, 0.20),
+/// z ∈ [0, 0.20) — see Renderer.snowPlowKey.
+struct SnowPlowCell: Codable, Equatable {
+    var gx: Int32
+    var gz: Int32
+    var d: Double
+    var a: Double
 }
 
 // MARK: - Trigger areas

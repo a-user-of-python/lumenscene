@@ -273,6 +273,14 @@ final class EditorSession: ObservableObject {
         renderer.weatherSnowAmount = Float(buildupSnow)
         renderer.objectSnowAmounts = snowExposureA
         renderer.snowFootprints = []
+        // v4.6: hand the renderer the saved plow layer BEFORE
+        // the first rebuild, so a project saved with trails
+        // opens with them in place. Old files have none.
+        renderer.snowPlow = Dictionary(
+            uniqueKeysWithValues: (project.scene.weather.plowCells ?? []).map {
+                (Renderer.snowPlowKey(Int($0.gx), Int($0.gz)),
+                 (d: Float($0.d), a: Float($0.a)))
+            })
         // v3.4: seed the renderer's quantised geometry levels
         // from the saved build-up BEFORE the first rebuild, so a
         // project saved with snow/puddles opens with its solid
@@ -547,6 +555,16 @@ final class EditorSession: ObservableObject {
         // snow is already down it gathers visibly from zero.
         snowExposureA[obj.id] = 0
         bakedExposureSteps[obj.id] = 0
+        // v4.6 (fold-in fix): the renderer's exposure map must
+        // learn the new id BEFORE the rebuild below — until
+        // the next frameTick sync it had no entry, and BOTH
+        // snow paths fall back to the ambient amount for an
+        // absent key (the sheet's support attribution and
+        // gpuMaterialForObject's shading factor), so a block
+        // placed in deep snow appeared with a full snow cap
+        // and full whitening at placement. Sean's restated
+        // rule (2026-10-31 16:57): new blocks land clean.
+        renderer.objectSnowAmounts = snowExposureA
         selection = obj.id
         renderer.rebuild(scene: project.scene, meshes: meshes)
         kickRender()
@@ -667,6 +685,9 @@ final class EditorSession: ObservableObject {
                     self.bakedExposureSteps[obj.id] = 0
                     if firstID == nil { firstID = obj.id }
                 }
+                // v4.6: same placement fix as addPrimitive —
+                // sync the renderer's map before the rebuild.
+                self.renderer.objectSnowAmounts = self.snowExposureA
                 self.selection = firstID
                 self.renderer.rebuild(scene: self.project.scene, meshes: self.meshes)
                 self.kickRender()
@@ -1319,6 +1340,12 @@ final class EditorSession: ObservableObject {
         project.scene.weather.snow = snowProgressClamped
         project.scene.weather.snowAmount = buildupSnow
         syncExposuresToProject()
+        // v4.6: the plow layer round-trips through the
+        // renderer (it is the recorder's working copy); an
+        // empty layer saves as nil so untouched projects keep
+        // byte-identical saves.
+        let plow = renderer.exportSnowPlow()
+        project.scene.weather.plowCells = plow.isEmpty ? nil : plow
     }
 
     /// v4.3: the quantised exposure step of one A-value, in
@@ -1422,14 +1449,19 @@ final class EditorSession: ObservableObject {
     /// v4.3 (Weather sheet): re-roll this project's snow pattern.
     /// A fresh non-zero seed re-bakes the renderer's field with
     /// the new pattern; the geometry rebuild picks it up.
+    /// v4.6: a re-roll is also the way back to PRISTINE snow —
+    /// it clears the plow layer (trails and berms) along with
+    /// the pattern, in the renderer and the saved project.
     func rerollSnowSeed() {
         let seed = UInt32.random(in: 1...UInt32.max)
         project.scene.weather.seed = seed
         renderer.weatherSeed = seed
+        renderer.snowPlow = [:]
+        project.scene.weather.plowCells = nil
         renderer.rebuild(scene: project.scene, meshes: meshes)
         renderer.resetAccumulation()
         kickRender()
-        status = "Snow pattern re-rolled."
+        status = "Snow pattern re-rolled — plowed trails cleared."
     }
 
     /// Read-only live snow figures for the Weather sheet.
@@ -1448,6 +1480,10 @@ final class EditorSession: ObservableObject {
         for key in snowExposureA.keys { snowExposureA[key] = 0 }
         bakedExposureSteps = snowExposureA.mapValues { _ in 0 }
         clearSnowStamps()
+        // v4.6: cleared build-up takes the plow layer with it —
+        // no snow, no trails.
+        renderer.snowPlow = [:]
+        project.scene.weather.plowCells = nil
         renderer.objectSnowAmounts = snowExposureA
         // v3.4: the solid weather geometry goes too — a full
         // rebuild at zero levels removes sheets + displacement.
