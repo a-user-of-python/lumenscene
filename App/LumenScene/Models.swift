@@ -378,36 +378,11 @@ extension CameraState {
         }
         target = normalisedTriple(decodedTarget, fallback: [0, 1, 0])
         playPosition = normalisedTriple(decodedPlayPosition, fallback: [0, 1.7, 3.5])
-        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .azimuth),
-           let value = decoded {
-            azimuth = value
-        } else {
-            azimuth = 35
-        }
-        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .elevation),
-           let value = decoded {
-            elevation = value
-        } else {
-            elevation = 22
-        }
-        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .distance),
-           let value = decoded {
-            distance = value
-        } else {
-            distance = 7
-        }
-        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .playYaw),
-           let value = decoded {
-            playYaw = value
-        } else {
-            playYaw = 0
-        }
-        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .playPitch),
-           let value = decoded {
-            playPitch = value
-        } else {
-            playPitch = 0
-        }
+        azimuth = (try? c.decodeIfPresent(Double.self, forKey: .azimuth)) ?? nil ?? 35
+        elevation = (try? c.decodeIfPresent(Double.self, forKey: .elevation)) ?? nil ?? 22
+        distance = (try? c.decodeIfPresent(Double.self, forKey: .distance)) ?? nil ?? 7
+        playYaw = (try? c.decodeIfPresent(Double.self, forKey: .playYaw)) ?? nil ?? 0
+        playPitch = (try? c.decodeIfPresent(Double.self, forKey: .playPitch)) ?? nil ?? 0
     }
 }
 
@@ -420,24 +395,9 @@ extension WeatherState {
     // missing or mistyped keys fall back to the property defaults.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        if let decoded = try? c.decodeIfPresent(Int.self, forKey: .mode),
-           let value = decoded {
-            mode = value
-        } else {
-            mode = 0
-        }
-        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .wetness),
-           let value = decoded {
-            wetness = value
-        } else {
-            wetness = 0
-        }
-        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .snow),
-           let value = decoded {
-            snow = value
-        } else {
-            snow = 0
-        }
+        mode = (try? c.decodeIfPresent(Int.self, forKey: .mode)) ?? nil ?? 0
+        wetness = (try? c.decodeIfPresent(Double.self, forKey: .wetness)) ?? nil ?? 0
+        snow = (try? c.decodeIfPresent(Double.self, forKey: .snow)) ?? nil ?? 0
     }
 }
 
@@ -452,18 +412,8 @@ extension TriggerArea {
     // `center`/`size` are normalised to exactly 3 elements (F18).
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        if let decoded = try? c.decodeIfPresent(UUID.self, forKey: .id),
-           let value = decoded {
-            id = value
-        } else {
-            id = UUID()
-        }
-        if let decoded = try? c.decodeIfPresent(String.self, forKey: .name),
-           let value = decoded {
-            name = value
-        } else {
-            name = "Area"
-        }
+        id = (try? c.decodeIfPresent(UUID.self, forKey: .id)) ?? nil ?? UUID()
+        name = (try? c.decodeIfPresent(String.self, forKey: .name)) ?? nil ?? "Area"
         var decodedCenter: [Double]?
         if let decoded = try? c.decodeIfPresent([Double].self, forKey: .center) {
             decodedCenter = decoded
