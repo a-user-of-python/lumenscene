@@ -12,6 +12,40 @@ enum EditorMode { case edit, play }
 
 enum MoveKey: Hashable { case w, a, s, d, q, e, up, down, left, right }
 
+/// v4.9: dedicated observable for the tree panel's FOOTER only
+/// (hint line, weather cover caption, snow-depth line,
+/// temperature status line). Before v4.9 the footer lived inside
+/// `treePanel`, which observes the whole session, so EVERY
+/// @Published change — including the per-percent weather sync —
+/// re-evaluated the footer along with everything else. The
+/// footer now observes ONLY this object, whose fields are
+/// written exclusively by `EditorSession.refreshFooter()` and
+/// only when the displayed string actually changes (the v3.1
+/// whole-percent discipline, applied to strings). Rendered
+/// content is byte-identical to the pre-v4.9 footer.
+@MainActor
+final class FooterDisplay: ObservableObject {
+    @Published private(set) var hintText: String = ""
+    /// Weather cover caption ("Ground: 62% wet · Snow cover:
+    /// 30%"); nil = the line is not shown.
+    @Published private(set) var weatherText: String? = nil
+    /// "Snow depth: A m of M m max"; nil = not shown.
+    @Published private(set) var snowDepthText: String? = nil
+    /// Temperature status line; nil = not shown.
+    @Published private(set) var temperatureText: String? = nil
+
+    /// Change-only writes: an unchanged string never fires
+    /// objectWillChange, so a footer observing this object
+    /// re-evaluates only when a displayed line really changes.
+    func update(hint: String, weather: String?, snowDepth: String?,
+                temperature: String?) {
+        if hintText != hint { hintText = hint }
+        if weatherText != weather { weatherText = weather }
+        if snowDepthText != snowDepth { snowDepthText = snowDepth }
+        if temperatureText != temperature { temperatureText = temperature }
+    }
+}
+
 @MainActor
 final class EditorSession: ObservableObject {
     @Published var project: Project
@@ -34,6 +68,8 @@ final class EditorSession: ObservableObject {
         didSet {
             if !multiSelectMode { multiSelection = [] }
             syncHighlightToRenderer()
+            // v4.9: the footer hint line depends on this toggle.
+            refreshFooter()
         }
     }
     @Published var multiSelection: Set<UUID> = [] {
@@ -52,11 +88,113 @@ final class EditorSession: ObservableObject {
     /// action). Display-only; frameTick clears it at expiry.
     @Published var playBanner: String = ""
 
+    /// v4.9: the tree footer's narrow observable (see
+    /// FooterDisplay). A `let`, deliberately NOT @Published:
+    /// publishing it through the session would re-couple the
+    /// footer to every session change. Views observe `footer`
+    /// directly; the session writes it change-only via
+    /// refreshFooter().
+    let footer = FooterDisplay()
+
     let renderer: Renderer
     /// v4.0: the node-graph game runtime. Inert in edit mode;
     /// started/stopped by toggleMode().
     let runtime: GameRuntime
     private(set) var meshes: [UUID: MeshData] = [:]
+
+    /// v4.9: scene-objects revision for the multi-select member
+    /// cache (see multiSelectionMembers()). Incremented ONLY by
+    /// noteSceneObjectsChanged(), which every method that adds,
+    /// removes, replaces or re-fields a scene object calls (the
+    /// call sites are enumerated on that method). Never bumped
+    /// per frame: frameTick does not touch it, and the per-frame
+    /// runtime funnels that write ONLY transform/material
+    /// (runtimeSetTransform / runtimeSetMaterial, viewport
+    /// dragging) cannot stale the cache, because the cached
+    /// member list is consumed only for name / visible / count.
+    private var sceneRevision: Int = 0
+    private var cachedMultiMembers: [SceneObject] = []
+    private var cachedMultiSet: Set<UUID>? = nil
+    private var cachedMultiRevision: Int = -1
+
+    /// v4.9: mark the scene-object list as changed for the
+    /// member cache. Call sites (audited against every
+    /// `project.scene.objects` write in this file): restore,
+    /// restorePlaySnapshot, mutateScene, objectBinding's
+    /// setter, addPrimitive, deleteSelected,
+    /// deleteMultiSelection, importModelFile (on success),
+    /// promoteObject (writes `visible`), runtimeSetVisible's
+    /// static fallback (writes `visible`), deleteArea
+    /// (un-assigns areaID), syncExposuresToProject (writes
+    /// `snowExposure`, save-rate). Writes that touch ONLY transform
+    /// or material (dragObjectTo, runtimeSetTransform,
+    /// runtimeSetMaterial) deliberately do NOT call this: the
+    /// cache's consumers read name/visible/membership only, so
+    /// those writes cannot make it stale.
+    private func noteSceneObjectsChanged() { sceneRevision += 1 }
+
+    /// v4.9: the multi-selection's member objects, resolved
+    /// with ONE filter pass and memoised on (multiSelection,
+    /// sceneRevision). Body passes driven by unrelated
+    /// @Published churn (e.g. the per-percent weather sync)
+    /// hit the cache instead of re-filtering the whole scene.
+    /// Invalidation is the revision contract above: any write
+    /// that could change a member's name/visible or the set's
+    /// membership bumps the revision first.
+    func multiSelectionMembers() -> [SceneObject] {
+        if cachedMultiSet == multiSelection,
+           cachedMultiRevision == sceneRevision {
+            return cachedMultiMembers
+        }
+        let members = project.scene.objects.filter {
+            multiSelection.contains($0.id)
+        }
+        cachedMultiMembers = members
+        cachedMultiSet = multiSelection
+        cachedMultiRevision = sceneRevision
+        return members
+    }
+
+    /// v4.9: recompute the footer's four displayed lines from
+    /// current state and push them into `footer` change-only.
+    /// The expressions below are the pre-v4.9 EditorView ones
+    /// verbatim (weatherCaption, the snow-depth format, the
+    /// hint strings, temperatureStatusText), so the rendered
+    /// footer is byte-identical. Called from init, setWeather-
+    /// Mode, setMaxSnowDepth, setTemperature,
+    /// clearWeatherBuildup, toggleMode, the multiSelectMode
+    /// didSet, and once per frameTick — the per-frame call is
+    /// a few short string builds whose publishes are guarded
+    /// inside FooterDisplay.update, so it costs nothing unless
+    /// a displayed line actually changes (snow depth at its
+    /// 0.01 m format granularity, freeze status at its
+    /// thresholds, the caption at whole percents).
+    func refreshFooter() {
+        let w = project.scene.weather
+        var parts: [String] = []
+        if w.wetness > 0.02 {
+            parts.append("Ground: \(Int((w.wetness * 100).rounded()))% wet")
+        }
+        if w.snow > 0.02 {
+            parts.append("Snow cover: \(Int((w.snow * 100).rounded()))%")
+        }
+        if parts.isEmpty {
+            if w.mode == 1 { parts.append("Ground: 0% wet") }
+            else if w.mode == 2 { parts.append("Snow cover: 0%") }
+        }
+        let showWeather = w.mode != 0 || w.wetness > 0.02 || w.snow > 0.02
+        let snowDepth: String? = liveSnowAmount > 0.005
+            ? String(format: "Snow depth: %.2f m of %.2f m max",
+                     liveSnowAmount, w.maxDepth)
+            : nil
+        footer.update(
+            hint: multiSelectMode
+                ? "Multi Select is on: tap objects in the view or the list to add or remove them. Drag any selected object to move them all. Tap empty space to clear."
+                : "Tap an object in the view to select it.",
+            weather: showWeather ? parts.joined(separator: " · ") : nil,
+            snowDepth: snowDepth,
+            temperature: temperatureStatusText)
+    }
 
     private struct Snapshot: Codable { var objects: [SceneObject] }
     private var undoStack: [Data] = []
@@ -327,6 +465,8 @@ final class EditorSession: ObservableObject {
         if !renderer.rayTracingSupported {
             status = "This device does not support Metal ray tracing."
         }
+        // v4.9: seed the footer's narrow observable.
+        refreshFooter()
     }
 
     // MARK: Render-on-change plumbing
@@ -403,6 +543,7 @@ final class EditorSession: ObservableObject {
     private func restore(_ data: Data) {
         guard let snap = try? JSONDecoder().decode(Snapshot.self, from: data) else { return }
         project.scene.objects = snap.objects
+        noteSceneObjectsChanged()
         if let sel = selection, !snap.objects.contains(where: { $0.id == sel }) {
             selection = nil
         }
@@ -411,10 +552,16 @@ final class EditorSession: ObservableObject {
         // the objects back as scene objects; the SET itself is
         // not part of the snapshot and stays cleared/pruned).
         if !multiSelection.isEmpty {
-            multiSelection = multiSelection.filter { id in
+            // v4.9: assign only on an actual change — an
+            // unpruned set must not republish.
+            let pruned = multiSelection.filter { id in
                 snap.objects.contains { $0.id == id }
             }
-            if multiSelection.count == 1 { selection = multiSelection.first }
+            if pruned != multiSelection { multiSelection = pruned }
+            if multiSelection.count == 1 {
+                let only = multiSelection.first
+                if selection != only { selection = only }
+            }
             if multiSelection.isEmpty && selection != nil,
                !snap.objects.contains(where: { $0.id == selection }) {
                 selection = nil
@@ -430,8 +577,10 @@ final class EditorSession: ObservableObject {
     }
 
     private func syncUndoDepths() {
-        undoDepth = undoStack.count
-        redoDepth = redoStack.count
+        // v4.9: change-only — an unchanged depth must not fire
+        // objectWillChange (this runs on every beginEdit).
+        if undoDepth != undoStack.count { undoDepth = undoStack.count }
+        if redoDepth != redoStack.count { redoDepth = redoStack.count }
     }
 
     var canUndo: Bool { undoDepth > 0 }
@@ -443,6 +592,7 @@ final class EditorSession: ObservableObject {
     /// beginEdit()/beginEditIfNewGesture() at gesture start.
     func mutateScene(_ change: (inout Scene) -> Void) {
         change(&project.scene)
+        noteSceneObjectsChanged()
         renderer.rebuild(scene: project.scene, meshes: meshes)
         kickRender()
     }
@@ -459,6 +609,7 @@ final class EditorSession: ObservableObject {
                 let old = project.scene.objects[idx]
                 if old == newValue { return }
                 project.scene.objects[idx] = newValue
+                noteSceneObjectsChanged()
                 // A name-only edit needs no renderer work at all.
                 var a = old, b = newValue
                 a.name = ""; b.name = ""
@@ -630,6 +781,7 @@ final class EditorSession: ObservableObject {
         let t = project.scene.camera.target
         obj.transform.position = [t[0], kind == "plane" ? 0 : defaultY(for: obj), t[2]]
         project.scene.objects.append(obj)
+        noteSceneObjectsChanged()
         // v4.3: a brand-new object has caught NO snow yet — if
         // snow is already down it gathers visibly from zero.
         snowExposureA[obj.id] = 0
@@ -681,6 +833,7 @@ final class EditorSession: ObservableObject {
         let name = project.scene.objects[idx].name
         let removedID = project.scene.objects[idx].id
         project.scene.objects.remove(at: idx)
+        noteSceneObjectsChanged()
         // v4.3: prune the deleted object's exposure immediately,
         // so it never lingers in the renderer's map.
         snowExposureA.removeValue(forKey: removedID)
@@ -749,8 +902,11 @@ final class EditorSession: ObservableObject {
     }
 
     func clearMultiSelection() {
-        multiSelection = []
-        selection = nil
+        // v4.9: change-only — clearing an already-empty set
+        // (e.g. a tap on empty space with nothing selected)
+        // must not republish either property.
+        if !multiSelection.isEmpty { multiSelection = [] }
+        if selection != nil { selection = nil }
     }
 
     /// Delete the whole set as ONE undo step.
@@ -759,6 +915,7 @@ final class EditorSession: ObservableObject {
         guard ids.count > 1 else { deleteSelected(); return }
         beginEdit()
         project.scene.objects.removeAll { ids.contains($0.id) }
+        noteSceneObjectsChanged()
         for id in ids {
             snowExposureA.removeValue(forKey: id)
             bakedExposureSteps.removeValue(forKey: id)
@@ -866,6 +1023,7 @@ final class EditorSession: ObservableObject {
                     self.bakedExposureSteps[obj.id] = 0
                     if firstID == nil { firstID = obj.id }
                 }
+                self.noteSceneObjectsChanged()
                 // v4.6: same placement fix as addPrimitive —
                 // sync the renderer's map before the rebuild.
                 self.renderer.objectSnowAmounts = self.snowExposureA
@@ -916,7 +1074,7 @@ final class EditorSession: ObservableObject {
             areaHiddenPromotedIDs.removeAll()
             dynamicEntries.removeAll()
             runtimeUnloaded.removeAll()
-            playBanner = ""
+            if !playBanner.isEmpty { playBanner = "" }
             bannerExpiry = nil
             // v4.3: footprints start empty every Play session,
             // and the figure driver starts from the look yaw
@@ -992,7 +1150,7 @@ final class EditorSession: ObservableObject {
             promotedIDs.removeAll()
             hiddenPromotedIDs.removeAll()
             areaHiddenPromotedIDs.removeAll()
-            playBanner = ""
+            if !playBanner.isEmpty { playBanner = "" }
             bannerExpiry = nil
             mode = .edit
             // v4.3: back in edit mode the figure returns to its
@@ -1003,6 +1161,9 @@ final class EditorSession: ObservableObject {
         noteCameraActivity()
         status = mode == .play ? "Play mode — walk around. Pause to edit."
                                 : "Edit mode."
+        // v4.9: Play entry/exit restores weather state — the
+        // footer's displayed lines follow it here too.
+        refreshFooter()
     }
 
     /// Undo-free restore of the Play-entry object snapshot. See
@@ -1015,6 +1176,7 @@ final class EditorSession: ObservableObject {
         playSnapshot = nil
         guard let snap = try? JSONDecoder().decode(Snapshot.self, from: data) else { return }
         project.scene.objects = snap.objects
+        noteSceneObjectsChanged()
         // v4.3: restored objects carry their Play-entry snapshot
         // exposures (absent = caught up); prune anything else.
         ensureExposuresForSceneObjects()
@@ -1055,6 +1217,7 @@ final class EditorSession: ObservableObject {
         // The promotion mechanism: from here the static layer must
         // never draw this object again this Play session.
         project.scene.objects[idx].visible = false
+        noteSceneObjectsChanged()
         syncDynamicEntry(id: id)
         // v4.1 (F29): do NOT rebuild here. A Play-start chain that
         // touches N objects in one tick would otherwise pay N full
@@ -1107,6 +1270,17 @@ final class EditorSession: ObservableObject {
         guard let idx = project.scene.objects.firstIndex(where: { $0.id == id })
         else { return }
         if !promotedIDs.contains(id) { promoteObject(id: id) }
+        // v4.9: change-only — a tween/pose funnel can re-send
+        // the transform the object already has (held end pose,
+        // zero-length step); the published write, the static
+        // rebuild and the dynamic-matrix push are all no-ops
+        // then, so skip them. The dynamic entry (when promoted)
+        // was built from this same transform, so it already
+        // carries t.matrix.
+        if project.scene.objects[idx].transform == t {
+            kickRender()
+            return
+        }
         // v4.1 (F19): promotion can FAIL (no/empty local mesh) —
         // then there is no dynamic entry to move, and writing only
         // the scene value would be silently invisible until some
@@ -1131,6 +1305,13 @@ final class EditorSession: ObservableObject {
         guard let idx = project.scene.objects.firstIndex(where: { $0.id == id })
         else { return }
         if !promotedIDs.contains(id) { promoteObject(id: id) }
+        // v4.9: change-only, same discipline as transforms —
+        // re-sending the current material skips the published
+        // write and the GPU-material rebuild below.
+        if project.scene.objects[idx].material == m {
+            kickRender()
+            return
+        }
         // v4.1 (F19): same unpromotable fallback as transforms.
         guard promotedIDs.contains(id) else {
             project.scene.objects[idx].material = m
@@ -1171,9 +1352,14 @@ final class EditorSession: ObservableObject {
             // legacy static path — write the flag and rebuild.
             // v4.1 (F29): the collision grid must follow, as the
             // area funnels already do.
-            project.scene.objects[idx].visible = visible
-            renderer.rebuild(scene: project.scene, meshes: meshes)
-            runtime.collisionDidChange()
+            // v4.9: change-only — an unchanged flag needs no
+            // published write, rebuild or collision rebuild.
+            if project.scene.objects[idx].visible != visible {
+                project.scene.objects[idx].visible = visible
+                noteSceneObjectsChanged()
+                renderer.rebuild(scene: project.scene, meshes: meshes)
+                runtime.collisionDidChange()
+            }
         }
         kickRender()
     }
@@ -1229,7 +1415,10 @@ final class EditorSession: ObservableObject {
     }
 
     func runtimeShowMessage(_ text: String, seconds: Double) {
-        playBanner = text
+        // v4.9: change-only published write — re-showing the
+        // same message still extends its expiry below, it just
+        // doesn't republish an identical string.
+        if playBanner != text { playBanner = text }
         bannerExpiry = Date().addingTimeInterval(seconds)
         kickRender()
     }
@@ -1252,7 +1441,12 @@ final class EditorSession: ObservableObject {
     /// above it per the (continuous) eye rule in teleportEyeY.
     func runtimeTeleportPlayer(to t: SIMD3<Float>) {
         let eyeY = teleportEyeY(forTargetY: Double(t.y))
-        project.scene.camera.playPosition = [Double(t.x), eyeY, Double(t.z)]
+        // v4.9: change-only — teleporting to the spot the
+        // player already occupies writes nothing.
+        let target: [Double] = [Double(t.x), eyeY, Double(t.z)]
+        if project.scene.camera.playPosition != target {
+            project.scene.camera.playPosition = target
+        }
         noteCameraActivity()
     }
 
@@ -1268,9 +1462,21 @@ final class EditorSession: ObservableObject {
     /// yaw/pitch in degrees (pitch clamped ±85, matching look
     /// input).
     func runtimeSetPlayerPose(position: SIMD3<Float>, yaw: Double, pitch: Double) {
-        project.scene.camera.playPosition = [Double(position.x), Double(position.y), Double(position.z)]
-        project.scene.camera.playYaw = yaw
-        project.scene.camera.playPitch = min(85, max(-85, pitch))
+        // v4.9: per-field change-only writes — a per-frame pose
+        // funnel (camera-follow nodes) re-sends held components
+        // constantly; only a component that actually moved
+        // writes through the published project.
+        let pos: [Double] = [Double(position.x), Double(position.y), Double(position.z)]
+        if project.scene.camera.playPosition != pos {
+            project.scene.camera.playPosition = pos
+        }
+        if project.scene.camera.playYaw != yaw {
+            project.scene.camera.playYaw = yaw
+        }
+        let clampedPitch = min(85, max(-85, pitch))
+        if project.scene.camera.playPitch != clampedPitch {
+            project.scene.camera.playPitch = clampedPitch
+        }
         noteCameraActivity()
     }
 
@@ -1313,9 +1519,17 @@ final class EditorSession: ObservableObject {
             // (its catalogue contract is unchanged) — in absolute
             // terms that is progress * maxDepth metres.
             if let snow { buildupSnow = min(1, max(0, snow)) * snowMaxDepth }
-            project.scene.weather.wetness = buildupWet
-            project.scene.weather.snow = snowProgressClamped
-            project.scene.weather.snowAmount = buildupSnow
+            // v4.9: change-only published writes (the rebuild +
+            // reset below still run exactly as before).
+            if project.scene.weather.wetness != buildupWet {
+                project.scene.weather.wetness = buildupWet
+            }
+            if project.scene.weather.snow != snowProgressClamped {
+                project.scene.weather.snow = snowProgressClamped
+            }
+            if project.scene.weather.snowAmount != buildupSnow {
+                project.scene.weather.snowAmount = buildupSnow
+            }
             // A direct level set can only lower exposures (they
             // re-gather from falling snow, per the age rule).
             clampExposuresToAmbient()
@@ -1480,7 +1694,10 @@ final class EditorSession: ObservableObject {
             project.scene.objects[i].areaID = nil
             unassigned = true
         }
-        if unassigned { renderer.rebuild(scene: project.scene, meshes: meshes) }
+        if unassigned {
+            noteSceneObjectsChanged()
+            renderer.rebuild(scene: project.scene, meshes: meshes)
+        }
         status = "Deleted trigger area."
         kickRender()
     }
@@ -1511,34 +1728,59 @@ final class EditorSession: ObservableObject {
         // them on a mode change (they were initialised from the
         // project and are kept in sync with it).
         if mode != 0 { weatherClock = 0 } // dynamics fade in fresh
-        project.scene.weather.mode = mode
+        // v4.9: change-only published write — re-selecting the
+        // current mode still resets the dynamics clock above
+        // and kicks a frame, it just doesn't republish.
+        if project.scene.weather.mode != mode {
+            project.scene.weather.mode = mode
+        }
         kickRender()
         if mode != 0 && !renderer.precipAvailable {
             status = "Precipitation unavailable on this device — ground effects still apply."
         }
+        refreshFooter()
     }
 
     /// Flush the live build-up accumulators into the published
     /// project. Called before anything writes the project to disk.
     func syncWeatherToProject() {
-        project.scene.weather.wetness = buildupWet
+        // v4.9: every write here is change-only — the values
+        // written are exactly the pre-v4.9 ones, but a field
+        // that already holds its synced value no longer fires
+        // objectWillChange (this runs on every save/export).
+        if project.scene.weather.wetness != buildupWet {
+            project.scene.weather.wetness = buildupWet
+        }
         // v4.3: the level persists as clamped progress; the
         // absolute amount and the per-object exposures ride
         // along so a reopened project resumes exactly here.
-        project.scene.weather.snow = snowProgressClamped
-        project.scene.weather.snowAmount = buildupSnow
+        if project.scene.weather.snow != snowProgressClamped {
+            project.scene.weather.snow = snowProgressClamped
+        }
+        if project.scene.weather.snowAmount != buildupSnow {
+            project.scene.weather.snowAmount = buildupSnow
+        }
         syncExposuresToProject()
         // v4.6: the plow layer round-trips through the
         // renderer (it is the recorder's working copy); an
         // empty layer saves as nil so untouched projects keep
         // byte-identical saves.
         let plow = renderer.exportSnowPlow()
-        project.scene.weather.plowCells = plow.isEmpty ? nil : plow
+        let plowValue: [SnowPlowCell]? = plow.isEmpty ? nil : plow
+        if project.scene.weather.plowCells != plowValue {
+            project.scene.weather.plowCells = plowValue
+        }
         // v4.7: snowfall clock + freeze fraction persist the
         // same way — nil at their zero values so untouched
         // projects keep byte-identical saves.
-        project.scene.weather.snowfallTotal = snowfallTotal == 0 ? nil : snowfallTotal
-        project.scene.weather.puddleFreeze = buildupFreeze == 0 ? nil : buildupFreeze
+        let snowfallValue: Double? = snowfallTotal == 0 ? nil : snowfallTotal
+        if project.scene.weather.snowfallTotal != snowfallValue {
+            project.scene.weather.snowfallTotal = snowfallValue
+        }
+        let freezeValue: Double? = buildupFreeze == 0 ? nil : buildupFreeze
+        if project.scene.weather.puddleFreeze != freezeValue {
+            project.scene.weather.puddleFreeze = freezeValue
+        }
     }
 
     /// v4.3: the quantised exposure step of one A-value, in
@@ -1612,9 +1854,15 @@ final class EditorSession: ObservableObject {
     /// syncWeatherToProject; never per frame.
     func syncExposuresToProject() {
         pruneExposures()
+        noteSceneObjectsChanged()
         for i in project.scene.objects.indices {
             if let exp = snowExposureA[project.scene.objects[i].id] {
-                project.scene.objects[i].snowExposure = Double(exp)
+                // v4.9: change-only per object (save-rate, but
+                // the loop previously republished per object).
+                let value = Double(exp)
+                if project.scene.objects[i].snowExposure != value {
+                    project.scene.objects[i].snowExposure = value
+                }
             }
         }
     }
@@ -1637,6 +1885,7 @@ final class EditorSession: ObservableObject {
         bakedExposureSteps = snowExposureA.mapValues { exposureStep(for: $0) }
         scheduleRebuild(geometry: true)
         kickRender()
+        refreshFooter()
     }
 
     /// v4.7 (Weather sheet): set the temperature (°C), or nil
@@ -1647,6 +1896,7 @@ final class EditorSession: ObservableObject {
         project.scene.weather.temperature = c.map { min(30, max(-20, $0)) }
         renderer.resetAccumulation()
         kickRender()
+        refreshFooter()
     }
 
     /// v4.8 (steering 1): water reflection resolution. Held
@@ -1745,6 +1995,7 @@ final class EditorSession: ObservableObject {
         renderer.resetAccumulation()
         kickRender()
         status = "Ground build-up cleared."
+        refreshFooter()
     }
 
     // MARK: v4.3 footprints + player figure
@@ -2156,12 +2407,31 @@ final class EditorSession: ObservableObject {
         // Published sync only when the displayed (whole-percent)
         // value actually changes. The snow percent is of the
         // clamped progress pc.
-        if Int((buildupWet * 100).rounded()) != Int((project.scene.weather.wetness * 100).rounded())
-            || Int((snowProgressClamped * 100).rounded()) != Int((project.scene.weather.snow * 100).rounded()) {
+        // v4.9: narrowed per field — previously a crossing in
+        // EITHER channel rewrote all three published fields;
+        // now each field writes only when its own displayed
+        // percent crosses (snowAmount rides with the snow
+        // channel, exactly as it did whenever snow crossed;
+        // save()'s syncWeatherToProject still flushes the exact
+        // amount to disk). Displayed values are unchanged.
+        let wetCrossed = Int((buildupWet * 100).rounded())
+            != Int((project.scene.weather.wetness * 100).rounded())
+        let snowCrossed = Int((snowProgressClamped * 100).rounded())
+            != Int((project.scene.weather.snow * 100).rounded())
+        if wetCrossed {
             project.scene.weather.wetness = buildupWet
+        }
+        if snowCrossed {
             project.scene.weather.snow = snowProgressClamped
             project.scene.weather.snowAmount = buildupSnow
         }
+        // v4.9: the footer follows the same change-only
+        // discipline via its own observable — refreshFooter
+        // republishes only when a displayed line changes, so
+        // this per-frame call is inert on unchanged frames
+        // (it also catches freeze-status flips, which cross
+        // no percent boundary).
+        refreshFooter()
         // v4.0: banner expiry — a published write only on the
         // frame where it actually lapses.
         if !playBanner.isEmpty, let expiry = bannerExpiry, Date() >= expiry {
@@ -2310,7 +2580,12 @@ final class EditorSession: ObservableObject {
             }
         }
         if moved {
-            project.scene.camera = cam
+            // v4.9: change-only — `moved` can be true with a
+            // zero net delta (opposing inputs, playSpeed 0);
+            // an identical camera must not republish per frame.
+            if project.scene.camera != cam {
+                project.scene.camera = cam
+            }
             lastCameraActivity = CACurrentMediaTime()
         }
     }
@@ -2380,12 +2655,15 @@ final class EditorSession: ObservableObject {
             return
         }
         if let hit = pickAt(ndc: ndc, aspect: aspect) {
-            selection = hit
+            // v4.9: change-only — re-tapping the already
+            // selected object republishes neither property.
+            if selection != hit { selection = hit }
             if let name = project.scene.objects.first(where: { $0.id == hit })?.name {
-                status = "Selected \(name)."
+                let text = "Selected \(name)."
+                if status != text { status = text }
             }
         } else {
-            selection = nil
+            if selection != nil { selection = nil }
         }
     }
 
@@ -2398,6 +2676,11 @@ final class EditorSession: ObservableObject {
         // at — orbit camera in edit mode, first-person in Play.
         let basis = mode == .play ? project.scene.camera.playBasis()
                                   : project.scene.camera.orbitBasis()
+        // v4.9: static AS builds are asynchronous now — flush
+        // any pending build + swap synchronously so the
+        // thumbnail renders the CURRENT scene, not the last
+        // completed build (pre-v4.9 synchronous behaviour).
+        renderer.flushPendingStaticBuild()
         let thumb = renderer.renderStillPNG(camera: basis, width: 640, height: 480, samples: 48)
         ProjectStore.saveProject(project, thumbnailPNG: thumb)
         status = "Saved."
@@ -2413,6 +2696,9 @@ final class EditorSession: ObservableObject {
         syncWeatherToProject()
         let basis = mode == .play ? project.scene.camera.playBasis()
                                   : project.scene.camera.orbitBasis()
+        // v4.9: same flush as save() — the export must render
+        // the current scene, not a still-pending async build.
+        renderer.flushPendingStaticBuild()
         guard let png = renderer.renderStillPNG(camera: basis, width: 1600, height: 1200, samples: 128)
         else { return nil }
         let name = project.name.replacingOccurrences(of: "/", with: "-")

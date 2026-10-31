@@ -259,6 +259,94 @@ final class Renderer {
     private var emissiveCount: Int = 0
     private var totalEmissiveArea: Float = 0
 
+    // MARK: - v4.9 optimisation state
+    //
+    // (1b) Static-build staging: rebuild() stages the complete
+    // new static state in a PreparedStatic and builds its AS
+    // asynchronously; the live properties above swap atomically
+    // at a frame boundary once the build completes, so a frame
+    // never mixes an old AS with new buffers or vice versa.
+    private struct PreparedStatic {
+        var cpuPositions: [Float] = []
+        var cpuIndices: [UInt32] = []
+        var cpuTriObject: [UUID] = []
+        var cpuTriMats: [UInt32] = []
+        var objectOrder: [UUID] = []
+        var materials: [GPUMaterial] = []
+        var sheet: Bool = false
+        var snow: Bool = false
+        var triCount: Int = 0
+        var posBuffer: MTLBuffer?
+        var nrmBuffer: MTLBuffer?
+        var uvBuffer: MTLBuffer?
+        var colBuffer: MTLBuffer?
+        var idxBuffer: MTLBuffer?
+        var triMatBuffer: MTLBuffer?
+        var accel: MTLAccelerationStructure?
+        var cmd: MTLCommandBuffer?
+    }
+    private var pendingStatic: PreparedStatic?
+    private var deferredStatic: PreparedStatic?
+    private var staticEverSwapped = false
+    /// The last presented frame's command buffer: the bounded
+    /// fence for CPU writes into shared buffers (see
+    /// waitForPreviousFrame).
+    private var lastFrameCommandBuffer: MTLCommandBuffer?
+
+    // (5) Material table: one persistent shared buffer, written
+    // per changed slot at a single flush point (top of draw).
+    private var matBufferCapacity = 0 // in GPUMaterial slots
+    private var matBufferUploaded: [GPUMaterial] = []
+    private var matPendingTable: [GPUMaterial] = []
+    private var matTableDirty = false
+    /// Emissive-index gating: signature of the emissive-
+    /// relevant material fields at the last uploadEmissiveIndex.
+    private var lastEmissiveSignature: UInt64 = 0
+    private var lastEmissiveSignatureValid = false
+
+    // (1c) Sheet-only scoped rebuild: fingerprint of everything
+    // except the sheet segment + the cached static prefix.
+    private struct StaticFingerprint: Equatable {
+        var ids: [UUID] = []
+        var baked: [UInt64] = []
+        var mats: [UInt64] = []
+        var xf: [UInt64] = []
+    }
+    private struct PrefixCache {
+        var fingerprint: StaticFingerprint
+        var positions: [Float]
+        var normals: [Float]
+        var uvs: [Float]
+        var colors: [Float]
+        var indices: [UInt32]
+        var triMats: [UInt32]
+        var triObjects: [UUID]
+        var materials: [GPUMaterial]
+        var objectOrder: [UUID]
+    }
+    private var cachedPrefix: PrefixCache?
+    private var scopedVerified: Set<UInt64> = []
+    private var scopedDisabled: Set<UInt64> = []
+    // (2b) Support-index cache for appendSnowSheet, keyed by a
+    // hash of the included world meshes + per-object amounts
+    // (the only inputs buildSupportIndex reads).
+    private var cachedSupportGrid: [Int64: [SnowSupportTri]]?
+    private var cachedSupportKey: UInt64 = 0
+    // (1a) Dynamic-layer persistent vertex capacity (vertices)
+    // + cached refit scratch.
+    private var dynVertCapacity = 0
+    private var dynRefitScratch: MTLBuffer?
+    private var dynRefitScratchSize = 0
+    private var dynTriMatCapacity = 0
+    private var dynTriMatUploaded: [UInt32] = []
+    // (4) Sim per-kind content knowledge: set by creation paths
+    // (lattice sync, recorder edits, active sources), cleared
+    // only by a full settle-scan read. Never guessed.
+    private var simSnowContent = false
+    private var simWaterContent = false
+    private var simSnowCeilMax: Float = 0
+    private var simWaterCeilMax: Float = 0
+
     // v4 dynamic layer: a second triangle soup beside the static
     // one, in its own buffers (slots 11-17) and its own AS.
     // Unified ids: static 0..<triCount, dynamic triCount... .
@@ -1127,6 +1215,7 @@ final class Renderer {
         if !geometry, updateMaterialsOnly(scene: scene, meshes: meshes) {
             return
         }
+        swapStaticIfReady()
         var positions: [Float] = []
         var normals: [Float] = []
         var uvArr: [Float] = []
@@ -1159,7 +1248,29 @@ final class Renderer {
         // Deterministic from transforms + mesh bounds; rebuilt
         // fresh here, nothing is stored between rebuilds.
         let snowIntruders = buildSnowIntruders(included: included)
+        // v4.9 (1c): fingerprint of everything EXCEPT the sheet
+        // segment, for the sheet-only scoped rebuild below.
+        let fp = staticFingerprint(included: included)
+        let fpHash = fingerprintHash(fp)
+        let canScope = weatherGeoActive && cachedPrefix?.fingerprint == fp
+            && !scopedDisabled.contains(fpHash)
+        let verifyScope = canScope && !scopedVerified.contains(fpHash)
+        let useScoped = canScope && !verifyScope
+        if useScoped, let cache = cachedPrefix {
+            // Scoped path: reuse the cached static prefix
+            // verbatim; only the sheet pass below re-runs.
+            positions = cache.positions
+            normals = cache.normals
+            uvArr = cache.uvs
+            colArr = cache.colors
+            indices = cache.indices
+            triMats = cache.triMats
+            triObjects = cache.triObjects
+            materials = cache.materials
+            objectOrder = cache.objectOrder
+        }
         var triBudget = 220_000
+        if !useScoped {
         for (obj, _, world) in included {
             let matIndex = UInt32(materials.count)
             materials.append(gpuMaterialForObject(obj))
@@ -1187,6 +1298,18 @@ final class Renderer {
                 triObjects.append(obj.id)
             }
         }
+        }
+        // v4.9 (1c): capture the static prefix (everything up to
+        // where the sheet segment begins) BEFORE the sheet pass
+        // appends, for the scoped-rebuild cache + self-check.
+        var builtPrefix: PrefixCache? = nil
+        if !useScoped {
+            builtPrefix = PrefixCache(fingerprint: fp, positions: positions,
+                                      normals: normals, uvs: uvArr, colors: colArr,
+                                      indices: indices, triMats: triMats,
+                                      triObjects: triObjects, materials: materials,
+                                      objectOrder: objectOrder)
+        }
         // v4.4: the weather sheet pass — one world-space
         // lattice draped over the sampled support surfaces,
         // emitting the snow sheet (FLAG_SNOW material) and
@@ -1206,33 +1329,47 @@ final class Renderer {
                             sheetEmitted: &sheetEmitted,
                             snowEmitted: &snowEmitted)
         }
-        sceneHasSheetMaterial = sheetEmitted
-        sceneHasSnowMaterial = snowEmitted
-        cachedStaticMaterials = materials
-
-        triCount = indices.count / 3
-        cpuPositions = positions
-        cpuIndices = indices
-        cpuTriObject = triObjects
-        cpuTriMats = triMats
-        cachedObjectOrder = objectOrder
-        _collisionTriangles = computeCollisionTriangles()
-        // The dynamic material base may have moved with the new
-        // static count; the dynamic layer itself survives.
-        refreshDynTriMats()
-        let fullMats = fullMaterialTable()
-        uploadEmissiveIndex(materials: fullMats)
-        matBuffer = makeBuffer(fullMats)
-
-        posBuffer = makeBuffer(positions)
-        nrmBuffer = makeBuffer(normals)
-        uvBuffer = makeBuffer(uvArr)
-        colBuffer = makeBuffer(colArr)
-        idxBuffer = makeBuffer(indices)
-        triMatBuffer = makeBuffer(triMats)
-
-        buildAccelerationStructure()
-        resetAccumulation()
+        // v4.9 (1c): one-shot self-check — the first time the
+        // scoped path is eligible for a fingerprint, this build
+        // ran the FULL path; its prefix must equal the cached
+        // prefix verbatim. On any mismatch the scoped path is
+        // permanently disabled for that fingerprint (the full
+        // arrays computed here are used either way, so the
+        // check itself can never corrupt a frame).
+        if let builtPrefix {
+            if verifyScope, let cache = cachedPrefix {
+                if prefixEqual(builtPrefix, cache) {
+                    scopedVerified.insert(fpHash)
+                } else {
+                    scopedDisabled.insert(fpHash)
+                    print("LumenScene: scoped sheet rebuild self-check failed; disabled for this scene fingerprint")
+                }
+            }
+            cachedPrefix = builtPrefix
+        }
+        // v4.9 (1b): stage the complete new static state (all
+        // buffers + CPU mirrors + counts) and build its AS
+        // asynchronously. The live properties swap atomically
+        // at the next frame boundary (see stageStaticBuild /
+        // swapStatic); until then rendering continues on the
+        // previous complete state.
+        var prepared = PreparedStatic()
+        prepared.cpuPositions = positions
+        prepared.cpuIndices = indices
+        prepared.cpuTriObject = triObjects
+        prepared.cpuTriMats = triMats
+        prepared.objectOrder = objectOrder
+        prepared.materials = materials
+        prepared.sheet = sheetEmitted
+        prepared.snow = snowEmitted
+        prepared.triCount = indices.count / 3
+        prepared.posBuffer = makeBuffer(positions)
+        prepared.nrmBuffer = makeBuffer(normals)
+        prepared.uvBuffer = makeBuffer(uvArr)
+        prepared.colBuffer = makeBuffer(colArr)
+        prepared.idxBuffer = makeBuffer(indices)
+        prepared.triMatBuffer = makeBuffer(triMats)
+        stageStaticBuild(prepared)
     }
 
     /// Material-only refresh: same objects, same geometry — rewrite
@@ -1241,6 +1378,7 @@ final class Renderer {
     /// set changed and a full rebuild is required.
     @discardableResult
     func updateMaterialsOnly(scene: Scene, meshes: [UUID: MeshData]) -> Bool {
+        swapStaticIfReady()
         guard accel != nil, !cpuIndices.isEmpty else { return false }
         // The included-object list must match the cached geometry
         // exactly — via the ONE shared inclusion predicate
@@ -1265,8 +1403,14 @@ final class Renderer {
         cachedStaticMaterials = materials
         refreshDynTriMats()
         let fullMats = fullMaterialTable()
-        uploadEmissiveIndex(materials: fullMats)
-        matBuffer = makeBuffer(fullMats)
+        // v4.9 (item 5): geometry is unchanged by construction
+        // here (the candidate list matched the cached geometry),
+        // so the emissive rescan is signature-gated and the
+        // material table writes only changed slots.
+        uploadEmissiveIndexGated(materials: fullMats, rescanStatic: true,
+                                 geometryUnchanged: true)
+        uploadMaterialTable(fullMats)
+        flushMaterialTable()
         resetAccumulation()
         return true
     }
@@ -1438,6 +1582,234 @@ final class Renderer {
             }
         }
         return (tris, cdf, acc)
+    }
+
+    // MARK: - v4.9 helpers (hashing, material table, fences)
+
+    private func fnv1a(_ h: inout UInt64, _ v: UInt64) {
+        h = (h ^ v) &* 1099511628211
+    }
+
+    /// Content hash of one baked world mesh (all five arrays,
+    /// counts + values). Used by the scoped-rebuild fingerprint
+    /// and the support-index cache key: when in doubt, the
+    /// fingerprint covers MORE, never less.
+    private func bakedHash(_ world: MeshData) -> UInt64 {
+        var h: UInt64 = 1469598103934665603
+        fnv1a(&h, UInt64(world.positions.count))
+        for v in world.positions { fnv1a(&h, UInt64(v.bitPattern)) }
+        fnv1a(&h, UInt64(world.normals.count))
+        for v in world.normals { fnv1a(&h, UInt64(v.bitPattern)) }
+        fnv1a(&h, UInt64(world.uvs.count))
+        for v in world.uvs { fnv1a(&h, UInt64(v.bitPattern)) }
+        fnv1a(&h, UInt64(world.colors.count))
+        for v in world.colors { fnv1a(&h, UInt64(v.bitPattern)) }
+        fnv1a(&h, UInt64(world.indices.count))
+        for v in world.indices { fnv1a(&h, UInt64(v)) }
+        return h
+    }
+
+    /// Field-wise hash of a GPUMaterial (explicit fields, never
+    /// raw struct bytes — padding is not deterministic).
+    private func materialHash(_ m: GPUMaterial) -> UInt64 {
+        var h: UInt64 = 1469598103934665603
+        for v in [m.baseColor.x, m.baseColor.y, m.baseColor.z, m.baseColor.w,
+                  m.emissive.x, m.emissive.y, m.emissive.z, m.emissive.w,
+                  m.glassParams.x, m.glassParams.y, m.glassParams.z, m.glassParams.w,
+                  m.tint.x, m.tint.y, m.tint.z, m.tint.w] {
+            fnv1a(&h, UInt64(v.bitPattern))
+        }
+        fnv1a(&h, UInt64(m.texIndex))
+        fnv1a(&h, UInt64(m.flags))
+        fnv1a(&h, UInt64(m.pad.x))
+        fnv1a(&h, UInt64(m.pad.y))
+        return h
+    }
+
+    private func gpuMaterialEqual(_ a: GPUMaterial, _ b: GPUMaterial) -> Bool {
+        a.baseColor == b.baseColor && a.emissive == b.emissive
+            && a.glassParams == b.glassParams && a.tint == b.tint
+            && a.texIndex == b.texIndex && a.flags == b.flags && a.pad == b.pad
+    }
+
+    private func materialsEqual(_ a: [GPUMaterial], _ b: [GPUMaterial]) -> Bool {
+        a.count == b.count && zip(a, b).allSatisfy { p in gpuMaterialEqual(p.0, p.1) }
+    }
+
+    private func prefixEqual(_ a: PrefixCache, _ b: PrefixCache) -> Bool {
+        a.positions == b.positions && a.normals == b.normals
+            && a.uvs == b.uvs && a.colors == b.colors
+            && a.indices == b.indices && a.triMats == b.triMats
+            && a.triObjects == b.triObjects && a.objectOrder == b.objectOrder
+            && materialsEqual(a.materials, b.materials)
+    }
+
+    /// v4.9 (1c): fingerprint of everything EXCEPT the sheet
+    /// segment: included object ids in order, per-object baked
+    /// world-mesh content, per-object material-table content,
+    /// and per-object transforms. The sheet pass reads other
+    /// inputs too (amounts, weather levels, the plow layer,
+    /// intruders) — those re-run with the sheet and are NOT
+    /// part of the prefix, so they are excluded here; anything
+    /// that feeds the prefix arrays is included.
+    private func staticFingerprint(
+        included: [(obj: SceneObject, local: MeshData, world: MeshData)]
+    ) -> StaticFingerprint {
+        var fp = StaticFingerprint()
+        for (obj, _, world) in included {
+            fp.ids.append(obj.id)
+            fp.baked.append(bakedHash(world))
+            fp.mats.append(materialHash(gpuMaterialForObject(obj)))
+            var h: UInt64 = 1469598103934665603
+            let m = obj.transform.matrix
+            for col in [m.columns.0, m.columns.1, m.columns.2, m.columns.3] {
+                for v in [col.x, col.y, col.z, col.w] {
+                    fnv1a(&h, UInt64(v.bitPattern))
+                }
+            }
+            fp.xf.append(h)
+        }
+        return fp
+    }
+
+    private func fingerprintHash(_ fp: StaticFingerprint) -> UInt64 {
+        var h: UInt64 = 1469598103934665603
+        for id in fp.ids {
+            for byte in id.uuidString.utf8 { fnv1a(&h, UInt64(byte)) }
+        }
+        for v in fp.baked { fnv1a(&h, v) }
+        for v in fp.mats { fnv1a(&h, v) }
+        for v in fp.xf { fnv1a(&h, v) }
+        return h
+    }
+
+    /// v4.9 (2b): cache key for buildSupportIndex — its only
+    /// inputs are the included world meshes (positions, normals,
+    /// indices) and each object's snow amount.
+    private func supportIndexKey(
+        included: [(obj: SceneObject, local: MeshData, world: MeshData)]
+    ) -> UInt64 {
+        var h: UInt64 = 1469598103934665603
+        for (obj, _, world) in included {
+            for byte in obj.id.uuidString.utf8 { fnv1a(&h, UInt64(byte)) }
+            fnv1a(&h, bakedHash(world))
+            let amount = objectSnowAmounts[obj.id] ?? weatherSnowAmount
+            fnv1a(&h, UInt64(amount.bitPattern))
+        }
+        return h
+    }
+
+    /// v4.9: bounded fence for CPU writes into .storageModeShared
+    /// buffers the GPU may still be reading (dynamic vertex
+    /// slices, the material table, the dynamic tri-mat buffer).
+    /// Waits ONLY on the previous presented frame's command
+    /// buffer — never on anything encoded for the current frame
+    /// — so the bound is one frame of GPU work, and at vsync
+    /// cadence that buffer is normally already complete.
+    private func waitForPreviousFrame() {
+        if let cb = lastFrameCommandBuffer, cb.status != .completed {
+            cb.waitUntilCompleted()
+        }
+    }
+
+    /// v4.9 (item 5): stage a new material table. The actual
+    /// buffer write happens once at the flush point (top of
+    /// draw / still / swap), with per-slot diffing — N cheap
+    /// setDynamicMaterial calls in a row cost ONE flush.
+    private func uploadMaterialTable(_ mats: [GPUMaterial]) {
+        matPendingTable = mats
+        matTableDirty = true
+    }
+
+    /// Write the staged material table into the persistent
+    /// shared matBuffer, changing only the slots whose bytes
+    /// differ from what was last uploaded. Buffer CONTENTS at
+    /// any draw are exactly the staged table — only the write
+    /// path changed, never the values.
+    private func flushMaterialTable() {
+        guard matTableDirty else { return }
+        matTableDirty = false
+        let mats = matPendingTable
+        let stride = MemoryLayout<GPUMaterial>.stride
+        var reallocated = false
+        if matBuffer == nil || matBufferCapacity < mats.count {
+            let cap = max(mats.count, 1)
+            matBuffer = device.makeBuffer(length: max(cap * stride, 4),
+                                          options: .storageModeShared)
+            matBufferCapacity = (matBuffer != nil) ? cap : 0
+            matBufferUploaded = []
+            reallocated = true
+        }
+        guard let buf = matBuffer, matBufferCapacity > 0 else {
+            matBufferUploaded = []
+            return
+        }
+        let fullRewrite = matBufferUploaded.count != mats.count
+        var anyDiff = fullRewrite
+        if !anyDiff {
+            for i in mats.indices where !gpuMaterialEqual(mats[i], matBufferUploaded[i]) {
+                anyDiff = true
+                break
+            }
+        }
+        guard anyDiff else {
+            matBufferUploaded = mats
+            return
+        }
+        // In-place writes into a buffer an in-flight frame may
+        // still be reading: fence on the previous frame first.
+        // A freshly allocated buffer is referenced by nothing
+        // in flight, so it needs no fence.
+        if !reallocated { waitForPreviousFrame() }
+        let ptr = buf.contents().bindMemory(to: GPUMaterial.self,
+                                            capacity: matBufferCapacity)
+        if fullRewrite {
+            for i in mats.indices { ptr[i] = mats[i] }
+        } else {
+            for i in mats.indices where !gpuMaterialEqual(mats[i], matBufferUploaded[i]) {
+                ptr[i] = mats[i]
+            }
+        }
+        matBufferUploaded = mats
+    }
+
+    /// Emissive-relevant signature of a material table: the
+    /// emissive flag bit + the full emissive SIMD4 per slot,
+    /// plus the triangle counts the scan ranges over. Anything
+    /// else in a material (base colour, snow pad, glass…) can
+    /// change without moving a single emissive byte.
+    private func emissiveSignature(_ mats: [GPUMaterial]) -> UInt64 {
+        var h: UInt64 = 1469598103934665603
+        fnv1a(&h, UInt64(triCount))
+        fnv1a(&h, UInt64(dynTriCount))
+        fnv1a(&h, UInt64(mats.count))
+        for m in mats {
+            fnv1a(&h, UInt64(m.flags & 1))
+            fnv1a(&h, UInt64(m.emissive.x.bitPattern))
+            fnv1a(&h, UInt64(m.emissive.y.bitPattern))
+            fnv1a(&h, UInt64(m.emissive.z.bitPattern))
+            fnv1a(&h, UInt64(m.emissive.w.bitPattern))
+        }
+        return h
+    }
+
+    /// v4.9 (item 5d): gated emissive upload. When the caller
+    /// knows geometry did not change and the emissive signature
+    /// is unchanged since the last upload, the index (tris,
+    /// areas, centroids, CDF, GPU buffers) is provably identical
+    /// to what is already uploaded, so the rescan AND the
+    /// re-upload are skipped entirely.
+    private func uploadEmissiveIndexGated(materials: [GPUMaterial],
+                                          rescanStatic: Bool,
+                                          geometryUnchanged: Bool) {
+        let sig = emissiveSignature(materials)
+        if geometryUnchanged, lastEmissiveSignatureValid,
+           sig == lastEmissiveSignature {
+            return
+        }
+        uploadEmissiveIndex(materials: materials, rescanStatic: rescanStatic)
+        lastEmissiveSignature = sig
+        lastEmissiveSignatureValid = true
     }
 
     private func makeBuffer<T>(_ array: [T]) -> MTLBuffer? {
@@ -2121,7 +2493,8 @@ final class Renderer {
         intruders: [SnowIntruder],
         grid: [Int64: [SnowSupportTri]],
         ox: Float, oz: Float, cs: Float, nx: Int, nz: Int,
-        baseH: [Float], supportY: [Float], hasSupport: [Bool]) -> Set<Int> {
+        baseH: [Float], supportY: [Float], hasSupport: [Bool],
+        latticeSupports: [SnowSupport?]) -> Set<Int> {
         var carved = Set<Int>()
         let vx = nx + 1
         let aNow = weatherSnowAmount
@@ -2319,7 +2692,15 @@ final class Renderer {
                     // whose support came from gap dilation have
                     // no direct sample and fall back to baseH.
                     var baseNB = base
-                    if let s = sampleSupport(grid, x: x, z: z),
+                    // v4.9 (item 3): reuse the support the sheet
+                    // pass already sampled at THIS lattice vertex
+                    // (same grid, same point — the identical
+                    // value sampleSupport would return); fall
+                    // back to a fresh sample only if the snapshot
+                    // does not cover this vertex.
+                    let sampled = (vi < latticeSupports.count)
+                        ? latticeSupports[vi] : sampleSupport(grid, x: x, z: z)
+                    if let s = sampled,
                        abs(s.y - sup) < 0.01 {
                         // Same column math as sheetColumn.
                         let taper = wgfSmooth(0.55, 0.75, s.interpNY)
@@ -2887,6 +3268,11 @@ final class Renderer {
             simWrite(simSnowRateBuf, driftFac)
             simWrite(simWaterCeilBuf, waterCeil)
             simWrite(simWaterRateBuf, waterRate)
+            // v4.9 (item 4): ceilings feed the source-creation
+            // test in tickWeatherSim; depth content is untouched
+            // on this path, so the content flags stand.
+            simSnowCeilMax = snowCeil.max() ?? 0
+            simWaterCeilMax = waterCeil.max() ?? 0
             simPrevCentroids = centroids
             return
         }
@@ -2931,6 +3317,13 @@ final class Renderer {
         simPrevCentroids = centroids
         simInitialised = simSnowBuf != nil && simWaterBuf != nil
         simSettled = false
+        // v4.9 (item 4): content knowledge from the actual
+        // (re)initialised fields — the arrays in hand ARE the
+        // new buffer contents.
+        simSnowContent = snow.contains { $0 > 0 }
+        simWaterContent = water.contains { $0 > 0 }
+        simSnowCeilMax = snowCeil.max() ?? 0
+        simWaterCeilMax = waterCeil.max() ?? 0
     }
 
     /// Apply recorder edit transfers (vertex delta pairs) to
@@ -2949,6 +3342,8 @@ final class Renderer {
         simInitialised = false
         simSettled = true
         simLastTick = 0
+        simSnowContent = false
+        simWaterContent = false
     }
 
     /// Step the simulation from the render loop. Fixed substeps
@@ -2973,24 +3368,38 @@ final class Renderer {
             || simRaining || weatherFreeze > 0.001
         if !inputsActive && simSettled { simStepsLastFrame = 0; return }
         // Settle scan at most twice a second while inactive.
+        // v4.9 (2a): the scan reads the shared buffers through
+        // their contents() pointers — the same values simRead
+        // copied out (two full arrays per scan before; zero
+        // bytes copied now). It also refreshes the per-kind
+        // content flags (item 4) from the same read.
         if !inputsActive, now - simLastSettleScan >= 0.5 {
             simLastSettleScan = now
             let count = simVX * simVZ
-            let snow = simRead(snowB, count: count)
-            let sup = simRead(supB, count: count)
+            let snowPtr = snowB.contents().bindMemory(to: Float.self, capacity: count)
+            let supPtr = supB.contents().bindMemory(to: Float.self, capacity: count)
+            let waterPtr = waterB.contents().bindMemory(to: Float.self, capacity: count)
+            var maxSnow: Float = 0
+            var maxWater: Float = 0
+            for idx in 0..<count {
+                if snowPtr[idx] > maxSnow { maxSnow = snowPtr[idx] }
+                if waterPtr[idx] > maxWater { maxWater = waterPtr[idx] }
+            }
+            simSnowContent = maxSnow > 0
+            simWaterContent = maxWater > 0
             let maxStep = 0.7536 * simCS
             var worst: Float = 0
             for j in 0..<simVZ {
                 for i in 0..<simVX {
                     let a = j * simVX + i
-                    if snow[a] <= 0 { continue }
+                    if snowPtr[a] <= 0 { continue }
                     if i + 1 < simVX {
-                        let d = abs((sup[a] + snow[a]) - (sup[a + 1] + snow[a + 1]))
-                        if sup[a + 1] != 0 || snow[a + 1] > 0 { worst = max(worst, d - maxStep) }
+                        let d = abs((supPtr[a] + snowPtr[a]) - (supPtr[a + 1] + snowPtr[a + 1]))
+                        if supPtr[a + 1] != 0 || snowPtr[a + 1] > 0 { worst = max(worst, d - maxStep) }
                     }
                     if j + 1 < simVZ {
                         let b = a + simVX
-                        let d = abs((sup[a] + snow[a]) - (sup[b] + snow[b]))
+                        let d = abs((supPtr[a] + snowPtr[a]) - (supPtr[b] + snowPtr[b]))
                         worst = max(worst, d - maxStep)
                     }
                 }
@@ -3013,6 +3422,32 @@ final class Renderer {
         params.freezeFrac = weatherFreeze
         params.snowBase = simSnowBaseRate
         params.waterBase = simRaining ? simWaterBase : 0
+        // v4.9 (item 4): per-kind activity gating. A flow kind
+        // whose field is entirely zero is mathematically
+        // identity — every transfer in simFlowKernel clamps to
+        // the giver's depth (and the boundary drain scales the
+        // giver's own depth), so zero in means zero out, bit
+        // for bit. A kind is ACTIVE iff it has content (flag set
+        // by lattice sync / recorder edits / the settle scan's
+        // full read — never guessed) or a source can create
+        // content this tick (positive base rate AND a positive
+        // ceiling somewhere). Sinks, compaction, drying and
+        // drainage never create content, so they need no
+        // activity of their own: on zero content they are the
+        // identity too (max(0, 0 - sink*dt) == 0).
+        let snowCreates = params.snowBase > 0 && simSnowCeilMax > 0
+        let waterCreates = simRaining && params.waterBase > 0 && simWaterCeilMax > 0
+        if snowCreates { simSnowContent = true }
+        if waterCreates { simWaterContent = true }
+        let snowActive = simSnowContent || snowCreates
+        let waterActive = simWaterContent || waterCreates
+        if !snowActive && !waterActive {
+            // Neither field can change this frame; the source/
+            // sink dispatch would be the identity on both kinds
+            // as well, so the whole tick encodes nothing.
+            simStepsLastFrame = 0
+            return
+        }
         let threads = MTLSize(width: simVX * simVZ, height: 1, depth: 1)
         func bindSim(_ e: MTLComputeCommandEncoder) {
             e.setBuffer(snowB, offset: 0, index: 0)
@@ -3025,26 +3460,43 @@ final class Renderer {
             e.setBuffer(hasB, offset: 0, index: 7)
             e.setBuffer(pinB, offset: 0, index: 9)
         }
+        // v4.9 (item 4): dispatch consolidation. The two flow
+        // kinds merge into ONE dispatch per (pass, parity) with
+        // kind == 2 when both are active (the kernel loops over
+        // the kinds; their writable state is disjoint, so every
+        // transfer per buffer is unchanged — see Shaders.metal).
+        // Parity dispatches stay separate (red/black in one
+        // dispatch would race). Barriers are emitted BETWEEN
+        // dispatches only: v4.8's barrier after the final
+        // dispatch of the tick ordered nothing (the encoder
+        // ends and the queue orders the next command buffer).
+        // Per substep: 1 source + 6 flow = 7 dispatches (was
+        // 13), barriers = dispatches - 1 per tick.
+        let flowKind: UInt32 = (snowActive && waterActive) ? 2 : (snowActive ? 0 : 1)
+        var dispatched = false
+        func barrierIfNeeded() {
+            if dispatched { enc.memoryBarrier(scope: .buffers) }
+        }
         for _ in 0..<steps {
             params.dt = Float(sub)
+            barrierIfNeeded()
             params.parity = 0; params.kind = 0
             enc.setComputePipelineState(src)
             bindSim(enc)
             enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 8)
             let w = src.threadExecutionWidth
             enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
-            enc.memoryBarrier(scope: .buffers)
+            dispatched = true
             for _ in 0..<3 {
-                for kind in [UInt32(0), UInt32(1)] {
-                    for parity in [UInt32(0), UInt32(1)] {
-                        params.kind = kind; params.parity = parity
-                        enc.setComputePipelineState(flow)
-                        bindSim(enc)
-                        enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 8)
-                        let wf = flow.threadExecutionWidth
-                        enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: wf, height: 1, depth: 1))
-                        enc.memoryBarrier(scope: .buffers)
-                    }
+                for parity in [UInt32(0), UInt32(1)] {
+                    barrierIfNeeded()
+                    params.kind = flowKind; params.parity = parity
+                    enc.setComputePipelineState(flow)
+                    bindSim(enc)
+                    enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 8)
+                    let wf = flow.threadExecutionWidth
+                    enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: wf, height: 1, depth: 1))
+                    dispatched = true
                 }
             }
         }
@@ -3065,7 +3517,19 @@ final class Renderer {
         let snowPossible = weatherGeoSnow > 0.001 || weatherSnowAmount > 0.001
             || objectSnowAmounts.values.contains { $0 > 0.001 }
         guard wet > 0.001 || snowPossible else { return }
-        let grid = buildSupportIndex(included: included)
+        // v4.9 (2b): the support index depends only on the
+        // included world meshes + per-object amounts — cache it
+        // under that key and reuse it on scoped rebuilds (and
+        // any other rebuild whose included set is unchanged).
+        let sKey = supportIndexKey(included: included)
+        let grid: [Int64: [SnowSupportTri]]
+        if let cached = cachedSupportGrid, cachedSupportKey == sKey {
+            grid = cached
+        } else {
+            grid = buildSupportIndex(included: included)
+            cachedSupportGrid = grid
+            cachedSupportKey = sKey
+        }
         if grid.isEmpty {
             // v4.6: no sheet this rebuild — but the plow
             // recorder's motion memory must still advance (an
@@ -3109,9 +3573,16 @@ final class Renderer {
         func vZ(_ j: Int) -> Float { oz + Float(j) * cs }
 
         // (a) Sample the support at every lattice vertex.
+        // v4.9 (item 3): snapshot the RAW samples (before the
+        // dilation below bridges some of them) — the plow
+        // recorder's candidates are lattice vertices, and it
+        // reuses these exact values instead of re-sampling.
+        var rawSupports = [SnowSupport?](repeating: nil, count: vx * vz)
         for j in 0..<vz {
             for i in 0..<vx {
-                verts[vIdx(i, j)].support = sampleSupport(grid, x: vX(i), z: vZ(j))
+                let s = sampleSupport(grid, x: vX(i), z: vZ(j))
+                verts[vIdx(i, j)].support = s
+                rawSupports[vIdx(i, j)] = s
             }
         }
         // (b) Dilation: a vertex with support on BOTH sides
@@ -3212,7 +3683,8 @@ final class Renderer {
             carvedThisPass = recordPlowing(intruders: intruders, grid: grid,
                           ox: ox, oz: oz, cs: cs, nx: nx, nz: nz,
                           baseH: baseH, supportY: supportY,
-                          hasSupport: hasSupport)
+                          hasSupport: hasSupport,
+                          latticeSupports: rawSupports)
             if !snowPlow.isEmpty {
                 for j in 0..<vz {
                     for i in 0..<vx {
@@ -3295,27 +3767,33 @@ final class Renderer {
                            waterCeil: wCeil, waterRate: wRate,
                            targetSnow: tSnow, targetWater: tWater,
                            forceInit: false)
-            if simInitialised {
+            if simInitialised, simVX * simVZ == n,
+               let snowBuf = simSnowBuf, let waterBuf = simWaterBuf {
                 v48SimActive = true
-                var snow = simCurrentSnow()
-                if snow.count == n {
-                    var edited = false
-                    for idx in verts.indices where hasS[idx] {
-                        // Edit transfer: only where intruders /
-                        // footprints / plow shape the column
-                        // (target != pure ceiling).
-                        if abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
-                            snow[idx] = tSnow[idx]
-                            edited = true
-                        }
+                // v4.9 (2a): read/write the sim state through
+                // the shared buffers' contents() pointers — the
+                // same memory simRead/simWrite copied in and out
+                // (two full field copies + one full write-back
+                // per sheet build before; zero copies now, and
+                // edit transfers write only the edited vertices,
+                // in place, with the identical values).
+                let snowPtr = snowBuf.contents().bindMemory(to: Float.self, capacity: n)
+                let waterPtr = waterBuf.contents().bindMemory(to: Float.self, capacity: n)
+                var edited = false
+                for idx in verts.indices where hasS[idx] {
+                    // Edit transfer: only where intruders /
+                    // footprints / plow shape the column
+                    // (target != pure ceiling).
+                    if abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
+                        snowPtr[idx] = tSnow[idx]
+                        edited = true
                     }
-                    if edited { simWrite(simSnowBuf, snow) }
-                    let water = simCurrentWater()
-                    for idx in verts.indices where hasS[idx] {
-                        verts[idx].snowH = snow[idx]
-                        verts[idx].topY = supY[idx] + snow[idx]
-                        if water.count == n { verts[idx].waterD = water[idx] }
-                    }
+                }
+                if edited { simSnowContent = true }
+                for idx in verts.indices where hasS[idx] {
+                    verts[idx].snowH = snowPtr[idx]
+                    verts[idx].topY = supY[idx] + snowPtr[idx]
+                    verts[idx].waterD = waterPtr[idx]
                 }
             }
         }
@@ -3724,10 +4202,15 @@ final class Renderer {
         }
     }
 
-    private func buildAccelerationStructure() {
-        accel = nil
+    /// v4.9 (1b): encode (and commit) an AS build for a staged
+    /// static state WITHOUT waiting. Returns the structure and
+    /// its command buffer (both nil for an empty scene, which
+    /// needs no build and is immediately swappable).
+    private func makeStaticAS(posBuffer: MTLBuffer?, idxBuffer: MTLBuffer?,
+                              triCount: Int)
+        -> (structure: MTLAccelerationStructure?, cmd: MTLCommandBuffer?) {
         guard rayTracingSupported, triCount > 0,
-              let posBuffer, let idxBuffer else { return }
+              let posBuffer, let idxBuffer else { return (nil, nil) }
         let geom = MTLAccelerationStructureTriangleGeometryDescriptor()
         geom.vertexBuffer = posBuffer
         geom.vertexStride = 12
@@ -3742,13 +4225,141 @@ final class Renderer {
         guard let structure = device.makeAccelerationStructure(size: sizes.accelerationStructureSize),
               let scratch = device.makeBuffer(length: sizes.buildScratchBufferSize, options: .storageModePrivate),
               let cmd = queue.makeCommandBuffer(),
-              let enc = cmd.makeAccelerationStructureCommandEncoder() else { return }
+              let enc = cmd.makeAccelerationStructureCommandEncoder() else { return (nil, nil) }
         enc.build(accelerationStructure: structure, descriptor: desc,
                   scratchBuffer: scratch, scratchBufferOffset: 0)
         enc.endEncoding()
         cmd.commit()
-        cmd.waitUntilCompleted()
-        accel = structure
+        return (structure, cmd)
+    }
+
+    /// Kick the AS build for a staged state and hold it as the
+    /// pending build. A frame is owed (the swap happens at a
+    /// frame boundary), so presentation is marked dirty.
+    private func kickStatic(_ p: inout PreparedStatic) {
+        let (structure, cmd) = makeStaticAS(posBuffer: p.posBuffer,
+                                            idxBuffer: p.idxBuffer,
+                                            triCount: p.triCount)
+        p.accel = structure
+        p.cmd = cmd
+        pendingStatic = p
+        presentationDirty = true
+    }
+
+    /// Stage a complete new static state. The FIRST build ever
+    /// completes synchronously (there is no previous state to
+    /// keep presenting, and callers may read hasGeometry /
+    /// picking state immediately). Later builds are async:
+    /// if a build is already in flight, this stage is held as
+    /// the deferred stage — coalescing: only the LATEST stage
+    /// is ever built next, the in-flight build's state is
+    /// discarded unswapped when it completes, and there is no
+    /// queue beyond (current, pending, deferred).
+    private func stageStaticBuild(_ prepared: PreparedStatic) {
+        var prepared = prepared
+        if !staticEverSwapped, pendingStatic == nil, deferredStatic == nil {
+            let (structure, cmd) = makeStaticAS(posBuffer: prepared.posBuffer,
+                                                idxBuffer: prepared.idxBuffer,
+                                                triCount: prepared.triCount)
+            prepared.accel = structure
+            cmd?.waitUntilCompleted()
+            swapStatic(prepared)
+            return
+        }
+        if pendingStatic == nil {
+            kickStatic(&prepared)
+        } else {
+            deferredStatic = prepared
+            presentationDirty = true
+        }
+    }
+
+    /// Atomically install a staged static state as the live
+    /// state: GPU buffers + AS + CPU mirrors + counts + flags
+    /// all move together, so no frame (and no pick) can ever
+    /// observe a mix of old and new. The dynamic layer's
+    /// material base, the collision export, the material table
+    /// and the emissive index are refreshed against the new
+    /// state here, in the same order the old synchronous
+    /// rebuild used.
+    private func swapStatic(_ p: PreparedStatic) {
+        accel = p.accel
+        posBuffer = p.posBuffer
+        nrmBuffer = p.nrmBuffer
+        uvBuffer = p.uvBuffer
+        colBuffer = p.colBuffer
+        idxBuffer = p.idxBuffer
+        triMatBuffer = p.triMatBuffer
+        triCount = p.triCount
+        cpuPositions = p.cpuPositions
+        cpuIndices = p.cpuIndices
+        cpuTriObject = p.cpuTriObject
+        cpuTriMats = p.cpuTriMats
+        cachedObjectOrder = p.objectOrder
+        cachedStaticMaterials = p.materials
+        sceneHasSheetMaterial = p.sheet
+        sceneHasSnowMaterial = p.snow
+        staticEverSwapped = true
+        _collisionTriangles = computeCollisionTriangles()
+        // The dynamic material base may have moved with the new
+        // static count; the dynamic layer itself survives.
+        refreshDynTriMats()
+        let fullMats = fullMaterialTable()
+        uploadEmissiveIndexGated(materials: fullMats, rescanStatic: true,
+                                 geometryUnchanged: false)
+        uploadMaterialTable(fullMats)
+        flushMaterialTable()
+        resetAccumulation()
+    }
+
+    /// Frame-boundary swap check (top of draw): if the pending
+    /// build has completed, swap it in — unless a newer stage
+    /// was deferred behind it, in which case the completed
+    /// build is discarded unswapped and the newest is kicked.
+    private func swapStaticIfReady() {
+        guard let pending = pendingStatic else {
+            if let d = deferredStatic {
+                deferredStatic = nil
+                var d = d
+                kickStatic(&d)
+            }
+            return
+        }
+        let done = pending.cmd == nil || pending.cmd!.status == .completed
+        guard done else { return }
+        pendingStatic = nil
+        if let d = deferredStatic {
+            deferredStatic = nil
+            var d = d
+            kickStatic(&d)
+            return
+        }
+        swapStatic(pending)
+    }
+
+    /// Synchronously complete any pending static build + swap.
+    /// Capture/export paths (stills, thumbnails) call this so
+    /// they always render the latest staged geometry — the
+    /// same guarantee the old synchronous rebuild gave them.
+    func flushPendingStaticBuild() {
+        while pendingStatic != nil || deferredStatic != nil {
+            if pendingStatic == nil, let d = deferredStatic {
+                deferredStatic = nil
+                var d = d
+                kickStatic(&d)
+                continue
+            }
+            guard let pending = pendingStatic else { break }
+            pending.cmd?.waitUntilCompleted()
+            pendingStatic = nil
+            if let d = deferredStatic {
+                deferredStatic = nil
+                var d = d
+                kickStatic(&d)
+                continue
+            }
+            swapStatic(pending)
+        }
     }
 
     // MARK: - Dynamic layer, areas, light-culling support (v4)
@@ -3807,7 +4418,24 @@ final class Renderer {
     private func refreshDynTriMats() {
         let base = dynMatBase
         cpuDynTriMats = cpuDynMatOffsets.map { UInt32(base + $0) }
-        dynTriMatBuffer = makeBuffer(cpuDynTriMats)
+        // v4.9: persistent shared buffer, rewritten in place
+        // only when the values actually changed.
+        var reallocated = false
+        if dynTriMatBuffer == nil || dynTriMatCapacity < cpuDynTriMats.count {
+            dynTriMatBuffer = device.makeBuffer(
+                length: max(cpuDynTriMats.count * 4, 4), options: .storageModeShared)
+            dynTriMatCapacity = (dynTriMatBuffer != nil) ? cpuDynTriMats.count : 0
+            dynTriMatUploaded = []
+            reallocated = true
+        }
+        if let buf = dynTriMatBuffer, dynTriMatUploaded != cpuDynTriMats,
+           !cpuDynTriMats.isEmpty {
+            if !reallocated { waitForPreviousFrame() }
+            let ptr = buf.contents().bindMemory(to: UInt32.self,
+                                                capacity: dynTriMatCapacity)
+            for i in cpuDynTriMats.indices { ptr[i] = cpuDynTriMats[i] }
+            dynTriMatUploaded = cpuDynTriMats
+        }
         // v4.1 (N2): this reassigns dynTriMatBuffer outside the
         // AS build — a nil buffer here (makeBuffer failure) must
         // not leave dynUsable stale-true. Recompute it with the
@@ -3863,11 +4491,17 @@ final class Renderer {
     func setDynamicMaterial(key: UUID, material: GPUMaterial) {
         guard let idx = dynEntries.firstIndex(where: { $0.key == key }) else { return }
         dynEntries[idx].material = material
-        let fullMats = fullMaterialTable()
-        matBuffer = makeBuffer(fullMats)
+        // v4.9 (item 5): cheap — stage the table and let the
+        // single flush point (top of draw) write only the
+        // changed slots; the emissive rescan is signature-gated
+        // (a snow-factor pad change moves no emissive byte, so
+        // a per-entry snow trigger no longer rescans anything).
         // v4.1 (F4ii): only a dynamic material changed — reuse
-        // the cached static emissive scan.
-        uploadEmissiveIndex(materials: fullMats, rescanStatic: false)
+        // the cached static emissive scan when a rescan IS due.
+        let fullMats = fullMaterialTable()
+        uploadMaterialTable(fullMats)
+        uploadEmissiveIndexGated(materials: fullMats, rescanStatic: false,
+                                 geometryUnchanged: true)
         resetAccumulation()
     }
 
@@ -4005,6 +4639,7 @@ final class Renderer {
     /// structurally (entries/soups added/removed) or the total
     /// dynamic tri count changed.
     private func composeDynamic(structureChanged: Bool) {
+        swapStaticIfReady()
         let oldDynTriCount = dynTriCount
         let budget = 90_000
         var positions: [Float] = []
@@ -4118,18 +4753,43 @@ final class Renderer {
         // layer's composition too.
         _collisionTriangles = computeCollisionTriangles()
 
-        dynPosBuffer = makeBuffer(positions)
-        dynNrmBuffer = makeBuffer(normals)
+        // v4.9 (1a): position/normal buffers are persistent —
+        // (re)allocated only when the composed vertex count
+        // outgrows them, otherwise rewritten in place (fenced
+        // on the previous frame when reusing live buffers).
+        let dynVerts = positions.count / 3
+        if dynVertCapacity < dynVerts || dynPosBuffer == nil || dynNrmBuffer == nil {
+            dynPosBuffer = device.makeBuffer(length: max(dynVerts * 12, 4),
+                                             options: .storageModeShared)
+            dynNrmBuffer = device.makeBuffer(length: max(dynVerts * 12, 4),
+                                             options: .storageModeShared)
+            dynVertCapacity = (dynPosBuffer != nil && dynNrmBuffer != nil) ? dynVerts : 0
+        } else {
+            waitForPreviousFrame()
+        }
+        if let b = dynPosBuffer, !positions.isEmpty {
+            let p = b.contents().bindMemory(to: Float.self, capacity: dynVerts * 3)
+            positions.withUnsafeBufferPointer { src in
+                if let s = src.baseAddress { p.update(from: s, count: positions.count) }
+            }
+        }
+        if let b = dynNrmBuffer, !normals.isEmpty {
+            let p = b.contents().bindMemory(to: Float.self, capacity: dynVerts * 3)
+            normals.withUnsafeBufferPointer { src in
+                if let s = src.baseAddress { p.update(from: s, count: normals.count) }
+            }
+        }
         dynUVBuffer = makeBuffer(uvArr)
         dynColBuffer = makeBuffer(colArr)
         dynIdxBuffer = makeBuffer(indices)
         refreshDynTriMats()
         buildDynamicAccelerationStructure()
         let fullMats = fullMaterialTable()
-        matBuffer = makeBuffer(fullMats)
+        uploadMaterialTable(fullMats)
         // v4.1 (F4ii): compose changes only dynamic content —
         // reuse the cached static emissive scan.
-        uploadEmissiveIndex(materials: fullMats, rescanStatic: false)
+        uploadEmissiveIndexGated(materials: fullMats, rescanStatic: false,
+                                 geometryUnchanged: false)
         if structureChanged || totalTris != oldDynTriCount {
             resetAccumulation()
         }
@@ -4144,6 +4804,7 @@ final class Renderer {
         let dirty = dynDirtyKeys
         dynDirtyKeys.removeAll()
         var anyBaked = false
+        var baked: [(slice: DynSlice, world: MeshData)] = []
         for key in dirty {
             // v4.3: the player figure flushes through the same
             // path — its key resolves to the reserved entry
@@ -4159,6 +4820,7 @@ final class Renderer {
             if start + count <= cpuDynPositions.count {
                 cpuDynPositions.replaceSubrange(start..<(start + count), with: world.positions)
                 cpuDynNormals.replaceSubrange(start..<(start + count), with: world.normals)
+                baked.append((slice: slice, world: world))
                 anyBaked = true
             }
             // An emissive entry moved: refresh the full-set
@@ -4181,12 +4843,58 @@ final class Renderer {
             }
         }
         guard anyBaked else { return }
-        dynPosBuffer = makeBuffer(cpuDynPositions)
-        dynNrmBuffer = makeBuffer(cpuDynNormals)
-        buildDynamicAccelerationStructure()
+        // v4.9 (1a): write ONLY the dirty slices into the
+        // persistent position/normal buffers, then REFIT the
+        // dynamic AS — a matrix-only flush changes no topology,
+        // buffer, or triangle count, so refit is the designed
+        // operation (same triangles => same intersection
+        // results; only BVH organisation may differ, exactly as
+        // it did between v4.8's per-flush full rebuilds). The
+        // refit command buffer commits on the serial queue
+        // BEFORE this frame's trace command buffer, so no wait
+        // is needed on it. The CPU slice writes are the one
+        // real hazard: they are fenced on the PREVIOUS frame's
+        // command buffer (never the one about to be encoded).
+        waitForPreviousFrame()
+        if let posB = dynPosBuffer, let nrmB = dynNrmBuffer,
+           dynVertCapacity * 3 >= cpuDynPositions.count {
+            let posPtr = posB.contents().bindMemory(to: Float.self,
+                                                    capacity: dynVertCapacity * 3)
+            let nrmPtr = nrmB.contents().bindMemory(to: Float.self,
+                                                    capacity: dynVertCapacity * 3)
+            for (slice, world) in baked {
+                let start = slice.vertexStart * 3
+                let count = slice.vertexCount * 3
+                world.positions.withUnsafeBufferPointer { src in
+                    if let s = src.baseAddress {
+                        (posPtr + start).update(from: s, count: count)
+                    }
+                }
+                world.normals.withUnsafeBufferPointer { src in
+                    if let s = src.baseAddress {
+                        (nrmPtr + start).update(from: s, count: count)
+                    }
+                }
+            }
+            if !refitDynamicAccelerationStructure() {
+                // Refit unavailable (no AS, allocation failure):
+                // the v4.8 full build remains as the fallback.
+                buildDynamicAccelerationStructure()
+            }
+        } else {
+            // Persistent buffers missing/undersized (compose
+            // normally owns them): fresh upload + full build.
+            dynPosBuffer = makeBuffer(cpuDynPositions)
+            dynNrmBuffer = makeBuffer(cpuDynNormals)
+            dynVertCapacity = cpuDynPositions.count / 3
+            buildDynamicAccelerationStructure()
+        }
         // v4.1 (F5): moved dynamic geometry moves its collision
-        // triangles with it.
-        _collisionTriangles = computeCollisionTriangles()
+        // triangles with it. v4.9: only the dirty entries'
+        // triangle ranges are recomputed (the collision array
+        // mirrors the dynamic slices at triCount + triStart);
+        // every other entry is byte-identical by construction.
+        patchCollisionTriangles(dirtySlices: baked.map { $0.slice })
         // Keep an active culled set honest about moved lights —
         // silently (no accumulation reset for matrix updates,
         // and no buffer swap when the culled set is unchanged).
@@ -4213,11 +4921,36 @@ final class Renderer {
             && dynIdxBuffer != nil && dynTriMatBuffer != nil
     }
 
-    private func buildDynamicAccelerationStructure() {
-        dynAccel = nil
-        dynUsable = false
-        guard rayTracingSupported, dynTriCount > 0,
-              let dynPosBuffer, let dynIdxBuffer else { return }
+    /// v4.9 (1a): recompute ONLY the given dynamic slices'
+    /// ranges of the collision export. The array layout is
+    /// [static tris..., dynamic tris...], mirroring the
+    /// dynamic slices at triCount + slice.triStart — patching
+    /// those ranges from the same CPU mirrors produces exactly
+    /// what computeCollisionTriangles() would return.
+    private func patchCollisionTriangles(dirtySlices: [DynSlice]) {
+        guard _collisionTriangles.count == triCount + dynTriCount else {
+            _collisionTriangles = computeCollisionTriangles()
+            return
+        }
+        for slice in dirtySlices where slice.triCount > 0 {
+            for dt in slice.triStart..<(slice.triStart + slice.triCount) {
+                let ia = Int(cpuDynIndices[3 * dt])
+                let ib = Int(cpuDynIndices[3 * dt + 1])
+                let ic = Int(cpuDynIndices[3 * dt + 2])
+                _collisionTriangles[triCount + dt] = (
+                    SIMD3<Float>(cpuDynPositions[3 * ia], cpuDynPositions[3 * ia + 1], cpuDynPositions[3 * ia + 2]),
+                    SIMD3<Float>(cpuDynPositions[3 * ib], cpuDynPositions[3 * ib + 1], cpuDynPositions[3 * ib + 2]),
+                    SIMD3<Float>(cpuDynPositions[3 * ic], cpuDynPositions[3 * ic + 1], cpuDynPositions[3 * ic + 2]))
+            }
+        }
+    }
+
+    /// The dynamic layer's AS descriptor — ONE builder shared
+    /// by the full build and the refit so their geometry can
+    /// never drift apart. usage includes .refit: the AS is
+    /// created refit-capable so flushDynamic can refit it.
+    private func dynamicASDescriptor() -> MTLPrimitiveAccelerationStructureDescriptor? {
+        guard let dynPosBuffer, let dynIdxBuffer else { return nil }
         let geom = MTLAccelerationStructureTriangleGeometryDescriptor()
         geom.vertexBuffer = dynPosBuffer
         geom.vertexStride = 12
@@ -4228,6 +4961,43 @@ final class Renderer {
         geom.opaque = true
         let desc = MTLPrimitiveAccelerationStructureDescriptor()
         desc.geometryDescriptors = [geom]
+        desc.usage = [.refit]
+        return desc
+    }
+
+    /// v4.9 (1a): refit the dynamic AS in place after a
+    /// matrix-only flush. No waitUntilCompleted: the refit
+    /// command buffer is committed on the renderer's serial
+    /// queue before the frame's trace command buffer is even
+    /// created, so queue order runs it first. Returns false
+    /// when refit is unavailable and the caller must fall back
+    /// to the full build.
+    private func refitDynamicAccelerationStructure() -> Bool {
+        guard rayTracingSupported, dynTriCount > 0,
+              let dynAccel, let desc = dynamicASDescriptor() else { return false }
+        let sizes = device.accelerationStructureSizes(descriptor: desc)
+        if dynRefitScratch == nil || dynRefitScratchSize < sizes.refitScratchBufferSize {
+            dynRefitScratch = device.makeBuffer(
+                length: max(sizes.refitScratchBufferSize, 4), options: .storageModePrivate)
+            dynRefitScratchSize = (dynRefitScratch != nil) ? sizes.refitScratchBufferSize : 0
+        }
+        guard let scratch = dynRefitScratch,
+              let cmd = queue.makeCommandBuffer(),
+              let enc = cmd.makeAccelerationStructureCommandEncoder() else { return false }
+        enc.refit(sourceAccelerationStructure: dynAccel,
+                  descriptor: desc,
+                  destinationAccelerationStructure: dynAccel,
+                  scratchBuffer: scratch, scratchBufferOffset: 0)
+        enc.endEncoding()
+        cmd.commit()
+        return true
+    }
+
+    private func buildDynamicAccelerationStructure() {
+        dynAccel = nil
+        dynUsable = false
+        guard rayTracingSupported, dynTriCount > 0,
+              let desc = dynamicASDescriptor() else { return }
         let sizes = device.accelerationStructureSizes(descriptor: desc)
         guard let structure = device.makeAccelerationStructure(size: sizes.accelerationStructureSize),
               let scratch = device.makeBuffer(length: sizes.buildScratchBufferSize, options: .storageModePrivate),
@@ -4703,6 +5473,12 @@ final class Renderer {
     /// next draw only then — a converged, untouched scene sleeps).
     @discardableResult
     func draw(view: MTKView, camera: CameraBasis, moving: Bool, play: Bool) -> Bool {
+        // v4.9 (1b/5): frame boundary — swap any completed
+        // static build atomically BEFORE anything encodes
+        // against renderer state, then flush staged material
+        // slots, then the dynamic layer.
+        swapStaticIfReady()
+        flushMaterialTable()
         flushDynamic()
         // v4.8: step the weather simulation (GPU compute) and
         // advance the water-reflection selection pattern.
@@ -4839,6 +5615,7 @@ final class Renderer {
             dynLock.unlock()
             cmd.present(drawable)
             cmd.commit()
+            lastFrameCommandBuffer = cmd
             wasMoving = moving
             lastWet = weatherWet
             lastSnow = weatherSnow
@@ -5030,6 +5807,7 @@ final class Renderer {
 
         cmd.present(drawable)
         cmd.commit()
+        lastFrameCommandBuffer = cmd
         wasMoving = moving
         lastWet = weatherWet
         lastSnow = weatherSnow
@@ -5041,6 +5819,12 @@ final class Renderer {
     /// project thumbnails and PNG export). Always full quality:
     /// full bounce depth, generous glass budget, no history cap.
     func renderStillPNG(camera: CameraBasis, width: Int, height: Int, samples: Int) -> Data? {
+        // v4.9 (1b/5): a still must show the LATEST staged
+        // geometry and materials (the old synchronous rebuild
+        // guaranteed this) — complete any pending static build
+        // + swap and flush the material table first.
+        flushPendingStaticBuild()
+        flushMaterialTable()
         guard let accum = makeAccumTexture(width: width, height: height),
               let cmd = queue.makeCommandBuffer() else { return nil }
         // Stills always use the FULL emissive set: force-restore

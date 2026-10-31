@@ -168,23 +168,10 @@ struct EditorView: View {
             set: { session.setWeatherMode($0) })
     }
 
-    /// "Ground: 62% wet · Snow cover: 30%" style summary of the
-    /// current weather build-up, for the tree panel.
-    private var weatherCaption: String {
-        let w = session.project.scene.weather
-        var parts: [String] = []
-        if w.wetness > 0.02 {
-            parts.append("Ground: \(Int((w.wetness * 100).rounded()))% wet")
-        }
-        if w.snow > 0.02 {
-            parts.append("Snow cover: \(Int((w.snow * 100).rounded()))%")
-        }
-        if parts.isEmpty {
-            if w.mode == 1 { parts.append("Ground: 0% wet") }
-            else if w.mode == 2 { parts.append("Snow cover: 0%") }
-        }
-        return parts.joined(separator: " · ")
-    }
+    // v4.9: the weather caption that used to be computed here
+    // moved into EditorSession.refreshFooter() (identical
+    // expression), feeding the footer's narrow FooterDisplay
+    // observable — see TreeFooterView below.
 
     // MARK: Top bar
 
@@ -460,7 +447,20 @@ struct EditorView: View {
     // MARK: Object tree (left)
 
     private var treePanel: some View {
-        VStack(spacing: 0) {
+        // v4.9: per-area member counts in ONE pass over the
+        // scene per treePanel evaluation. Previously every
+        // area row re-filtered all objects (O(areas × objects)
+        // per body pass); rows now read this map.
+        let areaMemberCounts: [UUID: Int] = {
+            var counts: [UUID: Int] = [:]
+            for obj in session.project.scene.objects {
+                if let areaID = obj.areaID {
+                    counts[areaID, default: 0] += 1
+                }
+            }
+            return counts
+        }()
+        return VStack(spacing: 0) {
             HStack {
                 Text("Objects").font(.headline).lineLimit(1).fixedSize(horizontal: true, vertical: false)
                 Spacer()
@@ -557,7 +557,7 @@ struct EditorView: View {
                                     .fixedSize(horizontal: true, vertical: false)
                                 Text(area.name).lineLimit(1)
                                 Spacer()
-                                Text("\(session.project.scene.objects.filter { $0.areaID == area.id }.count)")
+                                Text("\(areaMemberCounts[area.id] ?? 0)")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
@@ -579,44 +579,11 @@ struct EditorView: View {
                 }
                 .frame(maxHeight: 132)
             }
-            Text(session.multiSelectMode
-                 ? "Multi Select is on: tap objects in the view or the list to add or remove them. Drag any selected object to move them all. Tap empty space to clear."
-                 : "Tap an object in the view to select it.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(8)
-            if session.project.scene.weather.mode != 0
-                || session.project.scene.weather.wetness > 0.02
-                || session.project.scene.weather.snow > 0.02 {
-                Text(weatherCaption)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, session.liveSnowAmount > 0.005 ? 2 : 8)
-            }
-            // v4.3: the absolute depth under the cover percent —
-            // "Snow depth: 0.18 m of 0.30 m max".
-            if session.liveSnowAmount > 0.005 {
-                Text(String(format: "Snow depth: %.2f m of %.2f m max",
-                            session.liveSnowAmount,
-                            session.project.scene.weather.maxDepth))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, session.temperatureStatusText == nil ? 8 : 2)
-            }
-            // v4.7: temperature status, only when temperature
-            // is set — e.g. "−4.5 °C — puddles freezing".
-            if let tempStatus = session.temperatureStatusText {
-                Text(tempStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, 8)
-            }
+            // v4.9: the footer (hint + weather lines) is its
+            // own view observing ONLY the session's narrow
+            // FooterDisplay — see TreeFooterView. Rendered
+            // lines, order and styling are unchanged.
+            TreeFooterView(footer: session.footer)
         }
         .background(Color(white: 0.11))
     }
@@ -787,6 +754,59 @@ struct EditorView: View {
             return .handled
         }
         return .ignored
+    }
+}
+
+// MARK: - Tree panel footer (v4.9: narrow observation)
+
+/// The tree panel's footer: the Multi Select hint, the weather
+/// cover caption, the snow-depth line and the temperature
+/// status line — in that order, with the pre-v4.9 fonts,
+/// colours and paddings byte-identical (the caption's bottom
+/// padding is 2 when the snow-depth line follows it, else 8;
+/// the depth line's is 8 when no temperature line follows,
+/// else 2). This view observes ONLY the session's
+/// FooterDisplay, which the session updates change-only, so
+/// unrelated @Published churn in the session no longer
+/// re-evaluates the footer at all.
+struct TreeFooterView: View {
+    @ObservedObject var footer: FooterDisplay
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text(footer.hintText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(8)
+            if let weatherText = footer.weatherText {
+                Text(weatherText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, footer.snowDepthText != nil ? 2 : 8)
+            }
+            // v4.3: the absolute depth under the cover percent —
+            // "Snow depth: 0.18 m of 0.30 m max".
+            if let snowDepthText = footer.snowDepthText {
+                Text(snowDepthText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, footer.temperatureText == nil ? 8 : 2)
+            }
+            // v4.7: temperature status, only when temperature
+            // is set — e.g. "−4.5 °C — puddles freezing".
+            if let temperatureText = footer.temperatureText {
+                Text(temperatureText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 8)
+            }
+        }
     }
 }
 
@@ -1189,8 +1209,11 @@ struct MultiSelectionPropertiesView: View {
 
     var body: some View {
         let count = session.multiSelection.count
-        let members = session.project.scene.objects
-            .filter { session.multiSelection.contains($0.id) }
+        // v4.9: single filter pass, memoised in the session on
+        // (multiSelection, sceneRevision) — repeated body
+        // passes from unrelated published churn reuse the
+        // resolved members instead of re-filtering the scene.
+        let members = session.multiSelectionMembers()
         let anyVisible = members.contains { $0.visible }
         return ScrollView {
             VStack(alignment: .leading, spacing: 14) {

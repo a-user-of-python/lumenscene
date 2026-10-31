@@ -1745,7 +1745,7 @@ struct SimParams {
     uint vx;          // lattice vertices per row
     uint vz;          // lattice rows
     uint parity;      // red-black pass parity (flow kernel)
-    uint kind;        // flow kernel: 0 = snow, 1 = water
+    uint kind;        // flow kernel: 0 = snow, 1 = water, 2 = both (v4.9 merged dispatch)
     float dt;         // seconds this substep
     float cell;       // lattice cell size (m)
     float snowSink;   // uniform snow sink rate (m/s): temp melt or legacy shrink
@@ -1836,6 +1836,19 @@ kernel void simFlowKernel(
     // neighbour is never written by another thread this pass.
     const int dxs[4] = {1, -1, 0, 0};
     const int dzs[4] = {0, 0, 1, -1};
+    // v4.9: kind == 2 runs BOTH kinds in this one dispatch.
+    // The two kinds touch DISJOINT writable state (snow writes
+    // snowDepth only, water writes waterDepth only; supportY,
+    // waterCeil, hasSupport and pinned are read-only here), so
+    // running them sequentially in this thread, snow first then
+    // water, performs exactly the same transfers per buffer in
+    // the same neighbour order as the two separate dispatches
+    // did -- every transfer's arithmetic is unchanged. Parity
+    // passes stay separate dispatches: red and black within one
+    // dispatch would race (there is no grid-wide sync).
+    const uint kindCount = (sp.kind >= 2u) ? 2u : 1u;
+    for (uint ki = 0u; ki < kindCount; ++ki) {
+        const uint kind = (sp.kind >= 2u) ? ki : sp.kind;
     for (uint k = 0u; k < 4u; ++k) {
         int nx = int(x) + dxs[k];
         int nz = int(z) + dzs[k];
@@ -1850,7 +1863,7 @@ kernel void simFlowKernel(
         // v4.8: edge ring held 9.4 mm against the rate drain);
         // draining in the flow is what guarantees water never
         // stands past an edge or piles against a step.
-        if (sp.kind == 1u
+        if (kind == 1u
             && (hasSupport[n] == 0u
                 || (abs(supportY[idx] - supportY[n]) > 0.05f
                     && supportY[n] < supportY[idx]))) {
@@ -1865,7 +1878,7 @@ kernel void simFlowKernel(
         // the object's silhouette, not snow/water holding a
         // cliff (the v4.5 rule, kept verbatim).
         if (abs(supportY[idx] - supportY[n]) > 0.05f) continue;
-        if (sp.kind == 0u) {
+        if (kind == 0u) {
             // Snow. Pinned columns (resting intruder, carved
             // trail floor) neither give nor receive.
             if (pinned[idx] != 0u || pinned[n] != 0u) continue;
@@ -1921,6 +1934,7 @@ kernel void simFlowKernel(
             }
         }
     }
+    } // kind loop (v4.9 merged dispatch)
 }
 
 kernel void simApplyEditsKernel(
