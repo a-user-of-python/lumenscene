@@ -78,7 +78,8 @@ struct Uniforms {
     uint glassRefractBudget;   // max refraction events per path
     float wetLevel;            // v3: 0 dry .. 1 soaked (up-facing)
     float snowLevel;           // v3: 0 none .. 1 full cover (up-facing)
-    float2 weatherPad;
+    float dynTime;             // v3.2: weather clock (s) — puddle ripples
+    float rainFrac;            // v3.2: live rain intensity 0..~1.2 (0 unless raining)
 };
 
 struct Material {
@@ -144,6 +145,36 @@ static float wfbm2(float2 p) {
     return 0.55f * wnoise2(p)
          + 0.30f * wnoise2(p * 2.0f)
          + 0.15f * wnoise2(p * 4.0f);
+}
+
+// Worley (cellular) field (v3.2): F1 distance to the nearest
+// jittered cell point, plus that cell's uniform random in
+// [0,1]. Cell size is 1 in the caller's scaled space. The cell
+// random is uniform BY CONSTRUCTION (a hash of the cell id), so
+// a coverage fraction `cov` selects the same share of cells
+// anywhere in the world — flat floor, ramp, tabletop — which is
+// what guarantees puddles on a perfectly flat surface.
+static float wcell2(float2 p, thread float& cellRand) {
+    int2 ip = int2(floor(p));
+    float2 fp = fract(p);
+    float best = 8.0f;
+    float bestRand = 0.0f;
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            int2 c = ip + int2(i, j);
+            uint h = hash32((uint(c.x) * 0x8da6b343u) ^ (uint(c.y) * 0xd8163841u));
+            float r0 = float(h >> 8) * (1.0f / 16777216.0f);
+            uint h2 = hash32(h ^ 0x9e3779b9u);
+            float r1 = float(h2 >> 8) * (1.0f / 16777216.0f);
+            uint h3 = hash32(h2 ^ 0x85ebca6bu);
+            float cr = float(h3 >> 8) * (1.0f / 16777216.0f);
+            float2 pt = float2(float(i), float(j)) + float2(r0, r1);
+            float d = length(pt - fp);
+            if (d < best) { best = d; bestRand = cr; }
+        }
+    }
+    cellRand = bestRand;
+    return best;
 }
 
 // MARK: - Helpers
@@ -364,12 +395,54 @@ kernel void pathTraceKernel(
             // Wetness spreads and pools unevenly.
             wetF = clamp(wet * (0.7f + 0.6f * wfbm2(hitPos.xz * 1.3f + float2(4.7f, 9.1f))),
                          0.0f, 1.0f);
-            // Puddles: low spots of a broad field fill once the
-            // rain level pushes the threshold below their value.
-            float pf = wfbm2(hitPos.xz * 0.32f + float2(17.31f, 3.97f));
-            float thr = mix(1.05f, 0.35f,
-                            pow(clamp(u.wetLevel, 0.0f, 1.0f), 0.75f));
-            puddle = smoothstep(thr + 0.05f, thr - 0.05f, pf) * upFace
+            // Geometry response (v3.2): water runs downhill.
+            // elevBias favours low world positions (dips, holes,
+            // slope feet) and penalises raised ones; slopeShed
+            // drains slanted faces so water does not stand on a
+            // slant. On a dead-flat floor both are constant
+            // (elevBias +0.10 at floor level, shed 1), so the
+            // pattern layer below rules alone there.
+            float elevBias = clamp(0.10f - hitPos.y * 0.55f, -0.22f, 0.38f);
+            float slopeShed = clamp((geoN.y - 0.70f) / 0.30f, 0.0f, 1.0f);
+            // Trickle runnels: on slanted ground the wet
+            // darkening arrives as streaks elongated along the
+            // fall line (the shading normal's xz lean points
+            // downhill for an up-facing slope).
+            float slopeAmt = clamp((0.98f - geoN.y) / 0.28f, 0.0f, 1.0f);
+            if (slopeAmt > 0.01f && length(geoN.xz) > 1e-4f) {
+                float2 down = geoN.xz / length(geoN.xz);
+                float2 along = float2(dot(hitPos.xz, down),
+                                      dot(hitPos.xz, float2(-down.y, down.x)));
+                float streak = wnoise2(float2(along.y * 5.0f, along.x * 0.7f));
+                wetF = clamp(wetF + slopeAmt
+                             * smoothstep(0.52f, 0.85f, streak)
+                             * u.wetLevel * 0.55f, 0.0f, 1.0f);
+            }
+            // Puddles (v3.2 — two layers):
+            //  BASE: a world-space cellular pattern whose cell
+            //  randoms are uniform by construction, so coverage
+            //  is a deterministic function of wetness on ANY
+            //  surface — a completely flat plane gets real
+            //  puddles. A cell turns into a puddle once the
+            //  coverage target passes its (geometry-biased)
+            //  random; the blob then grows and merges with its
+            //  neighbours as wetness keeps rising.
+            //  GEOMETRY: elevBias shifts eligibility so dips,
+            //  holes and slope feet fill first and deepest;
+            //  slopeShed keeps standing water off slants; the
+            //  v3.1 broad field survives as a gentle pooling
+            //  modulator — never the gate.
+            float cellRand = 0.0f;
+            float cellF1 = wcell2(hitPos.xz * (1.0f / 1.15f), cellRand);
+            float cov = 0.52f * pow(clamp(u.wetLevel, 0.0f, 1.0f), 1.35f);
+            float elig = cellRand - elevBias * 0.55f;
+            float frac = clamp((cov - elig) / max(cov, 0.05f), 0.0f, 1.0f);
+            float rBlob = mix(0.10f, 0.80f, sqrt(frac));
+            float blob = (1.0f - smoothstep(rBlob - 0.10f, rBlob + 0.10f, cellF1))
+                       * smoothstep(0.02f, 0.20f, frac);
+            float broad = 0.78f + 0.45f * wfbm2(hitPos.xz * 0.32f
+                                                + float2(17.31f, 3.97f));
+            puddle = clamp(blob * broad, 0.0f, 1.0f) * slopeShed * upFace
                    * smoothstep(0.03f, 0.15f, u.wetLevel);
             // Snow piles in drifts: depth varies with the field,
             // cover turns on where the drifted depth is enough.
@@ -386,7 +459,38 @@ kernel void pathTraceKernel(
         if (puddle > 0.001f) {
             albedo *= (1.0f - 0.5f * puddle);
             gloss = max(gloss, puddle);
-            shadingN = normalize(mix(shadingN, geoN, puddle));
+            float3 waterN = geoN;
+            // Rain ripples (v3.2): expanding rings play on the
+            // puddle surface while rain is actually falling —
+            // rainFrac carries the live, time-varying intensity.
+            // Two layers of hash-phased ring cells tilt the
+            // water normal; each ring's tilt dies with its age
+            // and away from its centre, so the surface stays
+            // glassy between drops. Calm weather (rainFrac ~ 0)
+            // leaves v3.1's flat mirror untouched.
+            if (u.rainFrac > 0.01f) {
+                float2 tilt = float2(0.0f);
+                for (int layer = 0; layer < 2; layer++) {
+                    float sc = (layer == 0) ? 6.0f : 10.5f;
+                    float sp = (layer == 0) ? 0.85f : 1.25f;
+                    float2 rp = hitPos.xz * sc;
+                    int2 rc = int2(floor(rp));
+                    float2 rf = fract(rp) - 0.5f;
+                    uint rh = hash32((uint(rc.x) * 0x8da6b343u)
+                                     ^ (uint(rc.y) * 0xd8163841u)
+                                     ^ (uint(layer) * 0x27d4eb2du));
+                    float ph = float(rh >> 8) * (1.0f / 16777216.0f);
+                    float age = fract(u.dynTime * sp + ph);
+                    float rr = length(rf);
+                    float ring = sin(3.14159265f * age)
+                               * exp(-rr * 3.5f) * (1.0f - age);
+                    float2 dir = rr > 1e-4f ? rf / rr : float2(1.0f, 0.0f);
+                    tilt += dir * (ring * ((layer == 0) ? 0.30f : 0.18f));
+                }
+                tilt *= clamp(u.rainFrac, 0.0f, 1.2f);
+                waterN = normalize(geoN + float3(tilt.x, 0.0f, tilt.y));
+            }
+            shadingN = normalize(mix(shadingN, waterN, puddle));
         }
         // 3. Snow: whitened, gloss killed, normal mounded by the
         // drift gradient (or softened toward the face, as v3).
@@ -843,6 +947,9 @@ struct PrecipUniforms {
     float2 tanFovAspect; // x: tan(half vertical fov), y: aspect
     float time;
     uint mode;           // 1 = rain, 2 = snow
+    float intensity;     // v3.2: live intensity 0..~1.2 (surge cycle)
+    float2 windXZ;       // v3.2: wind velocity in xz (m/s), time-varying
+    float precipPad;
 };
 
 struct PrecipOut {
@@ -875,12 +982,24 @@ vertex PrecipOut precipVertex(uint vid [[vertex_id]],
 
     bool rain = u.mode == 1u;
     float3 box = rain ? float3(36.0f, 22.0f, 36.0f) : float3(34.0f, 20.0f, 34.0f);
-    float speed = rain ? (10.0f + seed.w * 4.0f) : (0.9f + seed.w * 1.1f);
-    float3 wind = float3(1.2f, 0.0f, 0.4f);
+    // v3.2 dynamics: rain falls faster as the surge intensity
+    // rises; the wind is the session's time-varying vector, so
+    // streaks slant and snow drifts with the gusts.
+    float speed = rain ? (10.0f + seed.w * 4.0f) * (0.85f + 0.30f * u.intensity)
+                       : (0.9f + seed.w * 1.1f);
+    float3 wind = float3(u.windXZ.x, 0.0f, u.windXZ.y);
 
     float3 p = base * box;
     p.y = fmod(p.y - u.time * speed, box.y);
     if (p.y < 0.0f) p.y += box.y;
+    // Wind carry: the particle field drifts sideways with the
+    // wind, wrapped inside the box. Rain falls too fast to be
+    // carried far (0.25x); snow rides the wind (0.55x).
+    float carry = rain ? 0.25f : 0.55f;
+    p.x = fmod(p.x + u.time * wind.x * carry, box.x);
+    if (p.x < 0.0f) p.x += box.x;
+    p.z = fmod(p.z + u.time * wind.z * carry, box.z);
+    if (p.z < 0.0f) p.z += box.z;
     if (!rain) {
         float phase = seed.w * 6.2831853f;
         p.x += sin(u.time * 0.8f + phase) * 0.35f;
@@ -921,7 +1040,10 @@ vertex PrecipOut precipVertex(uint vid [[vertex_id]],
     float farDist = rain ? 30.0f : 28.0f;
     float fadeFar = 1.0f - smoothstep(farDist * 0.65f, farDist, centreDist);
     float fadeNear = smoothstep(0.0f, 0.8f, centreDist);
-    out.fade = fadeFar * fadeNear;
+    // Intensity thins the field's alpha in a lull and thickens
+    // it in a surge (the draw count scales alongside, Swift-side).
+    out.fade = fadeFar * fadeNear
+             * (0.35f + 0.65f * clamp(u.intensity, 0.0f, 1.2f));
     return out;
 }
 

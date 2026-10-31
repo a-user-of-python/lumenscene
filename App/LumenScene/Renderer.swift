@@ -65,7 +65,8 @@ struct GPUUniforms {
     var glassRefractBudget: UInt32 = 4
     var wetLevel: Float = 0
     var snowLevel: Float = 0
-    var weatherPad = SIMD2<Float>(0, 0)
+    var dynTime: Float = 0   // v3.2: weather clock (s) — puddle ripples
+    var rainFrac: Float = 0  // v3.2: live rain intensity (0 unless raining)
 }
 
 struct ReprojUniforms {
@@ -103,6 +104,9 @@ struct PrecipUniforms {
     var tanFovAspect = SIMD2<Float>(0.7, 1)
     var time: Float = 0
     var mode: UInt32 = 0
+    var intensity: Float = 1 // v3.2: live intensity 0..~1.2
+    var windXZ = SIMD2<Float>(1.2, 0.4) // v3.2: time-varying wind (m/s)
+    var precipPad: Float = 0
 }
 
 struct TonemapParams {
@@ -199,6 +203,15 @@ final class Renderer {
     var weatherMode: Int = 0
     var weatherWet: Float = 0
     var weatherSnow: Float = 0
+    /// Weather dynamics (v3.2), written by the session every
+    /// tick alongside the levels: a slow surge clock, the live
+    /// intensity it produces, the rain-only intensity the trace
+    /// kernel ripples puddles with, and the gusting wind vector
+    /// the precipitation pass slants with.
+    var weatherDynTime: Float = 0
+    var weatherDynIntensity: Float = 1
+    var weatherDynRain: Float = 0
+    var weatherWind = SIMD2<Float>(1.2, 0.4)
     var precipAvailable: Bool { precipPipeline != nil }
     /// Weather levels used by the previous draw; a change softens
     /// reprojection history so the ground visibly wets/dries.
@@ -759,6 +772,8 @@ final class Renderer {
         u.glassRefractBudget = glassBudget
         u.wetLevel = weatherWet
         u.snowLevel = weatherSnow
+        u.dynTime = weatherDynTime
+        u.rainFrac = weatherDynRain
         return u
     }
 
@@ -908,9 +923,16 @@ final class Renderer {
                     Float(view.drawableSize.width) / Float(max(view.drawableSize.height, 1)))
                 pu.time = Float(CACurrentMediaTime().truncatingRemainder(dividingBy: 3600))
                 pu.mode = UInt32(weatherMode)
+                pu.intensity = weatherDynIntensity
+                pu.windXZ = weatherWind
                 penc.setVertexBytes(&pu, length: MemoryLayout<PrecipUniforms>.stride, index: 0)
                 penc.setVertexBuffer(precipSeedBuffer, offset: 0, index: 1)
-                let particleCount = weatherMode == 1 ? 1600 : 1200
+                // Draw count breathes with the surge intensity
+                // (never below ~45% — a lull still reads as
+                // weather; never above the 2048-seed buffer).
+                let inten = max(0.35, min(weatherDynIntensity, 1.15))
+                let baseCount = weatherMode == 1 ? 1600 : 1200
+                let particleCount = Int(Float(baseCount) * (0.45 + 0.55 * inten))
                 penc.drawPrimitives(type: .triangle, vertexStart: 0,
                                     vertexCount: particleCount * 6)
                 penc.endEncoding()
@@ -938,6 +960,11 @@ final class Renderer {
         // in pre-change samples.
         let weatherLevelsMoved = abs(weatherWet - lastWet) > 0.004
             || abs(weatherSnow - lastSnow) > 0.004
+        // Live rain over puddles (v3.2): while rain intensity is
+        // up, the settled fast path stays off and history reuse
+        // is capped below, so the ripple rings on puddles keep
+        // animating instead of being averaged into stillness.
+        let rippling = weatherMode == 1 && weatherDynRain > 0.3
         let weatherLevelsQuiet = abs(weatherWet - lastTracedWet) <= 0.004
             && abs(weatherSnow - lastTracedSnow) <= 0.004
         let pixelW = max(1, Int(Float(view.drawableSize.width) * t.scale))
@@ -966,7 +993,7 @@ final class Renderer {
         // the last trace (the settled image already includes
         // that shading); precipitation is overlaid on top and
         // the frame chain stays alive so it keeps animating.
-        if accel != nil, (weatherMode == 0 || weatherLevelsQuiet), historyValid, sampleCount >= t.maxSettle,
+        if accel != nil, (weatherMode == 0 || (weatherLevelsQuiet && !rippling)), historyValid, sampleCount >= t.maxSettle,
            let pc = prevCamera, !cameraChanged(pc, camera),
            let settled = accumTex[src] {
             if let tonemapPipeline,
@@ -1012,6 +1039,9 @@ final class Renderer {
                 }
                 if weatherLevelsMoved {
                     reuse = min(reuse, 8) // ground is changing state
+                }
+                if rippling {
+                    reuse = min(reuse, 12) // puddle ripples stay live
                 }
                 _ = encodeReproject(prevAccum: prevAccum, prevGuide: prevGuide,
                                     curGuide: curGuide, curAccum: curAccum,
@@ -1059,7 +1089,7 @@ final class Renderer {
         // frames go through the spatial denoise pass; the settled
         // frame (sampleCount >= maxSettle) is shown raw.
         var displaySource = curAccum
-        if accel != nil, moving || play || sampleCount < 160,
+        if accel != nil, moving || play || rippling || sampleCount < 160,
            denoisePipeline != nil, let displayTex, let curGuideNormal {
             let strength: Float = (play || moving) ? 1.0 : 0.65
             if encodeDenoise(accum: curAccum, guide: curGuide,

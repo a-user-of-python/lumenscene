@@ -37,6 +37,15 @@ final class EditorSession: ObservableObject {
     private var buildupWet: Double = 0
     private var buildupSnow: Double = 0
 
+    /// Weather dynamics (v3.2 — same non-published discipline
+    /// as the build-up accumulators): a clock that runs while
+    /// weather is on, the surge intensity it produces, and the
+    /// gusting wind vector. The clock resets when weather is
+    /// switched on, so each storm fades in and finds its phase.
+    private var weatherClock: Double = 0
+    private var dynIntensity: Double = 0
+    private var dynWind = SIMD2<Float>(1.2, 0.4)
+
     var pressedKeys: Set<MoveKey> = []
 
     /// Touch joystick vector (Play mode): x = strafe right,
@@ -446,6 +455,7 @@ final class EditorSession: ObservableObject {
         // Accumulators stay the source of truth — do not reset
         // them on a mode change (they were initialised from the
         // project and are kept in sync with it).
+        if mode != 0 { weatherClock = 0 } // dynamics fade in fresh
         project.scene.weather.mode = mode
         kickRender()
         if mode != 0 && !renderer.precipAvailable {
@@ -486,12 +496,41 @@ final class EditorSession: ObservableObject {
         // so a weather scene no longer re-evaluates the whole
         // SwiftUI editor body every frame.
         if dt > 0, dt <= 0.25 {
-            switch project.scene.weather.mode {
+            let mode = project.scene.weather.mode
+            // Dynamics (v3.2): while weather is on, a slow surge
+            // cycle drives the live intensity — detuned sines
+            // wander it between a lull (~0.3) and a surge (~1.2)
+            // over tens of seconds, faded in over the first ~6 s
+            // after switch-on. The wind heading wanders and its
+            // strength gusts on a related cycle. Build-up and
+            // melt rates follow the intensity, so the ground
+            // answers the sky: puddles grow in surges, snow piles
+            // faster in gusts of snowfall.
+            if mode != 0 {
+                weatherClock += Double(dt)
+                let t = weatherClock
+                let surge = 0.62 + 0.30 * sin(t * 0.11)
+                          + 0.22 * sin(t * 0.043 + 1.7)
+                          + 0.12 * sin(t * 0.31 + 0.5)
+                let fadeIn = min(1.0, t / 6.0)
+                dynIntensity = min(1.2, max(0.25, surge)) * fadeIn
+                let heading = 0.32 + 0.50 * sin(t * 0.017 + 1.3)
+                            + 0.20 * sin(t * 0.061)
+                let gust = 1.15 + 0.85 * sin(t * 0.13 + 2.0)
+                         + 0.45 * sin(t * 0.047)
+                let wmag = max(0.15, gust) * fadeIn
+                dynWind = SIMD2<Float>(Float(cos(heading) * wmag),
+                                       Float(sin(heading) * wmag))
+            } else {
+                dynIntensity = 0
+            }
+            switch mode {
             case 1:
-                buildupWet = min(1, buildupWet + Double(dt) / 75)
-                buildupSnow = max(0, buildupSnow - Double(dt) / 300)
+                buildupWet = min(1, buildupWet + Double(dt) / 75 * dynIntensity)
+                buildupSnow = max(0, buildupSnow - Double(dt) / 300
+                                        * (0.6 + 0.4 * dynIntensity))
             case 2:
-                buildupSnow = min(1, buildupSnow + Double(dt) / 100)
+                buildupSnow = min(1, buildupSnow + Double(dt) / 100 * dynIntensity)
             case 0:
                 buildupWet = max(0, buildupWet - Double(dt) / 600)
                 buildupSnow = max(0, buildupSnow - Double(dt) / 900)
@@ -502,6 +541,12 @@ final class EditorSession: ObservableObject {
         renderer.weatherMode = project.scene.weather.mode
         renderer.weatherWet = Float(buildupWet)
         renderer.weatherSnow = Float(buildupSnow)
+        renderer.weatherDynTime = Float(weatherClock
+            .truncatingRemainder(dividingBy: 3600))
+        renderer.weatherDynIntensity = Float(dynIntensity)
+        renderer.weatherDynRain = project.scene.weather.mode == 1
+            ? Float(dynIntensity) : 0
+        renderer.weatherWind = dynWind
         // Published sync only when the displayed (whole-percent)
         // value actually changes.
         if Int((buildupWet * 100).rounded()) != Int((project.scene.weather.wetness * 100).rounded())
