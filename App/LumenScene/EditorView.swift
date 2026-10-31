@@ -272,11 +272,18 @@ struct EditorView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(Color(white: 0.13))
-        .onGeometryChange(for: Bool.self) { proxy in
-            proxy.size.width < 1020
-        } action: { _, compact in
-            barCompact = compact
-        }
+        // Width probe for the compact switch (iOS 17-compatible:
+        // onGeometryChange needs iOS 18). The state write happens
+        // in onAppear/onChange, never during body evaluation.
+        .background(
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear { barCompact = proxy.size.width < 1020 }
+                    .onChange(of: proxy.size.width) { _, width in
+                        barCompact = width < 1020
+                    }
+            }
+        )
     }
 
     /// The Weather menu's contents, shared by the full row's
