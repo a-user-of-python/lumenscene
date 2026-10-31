@@ -78,8 +78,8 @@ struct Uniforms {
     uint glassRefractBudget;   // max refraction events per path
     float wetLevel;            // v3: 0 dry .. 1 soaked (up-facing)
     float snowLevel;           // v3: 0 none .. 1 full cover (up-facing)
-    float dynTime;             // v3.2: weather clock (s) — puddle ripples
-    float rainFrac;            // v3.2: live rain intensity 0..~1.2 (0 unless raining)
+    float dynTime;             // v3.2: weather clock (retained for layout; v3.3: unused by the trace kernel)
+    float rainFrac;            // v3.2: live rain intensity (retained for layout; v3.3: unused by the trace kernel)
 };
 
 struct Material {
@@ -147,18 +147,27 @@ static float wfbm2(float2 p) {
          + 0.15f * wnoise2(p * 4.0f);
 }
 
-// Worley (cellular) field (v3.2): F1 distance to the nearest
-// jittered cell point, plus that cell's uniform random in
-// [0,1]. Cell size is 1 in the caller's scaled space. The cell
-// random is uniform BY CONSTRUCTION (a hash of the cell id), so
-// a coverage fraction `cov` selects the same share of cells
-// anywhere in the world — flat floor, ramp, tabletop — which is
-// what guarantees puddles on a perfectly flat surface.
-static float wcell2(float2 p, thread float& cellRand) {
-    int2 ip = int2(floor(p));
-    float2 fp = fract(p);
-    float best = 8.0f;
-    float bestRand = 0.0f;
+// Metaball puddle potential (v3.3): summed smooth kernels
+// around the jittered points of the 3x3 cell neighbourhood,
+// each cell weighted by a fixed function of its hash random
+// (eligible cells weigh ~1, ineligible ~0 — the random is
+// uniform BY CONSTRUCTION, so a coverage threshold on the
+// potential selects the same share of cells anywhere in the
+// world, which is what guarantees puddles on a perfectly flat
+// surface). The sample position is domain-warped by a
+// low-frequency fbm pair first, so level sets of the potential
+// are irregular, rounded blobs that grow and merge like water
+// — never the straight Voronoi edges a nearest-distance (F1)
+// radius cut produced in v3.2 (Sean's "square slab" puddles).
+// Evaluated ONLY by the field bake kernel below; the path
+// tracer reads the baked result from a texture.
+static float wpuddlePotential(float2 p) {
+    float2 warp = float2(wfbm2(p * 0.16f + float2(3.1f, 7.7f)),
+                         wfbm2(p * 0.16f + float2(11.9f, 1.3f)));
+    float2 q = p + (warp - 0.5f) * 1.0f; // up to ±0.5 cells of wobble
+    int2 ip = int2(floor(q));
+    float2 fp = fract(q);
+    float sum = 0.0f;
     for (int j = -1; j <= 1; j++) {
         for (int i = -1; i <= 1; i++) {
             int2 c = ip + int2(i, j);
@@ -168,13 +177,15 @@ static float wcell2(float2 p, thread float& cellRand) {
             float r1 = float(h2 >> 8) * (1.0f / 16777216.0f);
             uint h3 = hash32(h2 ^ 0x85ebca6bu);
             float cr = float(h3 >> 8) * (1.0f / 16777216.0f);
+            float a = pow(clamp((0.58f - cr) / 0.58f, 0.0f, 1.0f), 0.7f);
+            if (a <= 0.001f) continue;
             float2 pt = float2(float(i), float(j)) + float2(r0, r1);
             float d = length(pt - fp);
-            if (d < best) { best = d; bestRand = cr; }
+            float s = clamp(1.0f - (d / 1.45f) * (d / 1.45f), 0.0f, 1.0f);
+            sum += a * s * s;
         }
     }
-    cellRand = bestRand;
-    return best;
+    return sum;
 }
 
 // MARK: - Helpers
@@ -204,6 +215,32 @@ static float3 envColor(float3 dir, float intensity) {
     return sky * intensity;
 }
 
+// MARK: - Weather field bake (v3.3)
+//
+// One-shot bake at renderer init: the level-independent
+// weather field over a 64 m world window centred on the
+// origin. R = puddle metaball potential, G = wet pooling fbm,
+// B = snow drift fbm, A = broad pooling fbm — the exact fields
+// the v3.1/v3.2 path kernel used to evaluate procedurally per
+// hit per sample (~75 hash evaluations). Wet/snow LEVELS are
+// thresholds applied analytically in the path kernel, so this
+// texture never needs refreshing when build-up changes.
+kernel void weatherFieldKernel(
+    texture2d<float, access::write> field [[texture(0)]],
+    uint2 pixel [[thread_position_in_grid]])
+{
+    uint w = field.get_width();
+    uint h = field.get_height();
+    if (pixel.x >= w || pixel.y >= h) return;
+    float2 uv = (float2(pixel) + 0.5f) / float2(float(w), float(h));
+    float2 xz = (uv - 0.5f) * 64.0f;
+    float pot = wpuddlePotential(xz * (1.0f / 1.15f));
+    float wetPool = wfbm2(xz * 1.3f + float2(4.7f, 9.1f));
+    float drift = wfbm2(xz * 0.5f + float2(9.17f, 27.3f));
+    float broad = wfbm2(xz * 0.32f + float2(17.31f, 3.97f));
+    field.write(float4(pot, wetPool, drift, broad), pixel);
+}
+
 // MARK: - Path trace kernel
 
 kernel void pathTraceKernel(
@@ -211,6 +248,7 @@ kernel void pathTraceKernel(
     texture2d_array<float> texAlbedo [[texture(1)]],
     texture2d_array<float> texNormal [[texture(2)]],
     texture2d_array<float> texData [[texture(3)]],
+    texture2d<float> weatherField [[texture(4)]],
     constant Uniforms& u [[buffer(0)]],
     device const float* positions [[buffer(1)]],
     device const float* normals [[buffer(2)]],
@@ -234,6 +272,7 @@ kernel void pathTraceKernel(
     rng.s1 = hash32(seedBase ^ 0x9e3779b9u) | 3u;
 
     constexpr sampler texSampler(address::repeat, filter::linear);
+    constexpr sampler fieldSampler(address::clamp_to_edge, filter::linear);
 
     // Primary ray.
     float2 ndc = float2((float(pixel.x) + rng.nextFloat()) / float(width),
@@ -378,23 +417,39 @@ kernel void pathTraceKernel(
         float wet = u.wetLevel * upFace;
         float snowGlobal = u.snowLevel * upFace;
         float gloss = (mat.texIndex > 0) ? clamp(1.0f - texRough, 0.0f, 1.0f) : 0.0f;
-        // Shaped weather field (v3.1): defaults are exactly the
+        // Shaped weather field: defaults are exactly the
         // v3 global behaviour (wetF = wet, snowCover = snowGlobal,
         // no puddle, drift 0.5, depth = snowGlobal). The shaped
         // field is only evaluated on the first two bounces —
         // deeper bounces keep the global levels, since the spatial
-        // detail is invisible there and the noise costs samples.
-        // When both levels are ~0 nothing below changes anything,
-        // so the dry settled image is unchanged from v3.
+        // detail is invisible there. Since v3.3 the field itself
+        // comes from the baked weatherField texture (one fetch)
+        // instead of per-hit procedural noise. When both levels
+        // are ~0 nothing below changes anything, so the dry
+        // settled image is unchanged from v3.
         float wetF = wet;
         float snowCover = snowGlobal;
         float puddle = 0.0f;
         float drift = 0.5f;
         float depth = snowGlobal;
+        // Baked field sample + window fade (v3.3). Neutral
+        // values (potential 0, modulators at their mid) make
+        // the un-faded case identical to no field at all.
+        float4 wfield = float4(0.0f, 0.5f, 0.5f, 0.489f);
+        float fieldFade = 0.0f;
         if ((u.wetLevel > 0.001f || u.snowLevel > 0.001f) && bounce <= 1u) {
+            // ONE bilinear fetch replaces the ~75 per-hit hash
+            // evaluations of the procedural v3.1/v3.2 block. The
+            // field window is 64 m across, centred on the
+            // origin; outside it the sample fades to neutral so
+            // distant geometry keeps the plain global levels.
+            float2 fuv = hitPos.xz * (1.0f / 64.0f) + 0.5f;
+            fieldFade = (1.0f - smoothstep(29.0f, 32.0f, abs(hitPos.x)))
+                      * (1.0f - smoothstep(29.0f, 32.0f, abs(hitPos.z)));
+            float4 fs = weatherField.sample(fieldSampler, fuv);
+            wfield = mix(float4(0.0f, 0.5f, 0.5f, 0.489f), fs, fieldFade);
             // Wetness spreads and pools unevenly.
-            wetF = clamp(wet * (0.7f + 0.6f * wfbm2(hitPos.xz * 1.3f + float2(4.7f, 9.1f))),
-                         0.0f, 1.0f);
+            wetF = clamp(wet * (0.7f + 0.6f * wfield.g), 0.0f, 1.0f);
             // Geometry response (v3.2): water runs downhill.
             // elevBias favours low world positions (dips, holes,
             // slope feet) and penalises raised ones; slopeShed
@@ -407,7 +462,9 @@ kernel void pathTraceKernel(
             // Trickle runnels: on slanted ground the wet
             // darkening arrives as streaks elongated along the
             // fall line (the shading normal's xz lean points
-            // downhill for an up-facing slope).
+            // downhill for an up-facing slope). One value-noise
+            // evaluation, slanted faces only — kept procedural
+            // because the streak frame is surface-dependent.
             float slopeAmt = clamp((0.98f - geoN.y) / 0.28f, 0.0f, 1.0f);
             if (slopeAmt > 0.01f && length(geoN.xz) > 1e-4f) {
                 float2 down = geoN.xz / length(geoN.xz);
@@ -418,35 +475,28 @@ kernel void pathTraceKernel(
                              * smoothstep(0.52f, 0.85f, streak)
                              * u.wetLevel * 0.55f, 0.0f, 1.0f);
             }
-            // Puddles (v3.2 — two layers):
-            //  BASE: a world-space cellular pattern whose cell
-            //  randoms are uniform by construction, so coverage
-            //  is a deterministic function of wetness on ANY
-            //  surface — a completely flat plane gets real
-            //  puddles. A cell turns into a puddle once the
-            //  coverage target passes its (geometry-biased)
-            //  random; the blob then grows and merges with its
-            //  neighbours as wetness keeps rising.
-            //  GEOMETRY: elevBias shifts eligibility so dips,
-            //  holes and slope feet fill first and deepest;
-            //  slopeShed keeps standing water off slants; the
-            //  v3.1 broad field survives as a gentle pooling
-            //  modulator — never the gate.
-            float cellRand = 0.0f;
-            float cellF1 = wcell2(hitPos.xz * (1.0f / 1.15f), cellRand);
-            float cov = 0.52f * pow(clamp(u.wetLevel, 0.0f, 1.0f), 1.35f);
-            float elig = cellRand - elevBias * 0.55f;
-            float frac = clamp((cov - elig) / max(cov, 0.05f), 0.0f, 1.0f);
-            float rBlob = mix(0.10f, 0.80f, sqrt(frac));
-            float blob = (1.0f - smoothstep(rBlob - 0.10f, rBlob + 0.10f, cellF1))
-                       * smoothstep(0.02f, 0.20f, frac);
-            float broad = 0.78f + 0.45f * wfbm2(hitPos.xz * 0.32f
-                                                + float2(17.31f, 3.97f));
-            puddle = clamp(blob * broad, 0.0f, 1.0f) * slopeShed * upFace
+            // Puddles (v3.3): a threshold sweep of the baked
+            // METABALL potential. The threshold falls as
+            // wetness rises, so pools appear at the most
+            // eligible spots first, then grow and merge —
+            // coverage stays a deterministic function of
+            // wetness on ANY surface (the flat guarantee).
+            // elevBias shifts the threshold so dips, holes and
+            // slope feet fill earlier and deeper; slopeShed
+            // keeps standing water off slants; the broad
+            // pooling field modulates. Outlines are level sets
+            // of a smooth summed field: rounded, irregular,
+            // feathered — square corners are impossible.
+            float wetN = clamp(u.wetLevel, 0.0f, 1.0f);
+            float thr = mix(1.15f, 0.08f, pow(wetN, 1.15f)) - elevBias * 0.45f;
+            float mask = smoothstep(thr - 0.14f, thr + 0.14f, wfield.r);
+            float broad = 0.78f + 0.45f * wfield.a;
+            puddle = clamp(mask * broad, 0.0f, 1.0f) * slopeShed * upFace
                    * smoothstep(0.03f, 0.15f, u.wetLevel);
-            // Snow piles in drifts: depth varies with the field,
-            // cover turns on where the drifted depth is enough.
-            drift = wfbm2(hitPos.xz * 0.5f + float2(9.17f, 27.3f));
+            // Snow piles in drifts: depth varies with the
+            // baked drift field, cover turns on where the
+            // drifted depth is enough.
+            drift = wfield.b;
             depth = u.snowLevel * mix(0.3f, 1.7f, drift);
             snowCover = smoothstep(0.45f, 0.75f, depth) * upFace;
         }
@@ -456,41 +506,15 @@ kernel void pathTraceKernel(
             gloss = max(gloss, wetF * 0.85f);
         }
         // 2. Puddle: mirror-flat standing water over the wet base.
+        // The shading normal is the flat geometric normal so the
+        // reflection converges cleanly and stays put; the
+        // rain-ripple shimmer is applied at display time by the
+        // tonemap pass (v3.3), which is what lets rain trace —
+        // and settle — exactly like snow.
         if (puddle > 0.001f) {
             albedo *= (1.0f - 0.5f * puddle);
             gloss = max(gloss, puddle);
-            float3 waterN = geoN;
-            // Rain ripples (v3.2): expanding rings play on the
-            // puddle surface while rain is actually falling —
-            // rainFrac carries the live, time-varying intensity.
-            // Two layers of hash-phased ring cells tilt the
-            // water normal; each ring's tilt dies with its age
-            // and away from its centre, so the surface stays
-            // glassy between drops. Calm weather (rainFrac ~ 0)
-            // leaves v3.1's flat mirror untouched.
-            if (u.rainFrac > 0.01f) {
-                float2 tilt = float2(0.0f);
-                for (int layer = 0; layer < 2; layer++) {
-                    float sc = (layer == 0) ? 6.0f : 10.5f;
-                    float sp = (layer == 0) ? 0.85f : 1.25f;
-                    float2 rp = hitPos.xz * sc;
-                    int2 rc = int2(floor(rp));
-                    float2 rf = fract(rp) - 0.5f;
-                    uint rh = hash32((uint(rc.x) * 0x8da6b343u)
-                                     ^ (uint(rc.y) * 0xd8163841u)
-                                     ^ (uint(layer) * 0x27d4eb2du));
-                    float ph = float(rh >> 8) * (1.0f / 16777216.0f);
-                    float age = fract(u.dynTime * sp + ph);
-                    float rr = length(rf);
-                    float ring = sin(3.14159265f * age)
-                               * exp(-rr * 3.5f) * (1.0f - age);
-                    float2 dir = rr > 1e-4f ? rf / rr : float2(1.0f, 0.0f);
-                    tilt += dir * (ring * ((layer == 0) ? 0.30f : 0.18f));
-                }
-                tilt *= clamp(u.rainFrac, 0.0f, 1.2f);
-                waterN = normalize(geoN + float3(tilt.x, 0.0f, tilt.y));
-            }
-            shadingN = normalize(mix(shadingN, waterN, puddle));
+            shadingN = normalize(mix(shadingN, geoN, puddle));
         }
         // 3. Snow: whitened, gloss killed, normal mounded by the
         // drift gradient (or softened toward the face, as v3).
@@ -503,10 +527,15 @@ kernel void pathTraceKernel(
             gloss *= (1.0f - snowCover);
             bool relief = false;
             if (bounce <= 1u && geoN.y > 0.7f) {
-                float gx = wfbm2((hitPos.xz + float2(0.35f, 0.0f)) * 0.5f
-                                 + float2(9.17f, 27.3f)) - drift;
-                float gz = wfbm2((hitPos.xz + float2(0.0f, 0.35f)) * 0.5f
-                                 + float2(9.17f, 27.3f)) - drift;
+                // Drift gradient from the baked field (v3.3):
+                // two extra fetches replace two fbm evaluations.
+                float gx = weatherField.sample(fieldSampler,
+                        (hitPos.xz + float2(0.35f, 0.0f)) * (1.0f / 64.0f) + 0.5f).b
+                        - drift;
+                float gz = weatherField.sample(fieldSampler,
+                        (hitPos.xz + float2(0.0f, 0.35f)) * (1.0f / 64.0f) + 0.5f).b
+                        - drift;
+                gx *= fieldFade; gz *= fieldFade;
                 float3 mound = normalize(float3(-gx * depth * 1.4f, 1.0f,
                                                 -gz * depth * 1.4f));
                 shadingN = normalize(mix(shadingN, mound, snowCover * 0.6f));
@@ -894,6 +923,10 @@ kernel void reprojectKernel(
 struct TonemapParams {
     uint samples;
     float exposure;
+    float shimmerTime;  // v3.3: weather clock (s) for the ripple shimmer
+    float shimmerRain;  // v3.3: live rain intensity (0 unless raining)
+    float wetLevel;     // v3.3: ground wetness, for the puddle mask
+    float pad;
 };
 
 struct VSOut {
@@ -915,6 +948,9 @@ static float3 aces(float3 x) {
 
 fragment float4 tonemapFragment(VSOut in [[stage_in]],
                                 texture2d<float> accum [[texture(0)]],
+                                texture2d<float> guide [[texture(1)]],
+                                texture2d<float> guideNormal [[texture(2)]],
+                                texture2d<float> weatherField [[texture(3)]],
                                 constant TonemapParams& p [[buffer(0)]]) {
     constexpr sampler s(address::clamp_to_edge, filter::linear);
     float4 a = accum.sample(s, in.uv);
@@ -922,6 +958,63 @@ fragment float4 tonemapFragment(VSOut in [[stage_in]],
     // fall back to the uniform count where alpha is unset.
     float n = a.a > 0.5f ? a.a : max(1.0f, float(p.samples));
     float3 c = a.rgb / n;
+    // Rain-ripple shimmer (v3.3): while it rains, puddle pixels
+    // get a small time-varying brightness modulation in linear
+    // space — the display-rate echo of the normal tilt the
+    // path kernel used to re-trace every frame (v3.2's lag).
+    // Puddles are located exactly as the tracer shaded them:
+    // primary-hit world position from the guide, the baked
+    // field mask at that spot, up-facing hits only. The
+    // converged mirror underneath stays untouched; stills and
+    // exports pass shimmerRain = 0 and skip this entirely.
+    if (p.shimmerRain > 0.01f) {
+        float4 g = guide.sample(s, in.uv);
+        float4 gn = guideNormal.sample(s, in.uv);
+        if (g.a > 0.5f && gn.y > 0.5f) {
+            float3 wp = g.xyz;
+            float2 fuv = wp.xz * (1.0f / 64.0f) + 0.5f;
+            float fade = (1.0f - smoothstep(29.0f, 32.0f, abs(wp.x)))
+                       * (1.0f - smoothstep(29.0f, 32.0f, abs(wp.z)));
+            float4 fs = weatherField.sample(s, fuv);
+            float pot = fs.r * fade;
+            float wetN = clamp(p.wetLevel, 0.0f, 1.0f);
+            float elevBias = clamp(0.10f - wp.y * 0.55f, -0.22f, 0.38f);
+            float thr = mix(1.15f, 0.08f, pow(wetN, 1.15f)) - elevBias * 0.45f;
+            float mask = smoothstep(thr - 0.14f, thr + 0.14f, pot);
+            float broad = 0.78f + 0.45f * fs.a;
+            float slopeShed = clamp((gn.y - 0.70f) / 0.30f, 0.0f, 1.0f);
+            float upFace = smoothstep(0.5f, 0.85f, gn.y);
+            float puddleM = clamp(mask * broad, 0.0f, 1.0f) * slopeShed * upFace
+                          * smoothstep(0.03f, 0.15f, p.wetLevel);
+            if (puddleM > 0.01f) {
+                // Two layers of expanding rings, as in the old
+                // in-tracer version — but only their brightness
+                // echo: rings alternately lift and dip the
+                // reflected light a little as they pass.
+                float rings = 0.0f;
+                for (int layer = 0; layer < 2; layer++) {
+                    float sc = (layer == 0) ? 6.0f : 10.5f;
+                    float sp = (layer == 0) ? 0.85f : 1.25f;
+                    float2 rp = wp.xz * sc;
+                    int2 rc = int2(floor(rp));
+                    float2 rf = fract(rp) - 0.5f;
+                    uint rh = hash32((uint(rc.x) * 0x8da6b343u)
+                                     ^ (uint(rc.y) * 0xd8163841u)
+                                     ^ (uint(layer) * 0x27d4eb2du));
+                    float ph = float(rh >> 8) * (1.0f / 16777216.0f);
+                    float age = fract(p.shimmerTime * sp + ph);
+                    float rr = length(rf);
+                    float ring = sin(3.14159265f * age)
+                               * exp(-rr * 3.5f) * (1.0f - age);
+                    rings += ring * ((layer == 0) ? 0.65f : 0.40f)
+                           * (ph > 0.5f ? 1.0f : -1.0f);
+                }
+                float m = 1.0f + 0.16f * rings * puddleM
+                              * clamp(p.shimmerRain, 0.0f, 1.2f);
+                c *= m;
+            }
+        }
+    }
     c = aces(c * p.exposure);
     c = pow(c, float3(1.0f / 2.2f));
     return float4(c, 1.0f);

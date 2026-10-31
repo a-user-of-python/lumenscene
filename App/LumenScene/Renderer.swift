@@ -65,8 +65,8 @@ struct GPUUniforms {
     var glassRefractBudget: UInt32 = 4
     var wetLevel: Float = 0
     var snowLevel: Float = 0
-    var dynTime: Float = 0   // v3.2: weather clock (s) — puddle ripples
-    var rainFrac: Float = 0  // v3.2: live rain intensity (0 unless raining)
+    var dynTime: Float = 0   // v3.2: weather clock (retained for layout; v3.3: unused by the trace kernel)
+    var rainFrac: Float = 0  // v3.2: live rain intensity (retained for layout; v3.3: unused by the trace kernel)
 }
 
 struct ReprojUniforms {
@@ -112,6 +112,10 @@ struct PrecipUniforms {
 struct TonemapParams {
     var samples: UInt32 = 0
     var exposure: Float = 1.15
+    var shimmerTime: Float = 0  // v3.3: weather clock (s) — display ripple shimmer
+    var shimmerRain: Float = 0  // v3.3: live rain intensity (0 unless raining)
+    var wetLevel: Float = 0     // v3.3: ground wetness, for the puddle mask
+    var pad: Float = 0
 }
 
 typealias CameraBasis = (origin: SIMD3<Float>, forward: SIMD3<Float>, right: SIMD3<Float>, up: SIMD3<Float>)
@@ -131,6 +135,10 @@ final class Renderer {
     private var tonemapPipeline: MTLRenderPipelineState?
     private var precipPipeline: MTLRenderPipelineState?
     private var precipSeedBuffer: MTLBuffer?
+    private var fieldPipeline: MTLComputePipelineState?
+    /// Baked weather field (v3.3): level-independent, baked
+    /// once at init — see bakeWeatherField().
+    private var weatherFieldTex: MTLTexture?
 
     // Scene GPU state.
     private var accel: MTLAccelerationStructure?
@@ -264,6 +272,9 @@ final class Renderer {
         if let fn = library.makeFunction(name: "denoiseKernel") {
             denoisePipeline = try? device.makeComputePipelineState(function: fn)
         }
+        if let fn = library.makeFunction(name: "weatherFieldKernel") {
+            fieldPipeline = try? device.makeComputePipelineState(function: fn)
+        }
         if let vfn = library.makeFunction(name: "tonemapVertex"),
            let ffn = library.makeFunction(name: "tonemapFragment") {
             let desc = MTLRenderPipelineDescriptor()
@@ -323,6 +334,45 @@ final class Renderer {
                 }
             }
         buildTextureArrays()
+        bakeWeatherField()
+    }
+
+    /// One-shot bake of the level-independent weather field
+    /// (v3.3): 2048x2048 RGBA16F over a 64 m world window —
+    /// R puddle metaball potential, G wet pooling, B snow
+    /// drift, A broad pooling. Wet/snow levels are thresholds
+    /// applied analytically in the trace kernel, so the bake
+    /// never needs refreshing when build-up changes. If the
+    /// bake is unavailable, a 1x1 neutral texture stands in
+    /// (global wet/snow shading still works; no puddles).
+    private func bakeWeatherField() {
+        let size = 2048
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float, width: size, height: size, mipmapped: false)
+        desc.usage = [.shaderRead, .shaderWrite]
+        desc.storageMode = .private
+        if let fieldPipeline, let tex = device.makeTexture(descriptor: desc),
+           let cmd = queue.makeCommandBuffer(),
+           let enc = cmd.makeComputeCommandEncoder() {
+            enc.setComputePipelineState(fieldPipeline)
+            enc.setTexture(tex, index: 0)
+            dispatch(enc, pipeline: fieldPipeline, width: size, height: size)
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            weatherFieldTex = tex
+            return
+        }
+        let ndesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba16Float, width: 1, height: 1, mipmapped: false)
+        ndesc.usage = [.shaderRead]
+        ndesc.storageMode = .shared
+        if let tex = device.makeTexture(descriptor: ndesc) {
+            var px: [Float16] = [0, 0.5, 0.5, 0.489]
+            tex.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0,
+                        withBytes: &px, bytesPerRow: 8)
+            weatherFieldTex = tex
+        }
     }
 
     deinit {
@@ -844,12 +894,14 @@ final class Renderer {
               let idxBuffer, let triMatBuffer, let matBuffer,
               let emisTriBuffer, let emisCDFBuffer,
               let texAlbedo, let texNormal, let texData,
+              let weatherFieldTex,
               let enc = cmd.makeComputeCommandEncoder() else { return false }
         enc.setComputePipelineState(tracePipeline)
         enc.setTexture(accum, index: 0)
         enc.setTexture(texAlbedo, index: 1)
         enc.setTexture(texNormal, index: 2)
         enc.setTexture(texData, index: 3)
+        enc.setTexture(weatherFieldTex, index: 4)
         enc.setBuffer(posBuffer, offset: 0, index: 1)
         enc.setBuffer(nrmBuffer, offset: 0, index: 2)
         enc.setBuffer(uvBuffer, offset: 0, index: 3)
@@ -940,6 +992,20 @@ final class Renderer {
         }
     }
 
+    /// Tonemap parameters for a live frame. With `shimmer` set,
+    /// the fragment adds the display-rate rain-ripple shimmer
+    /// on puddle pixels (v3.3); stills pass false so exports
+    /// stay clean.
+    private func tonemapParams(shimmer: Bool) -> TonemapParams {
+        var p = TonemapParams(samples: max(sampleCount, 1), exposure: exposure)
+        if shimmer {
+            p.shimmerTime = weatherDynTime
+            p.shimmerRain = weatherMode == 1 ? weatherDynRain : 0
+            p.wetLevel = weatherWet
+        }
+        return p
+    }
+
     /// One frame for the live MTKView. Returns true when another
     /// frame would still change the picture (the caller chains the
     /// next draw only then — a converged, untouched scene sleeps).
@@ -960,11 +1026,12 @@ final class Renderer {
         // in pre-change samples.
         let weatherLevelsMoved = abs(weatherWet - lastWet) > 0.004
             || abs(weatherSnow - lastSnow) > 0.004
-        // Live rain over puddles (v3.2): while rain intensity is
-        // up, the settled fast path stays off and history reuse
-        // is capped below, so the ripple rings on puddles keep
-        // animating instead of being averaged into stillness.
-        let rippling = weatherMode == 1 && weatherDynRain > 0.3
+        // v3.3: rain traces exactly like snow. The v3.2
+        // `rippling` special case (settled path disabled +
+        // history reuse capped at 12 while it rained) is gone —
+        // ripples are a display-time shimmer in the tonemap
+        // pass now, so a rainy scene settles and sleeps like
+        // any other.
         let weatherLevelsQuiet = abs(weatherWet - lastTracedWet) <= 0.004
             && abs(weatherSnow - lastTracedSnow) <= 0.004
         let pixelW = max(1, Int(Float(view.drawableSize.width) * t.scale))
@@ -993,14 +1060,17 @@ final class Renderer {
         // the last trace (the settled image already includes
         // that shading); precipitation is overlaid on top and
         // the frame chain stays alive so it keeps animating.
-        if accel != nil, (weatherMode == 0 || (weatherLevelsQuiet && !rippling)), historyValid, sampleCount >= t.maxSettle,
+        if accel != nil, (weatherMode == 0 || weatherLevelsQuiet), historyValid, sampleCount >= t.maxSettle,
            let pc = prevCamera, !cameraChanged(pc, camera),
            let settled = accumTex[src] {
             if let tonemapPipeline,
                let renc = cmd.makeRenderCommandEncoder(descriptor: passDesc) {
-                var params = TonemapParams(samples: max(sampleCount, 1), exposure: exposure)
+                var params = tonemapParams(shimmer: true)
                 renc.setRenderPipelineState(tonemapPipeline)
                 renc.setFragmentTexture(settled, index: 0)
+                renc.setFragmentTexture(guideTex[src], index: 1)
+                renc.setFragmentTexture(guideNormalTex[src], index: 2)
+                renc.setFragmentTexture(weatherFieldTex, index: 3)
                 renc.setFragmentBytes(&params, length: MemoryLayout<TonemapParams>.stride, index: 0)
                 renc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                 renc.endEncoding()
@@ -1039,9 +1109,6 @@ final class Renderer {
                 }
                 if weatherLevelsMoved {
                     reuse = min(reuse, 8) // ground is changing state
-                }
-                if rippling {
-                    reuse = min(reuse, 12) // puddle ripples stay live
                 }
                 _ = encodeReproject(prevAccum: prevAccum, prevGuide: prevGuide,
                                     curGuide: curGuide, curAccum: curAccum,
@@ -1089,7 +1156,7 @@ final class Renderer {
         // frames go through the spatial denoise pass; the settled
         // frame (sampleCount >= maxSettle) is shown raw.
         var displaySource = curAccum
-        if accel != nil, moving || play || rippling || sampleCount < 160,
+        if accel != nil, moving || play || sampleCount < 160,
            denoisePipeline != nil, let displayTex, let curGuideNormal {
             let strength: Float = (play || moving) ? 1.0 : 0.65
             if encodeDenoise(accum: curAccum, guide: curGuide,
@@ -1101,9 +1168,12 @@ final class Renderer {
 
         if let tonemapPipeline,
            let renc = cmd.makeRenderCommandEncoder(descriptor: passDesc) {
-            var params = TonemapParams(samples: max(sampleCount, 1), exposure: exposure)
+            var params = tonemapParams(shimmer: true)
             renc.setRenderPipelineState(tonemapPipeline)
             renc.setFragmentTexture(displaySource, index: 0)
+            renc.setFragmentTexture(curGuide, index: 1)
+            renc.setFragmentTexture(curGuideNormal, index: 2)
+            renc.setFragmentTexture(weatherFieldTex, index: 3)
             renc.setFragmentBytes(&params, length: MemoryLayout<TonemapParams>.stride, index: 0)
             renc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             renc.endEncoding()
@@ -1148,6 +1218,12 @@ final class Renderer {
         var params = TonemapParams(samples: UInt32(samples), exposure: exposure)
         renc.setRenderPipelineState(tonemapPipeline)
         renc.setFragmentTexture(accum, index: 0)
+        // Inert placeholders: the fragment's shimmer block is
+        // gated on shimmerRain > 0 (0 here) and never samples
+        // indices 1-3 for stills.
+        renc.setFragmentTexture(weatherFieldTex, index: 1)
+        renc.setFragmentTexture(weatherFieldTex, index: 2)
+        renc.setFragmentTexture(weatherFieldTex, index: 3)
         renc.setFragmentBytes(&params, length: MemoryLayout<TonemapParams>.stride, index: 0)
         renc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         renc.endEncoding()
