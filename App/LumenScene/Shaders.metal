@@ -81,7 +81,7 @@ struct Uniforms {
     float dynTime;             // v3.2: weather clock (retained for layout; v3.3: unused by the trace kernel)
     float rainFrac;            // v3.2: live rain intensity (retained for layout; v3.3: unused by the trace kernel)
     uint dynTriCount;          // v4: dynamic-layer triangle count (unified ids start at triCount)
-    uint padDyn;
+    uint hidePlayerHead;       // v4.5: 1 while the camera is the Play first-person eye — the player figure's head/hair (FLAG_PLAYER_HEAD) are excluded from PRIMARY hits only (was padDyn; layout unchanged)
 };
 
 struct Material {
@@ -101,6 +101,7 @@ constant uint FLAG_TRIPLANAR = 4u;
 constant uint FLAG_FIT = 8u;
 constant uint FLAG_SHEET = 16u;   // v3.4: puddle water sheet (real geometry)
 constant uint FLAG_SNOW = 32u;    // v4.4: snow sheet (real geometry, always snow material)
+constant uint FLAG_PLAYER_HEAD = 64u; // v4.5: player figure head/hair — invisible to primary rays from the Play eye (u.hidePlayerHead), visible to every other ray
 
 // MARK: - RNG (xorshift128, seeded per pixel + frame)
 
@@ -372,23 +373,49 @@ kernel void pathTraceKernel(
         // are ids 0..<triCount, dynamic tris are triCount..<
         // triCount+dynTriCount; the nearer hit of the two AS
         // traversals wins and selects the attribute set below.
-        auto sHit = isect.intersect(ray, accel);
-        bool haveHit = sHit.type != intersection_type::none;
-        float hitDist = haveHit ? sHit.distance : 1e30f;
-        uint primID = haveHit ? sHit.primitive_id : 0u;
-        float2 hitBary = haveHit ? sHit.triangle_barycentric_coord : float2(0);
-        bool hitFront = haveHit ? sHit.triangle_front_facing : true;
+        // v4.5: at bounce 0 with u.hidePlayerHead set (the Play
+        // first-person eye), a winning hit on the player
+        // figure's head or hair (FLAG_PLAYER_HEAD) is stepped
+        // over and the merged query re-runs past it — the eye
+        // sits INSIDE the head box, so without this its inner
+        // wall is the whole screen. Bounces >= 1 and shadow
+        // rays are NOT filtered: the head still renders in
+        // reflections and mirror views and casts shadows, and
+        // the rest of the body stays visible to primary rays
+        // (look down and you see your torso, arms and legs).
+        bool haveHit = false;
+        float hitDist = 1e30f;
+        uint primID = 0u;
+        float2 hitBary = float2(0);
+        bool hitFront = true;
         bool isDynHit = false;
-        if (u.dynTriCount > 0) {
-            raytracing::ray dynRay = ray;
-            if (haveHit) dynRay.max_distance = hitDist;
-            auto dHit = isect.intersect(dynRay, dynAccel);
-            if (dHit.type != intersection_type::none
-                && (!haveHit || dHit.distance < hitDist)) {
-                haveHit = true; isDynHit = true;
-                hitDist = dHit.distance; primID = dHit.primitive_id;
-                hitBary = dHit.triangle_barycentric_coord;
-                hitFront = dHit.triangle_front_facing;
+        {
+            raytracing::ray qray = ray;
+            for (uint attempt = 0u; attempt < 8u; ++attempt) {
+                auto sHit = isect.intersect(qray, accel);
+                haveHit = sHit.type != intersection_type::none;
+                hitDist = haveHit ? sHit.distance : 1e30f;
+                primID = haveHit ? sHit.primitive_id : 0u;
+                hitBary = haveHit ? sHit.triangle_barycentric_coord : float2(0);
+                hitFront = haveHit ? sHit.triangle_front_facing : true;
+                isDynHit = false;
+                if (u.dynTriCount > 0) {
+                    raytracing::ray dynRay = qray;
+                    if (haveHit) dynRay.max_distance = hitDist;
+                    auto dHit = isect.intersect(dynRay, dynAccel);
+                    if (dHit.type != intersection_type::none
+                        && (!haveHit || dHit.distance < hitDist)) {
+                        haveHit = true; isDynHit = true;
+                        hitDist = dHit.distance; primID = dHit.primitive_id;
+                        hitBary = dHit.triangle_barycentric_coord;
+                        hitFront = dHit.triangle_front_facing;
+                    }
+                }
+                if (!haveHit || bounce != 0u || u.hidePlayerHead == 0u) break;
+                uint hMat = (isDynHit ? dynTriMat : triMat)[primID];
+                if ((materials[hMat].flags & FLAG_PLAYER_HEAD) == 0u) break;
+                qray.min_distance = hitDist + 0.002f;
+                haveHit = false;
             }
         }
         if (!haveHit) {
@@ -909,21 +936,41 @@ kernel void guideKernel(
     // FLAG_SHEET / glass / reflection-dominant hit therefore
     // gets exactly the trace kernel's reusability treatment in
     // the ghosting logic below.
-    auto sHit = isect.intersect(ray, accel);
-    bool haveHit = sHit.type != intersection_type::none;
-    float hitDist = haveHit ? sHit.distance : 1e30f;
-    uint primID = haveHit ? sHit.primitive_id : 0u;
-    float2 hitBary = haveHit ? sHit.triangle_barycentric_coord : float2(0);
+    // v4.5: the FLAG_PLAYER_HEAD step-over is applied here
+    // identically (this kernel IS the primary ray), so the
+    // guide position/normal/class describe the same surface
+    // the trace kernel shades — no head-shaped ghost in the
+    // denoised or reprojected image.
+    bool haveHit = false;
+    float hitDist = 1e30f;
+    uint primID = 0u;
+    float2 hitBary = float2(0);
     bool isDynHit = false;
-    if (u.dynTriCount > 0) {
-        raytracing::ray dynRay = ray;
-        if (haveHit) dynRay.max_distance = hitDist;
-        auto dHit = isect.intersect(dynRay, dynAccel);
-        if (dHit.type != intersection_type::none
-            && (!haveHit || dHit.distance < hitDist)) {
-            haveHit = true; isDynHit = true;
-            hitDist = dHit.distance; primID = dHit.primitive_id;
-            hitBary = dHit.triangle_barycentric_coord;
+    {
+        raytracing::ray qray = ray;
+        for (uint attempt = 0u; attempt < 8u; ++attempt) {
+            auto sHit = isect.intersect(qray, accel);
+            haveHit = sHit.type != intersection_type::none;
+            hitDist = haveHit ? sHit.distance : 1e30f;
+            primID = haveHit ? sHit.primitive_id : 0u;
+            hitBary = haveHit ? sHit.triangle_barycentric_coord : float2(0);
+            isDynHit = false;
+            if (u.dynTriCount > 0) {
+                raytracing::ray dynRay = qray;
+                if (haveHit) dynRay.max_distance = hitDist;
+                auto dHit = isect.intersect(dynRay, dynAccel);
+                if (dHit.type != intersection_type::none
+                    && (!haveHit || dHit.distance < hitDist)) {
+                    haveHit = true; isDynHit = true;
+                    hitDist = dHit.distance; primID = dHit.primitive_id;
+                    hitBary = dHit.triangle_barycentric_coord;
+                }
+            }
+            if (!haveHit || u.hidePlayerHead == 0u) break;
+            uint hMat = (isDynHit ? dynTriMat : triMat)[primID];
+            if ((materials[hMat].flags & FLAG_PLAYER_HEAD) == 0u) break;
+            qray.min_distance = hitDist + 0.002f;
+            haveHit = false;
         }
     }
     if (!haveHit) {

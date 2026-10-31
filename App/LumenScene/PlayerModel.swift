@@ -143,6 +143,49 @@ enum PlayerModel {
         return merged(parts)
     }
 
+    /// v4.5: split a posed figure mesh into (body, head) so the
+    /// renderer can give the head + hair their own material
+    /// (FLAG_PLAYER_HEAD — excluded from primary hits while
+    /// the camera is the Play first-person eye, which sits
+    /// inside the head box). The part order in mesh() is
+    /// fixed: pelvis, torso, HEAD, HAIR, then arms and legs;
+    /// every box is 12 triangles, so the head parts are
+    /// triangles 24..<48. Counts are constant like the whole
+    /// figure's: body 240 verts / 120 tris, head 48 / 24.
+    static func splitHead(_ mesh: MeshData) -> (body: MeshData, head: MeshData) {
+        func slice(_ tris: Range<Int>) -> MeshData {
+            var out = MeshData()
+            var remap: [UInt32: UInt32] = [:]
+            func vert(_ old: UInt32) -> UInt32 {
+                if let n = remap[old] { return n }
+                let n = UInt32(out.vertexCount)
+                remap[old] = n
+                let o = Int(old)
+                out.positions += [mesh.positions[3 * o], mesh.positions[3 * o + 1], mesh.positions[3 * o + 2]]
+                out.normals += [mesh.normals[3 * o], mesh.normals[3 * o + 1], mesh.normals[3 * o + 2]]
+                out.uvs += [mesh.uvs[2 * o], mesh.uvs[2 * o + 1]]
+                out.colors += [mesh.colors[3 * o], mesh.colors[3 * o + 1], mesh.colors[3 * o + 2]]
+                return n
+            }
+            for t in tris {
+                out.indices += [vert(mesh.indices[3 * t]),
+                                vert(mesh.indices[3 * t + 1]),
+                                vert(mesh.indices[3 * t + 2])]
+            }
+            return out
+        }
+        let head = slice(24..<48)
+        var body = slice(0..<24)
+        let tail = slice(48..<mesh.triangleCount)
+        let base = UInt32(body.vertexCount)
+        body.positions += tail.positions
+        body.normals += tail.normals
+        body.uvs += tail.uvs
+        body.colors += tail.colors
+        body.indices += tail.indices.map { $0 + base }
+        return (body, head)
+    }
+
     // MARK: - Part assembly
 
     /// Builds one MeshGen box, overwrites every vertex colour with

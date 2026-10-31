@@ -1488,6 +1488,10 @@ final class EditorSession: ObservableObject {
     /// Edit mode: the figure stands idle at the saved Play start
     /// (feet = eye − 1.7), facing the saved look direction.
     private func setEditPlayerFigure() {
+        // v4.5: the Edit orbit camera (and Cut To View's
+        // stills) are third-person — the whole figure, head
+        // included, renders normally.
+        renderer.hidePlayerHead = false
         let cam = project.scene.camera
         let p = cam.playPosition
         let feet = SIMD3<Float>(Float(p[0]), Float(p[1]) - 1.7, Float(p[2]))
@@ -1507,6 +1511,10 @@ final class EditorSession: ObservableObject {
     /// Purely visual: playPosition is READ, never written.
     private func drivePlayerAndFootprints(now: CFTimeInterval, dt: Float) {
         guard mode == .play else { return }
+        // v4.5: in Play the camera IS the figure's eye (inside
+        // the head box) — the renderer excludes head + hair
+        // from primary hits for as long as this is set.
+        renderer.hidePlayerHead = true
         let p = project.scene.camera.playPosition
         let eye = SIMD3<Float>(Float(p[0]), Float(p[1]), Float(p[2]))
         let feet = eye - SIMD3<Float>(0, 1.7, 0)

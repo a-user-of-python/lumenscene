@@ -70,7 +70,7 @@ struct GPUUniforms {
     var dynTime: Float = 0   // v3.2: weather clock (retained for layout; v3.3: unused by the trace kernel)
     var rainFrac: Float = 0  // v3.2: live rain intensity (retained for layout; v3.3: unused by the trace kernel)
     var dynTriCount: UInt32 = 0  // v4: dynamic-layer triangles (unified ids start at triCount)
-    var padDyn: UInt32 = 0
+    var hidePlayerHead: UInt32 = 0  // v4.5: Play-eye primary-ray head exclusion (was padDyn; layout unchanged)
 }
 
 struct ReprojUniforms {
@@ -158,6 +158,17 @@ private let dynNilObjectSentinel = UUID(uuidString: "00000000-0000-0000-0000-000
 /// (see setPlayerFigure). Fixed so the figure's slice, dirty
 /// tracking and material slot are stable across pose swaps.
 private let playerFigureKey = UUID(uuidString: "00000000-0000-0000-0000-0000000000F1")!
+
+/// v4.5: the reserved key of the figure's HEAD entry (head +
+/// hair, split from the body by PlayerModel.splitHead) — its
+/// material carries FLAG_PLAYER_HEAD (64) so the trace/guide
+/// kernels can exclude it from primary hits while the camera
+/// is the Play first-person eye.
+private let playerHeadKey = UUID(uuidString: "00000000-0000-0000-0000-0000000000F2")!
+
+/// v4.5: GPUMaterial flag for the player head entry (mirrors
+/// FLAG_PLAYER_HEAD in Shaders.metal).
+private let flagPlayerHead: UInt32 = 64
 
 /// v4.3: one player footprint stamp in snow (world XZ,
 /// metres) — the struct is Renderer.SnowFootprint (nested,
@@ -262,6 +273,19 @@ final class Renderer {
     /// Every dynamic-layer composition appends it LAST (after
     /// the particle soups) in geometry and the material table.
     private var playerFigureEntry: DynEntry?
+    /// v4.5: the figure's head entry (head + hair), composed
+    /// immediately after the body entry with the
+    /// FLAG_PLAYER_HEAD material; same matrix, same pose cadence.
+    private var playerHeadEntry: DynEntry?
+    /// v4.5: the unsplit figure mesh, kept for the snow
+    /// intruder (its bounds are the whole figure's).
+    private var playerFigureFullMesh: MeshData?
+    /// v4.5: session-set — true while the camera is the Play
+    /// first-person eye. uniforms() forwards it to the trace
+    /// and guide kernels, which exclude the figure's head from
+    /// primary hits only. Never set in Edit (the orbit camera
+    /// sees the whole figure) or for stills from Edit.
+    var hidePlayerHead = false
     private var dynDirtyKeys: Set<UUID> = []
     private struct DynSlice {
         var vertexStart: Int = 0
@@ -1622,9 +1646,10 @@ final class Renderer {
     // with the inverse matrix. Where the intruder's world
     // bottom reaches into the snow, the field height is
     // compressed toward (bottom − 0.02 m) with a soft inner
-    // lip and a 0.30 m outer falloff, and a raised rim ring
-    // (up to 0.45 × the local field height, peaking ~0.12 m
-    // out, gone by 0.45 m) rings the contact. Everything is
+    // lip — INSIDE the footprint only (v4.5: outside it the
+    // snow is never compressed; it BANKS against the object,
+    // +18% of field height at the wall easing out over
+    // 0.8 m — see imprintedSnowHeight). Everything is
     // derived from transforms at rebuild time — drag troughs
     // appear for free because a drag rebuilds at the object's
     // live transform, and nothing sculpted is ever stored.
@@ -1710,8 +1735,10 @@ final class Renderer {
             }
         }
         if let fig = playerFigureEntry {
+            // v4.5: the intruder keeps the UNSPLIT figure mesh
+            // (the entry itself now holds only the body split).
             if let intr = makeSnowIntruder(
-                staticID: nil, local: fig.mesh,
+                staticID: nil, local: playerFigureFullMesh ?? fig.mesh,
                 matrix: fig.matrix, world: nil, isCircle: false) {
                 out.append(intr)
             }
@@ -1778,22 +1805,39 @@ final class Renderer {
             let snowTop = hostY + h
             guard intr.bottomY < snowTop + 0.001,
                   intr.worldMax.y > hostY + 0.001 else { continue }
-            let hC = wgfClamp(intr.bottomY - 0.02 - hostY, 0, h)
-            guard hC < h else { continue } // no compression → no rim either
-            // Blend: soft inner lip inside, 0.30 m falloff outside.
-            let w: Float
             if inside {
-                w = wgfSmooth(0, 0.10, insideDepth)
+                // Compression ONLY where the object physically
+                // presses: the footprint interior, toward
+                // bottom − 0.02 with a soft 10 cm inner lip.
+                let hC = wgfClamp(intr.bottomY - 0.02 - hostY, 0, h)
+                if hC < h {
+                    let w = wgfSmooth(0, 0.10, insideDepth)
+                    h = h + (hC - h) * w
+                }
             } else {
-                w = 1 - wgfSmooth(0, 0.30, outsideDist)
-            }
-            if w > 0 { h = h + (hC - h) * w }
-            // Rim: displaced snow piles up just outside the
-            // footprint — peak ~0.12 m out, gone by 0.45 m.
-            if !inside, outsideDist > 0, outsideDist < 0.45 {
-                let d = outsideDist
-                let bump = wgfSmooth(0, 0.12, d) * (1 - wgfSmooth(0.12, 0.45, d))
-                h += fieldH0 * 0.45 * bump
+                // v4.5 BANKING — replaces the v4.3 outside
+                // falloff and rim. Snow outside the footprint
+                // is NEVER compressed: the old blend held the
+                // column at the fully compressed height AT the
+                // wall and let it recover over 0.30 m, which
+                // dug a flat trench exactly where the pile
+                // should meet the object (host audit, v4.5:
+                // at an unburied wall the old profile reads
+                // 0.000 m at the wall against a 0.631 m field,
+                // then overshoots to a 1.163 m rim hump at
+                // +0.3 m). Now the pile rises toward the wall
+                // instead: +18% of the local field height at
+                // the wall, easing to nothing 0.8 m out —
+                // drift banked against an obstacle (same wall:
+                // 0.745 m at the wall, 1.093 m at +0.3 m, field
+                // beyond). Suppressed when the field already
+                // buries the intruder (its top below the
+                // un-imprinted snow top — no wall to bank
+                // against; the sheet just passes over).
+                if hostY + fieldH0 <= intr.worldMax.y + 0.001 {
+                    let fall = 1 - wgfSmooth(0, 0.8, outsideDist)
+                    h += fieldH0 * 0.18 * fall
+                }
             }
         }
         // Footprint stamps (player steps): multiplicative
@@ -2099,22 +2143,8 @@ final class Renderer {
                 } else {
                     verts[idx].topY = s.y
                 }
-                // Normal from taps of the total height
-                // function (support + snow, imprints and
-                // all) — the same taps that placed every
-                // other vertex, so shading and silhouette
-                // agree. A tap with no support counts as the
-                // centre height (one-sided fall-back).
-                let e: Float = 0.05
-                func tapH(_ tx: Float, _ tz: Float) -> Float {
-                    sheetColumn(x: tx, z: tz, grid: grid,
-                                intruders: intruders,
-                                snowPossible: snowPossible)?.topY
-                        ?? verts[idx].topY
-                }
-                let gx = (tapH(x + e, z) - tapH(x - e, z)) / (2 * e)
-                let gz = (tapH(x, z + e) - tapH(x, z - e)) / (2 * e)
-                verts[idx].normal = simd_normalize(SIMD3<Float>(-gx, 1, -gz))
+                // Normals are computed in step (c3) from the
+                // relaxed lattice — see below.
                 // Vertex tint mirrors the shader's crevice
                 // term (drift crests bright, hollows shaded):
                 // the sheet's own material skips the weather
@@ -2126,6 +2156,127 @@ final class Renderer {
                     verts[idx].mask = pm.mask
                     verts[idx].depth01 = pm.depth
                 }
+            }
+        }
+        // (c2) v4.5: PINNED columns + REPOSE RELAXATION.
+        //
+        // A column is PINNED when a contacting intruder's
+        // footprint covers it and the intruder's underside is
+        // at or below the column's snow top — the object is
+        // physically holding that snow down, so relaxation
+        // must not move it (and the drop at a present object's
+        // wall is the object's own silhouette, like a support
+        // step — the sheet meets the wall at the banked
+        // height and the compressed interior is inside the
+        // object, unseen).
+        //
+        // Relaxation then enforces the angle of repose on the
+        // snow SURFACE: between same-support neighbours
+        // (support heights within 5 cm — a genuine support
+        // step is the object's silhouette, not snow holding a
+        // cliff), no edge may exceed tan(37°) × cell. It runs
+        // Gauss–Seidel (in-place, fixed sweep order) because
+        // the Jacobi form of this scheme DIVERGES in 2D (four
+        // edges per column, per-edge transfer of half the
+        // excess overshoots — host audit, v4.5: heights blew
+        // past 1e10 within 40 passes on the pit grid). GS
+        // leaves each visited pair exactly at the limit and
+        // is a pure function of the current height state:
+        // deterministic per rebuild, no state, nothing extra
+        // stored — save/load is untouched. Effect on Sean's
+        // repro: lift a buried block and the pit the imprint
+        // leaves slumps — audit: max interior slope 81° ->
+        // 37°, pit centre recovers 0.00 -> 0.76 m of its
+        // 1.56 m field (a smooth hollow; volume is conserved,
+        // so it does not fill flat). Footprint stamps (soft,
+        // unpinned) get their rims softened the same way.
+        var pinned = [Bool](repeating: false, count: vx * vz)
+        if snowPossible {
+            for j in 0..<vz {
+                for i in 0..<vx {
+                    let idx = vIdx(i, j)
+                    guard let s = verts[idx].support else { continue }
+                    let x = vX(i), z = vZ(j)
+                    for intr in intruders {
+                        if let sid = intr.staticID, sid == s.hostID { continue }
+                        if x < intr.worldMin.x - 0.5 || x > intr.worldMax.x + 0.5
+                            || z < intr.worldMin.z - 0.5 || z > intr.worldMax.z + 0.5 {
+                            continue
+                        }
+                        guard intr.worldMax.y > s.y + 0.001,
+                              intr.bottomY - 0.02 <= verts[idx].topY + 0.01 else { continue }
+                        let lp = intr.inverse * SIMD4<Float>(x, s.y, z, 1)
+                        let lx = lp.x - intr.centre.x
+                        let lz = lp.z - intr.centre.y
+                        let inside: Bool
+                        if intr.isCircle {
+                            inside = lx * lx + lz * lz < intr.half.x * intr.half.x
+                        } else {
+                            inside = abs(lx) < intr.half.x && abs(lz) < intr.half.y
+                        }
+                        if inside { pinned[idx] = true; break }
+                    }
+                }
+            }
+            let maxStep = Float(0.7536) * cs // tan(37°) × cell
+            for _ in 0..<48 {
+                var worst: Float = 0
+                for j in 0..<vz {
+                    for i in 0..<vx {
+                        let a = vIdx(i, j)
+                        if pinned[a] || verts[a].support == nil { continue }
+                        for (di, dj) in [(1, 0), (0, 1)] {
+                            let ii = i + di, jj = j + dj
+                            if ii >= vx || jj >= vz { continue }
+                            let b = vIdx(ii, jj)
+                            if pinned[b], verts[b].support != nil { continue }
+                            guard let sa = verts[a].support,
+                                  let sb = verts[b].support else { continue }
+                            if abs(sa.y - sb.y) > 0.05 { continue }
+                            let d = verts[a].topY - verts[b].topY
+                            if abs(d) > maxStep {
+                                let m = (abs(d) - maxStep) * 0.5
+                                worst = max(worst, m)
+                                if d > 0 {
+                                    verts[a].topY -= m; verts[b].topY += m
+                                } else {
+                                    verts[a].topY += m; verts[b].topY -= m
+                                }
+                            }
+                        }
+                    }
+                }
+                if worst < 0.0005 { break }
+            }
+            for idx in verts.indices {
+                if let s = verts[idx].support {
+                    verts[idx].snowH = max(0, verts[idx].topY - s.y)
+                }
+            }
+        }
+        // (c3) v4.5: normals from the RELAXED lattice —
+        // central differences of verts.topY (one-sided where a
+        // neighbour has no support). This replaces v4.4's
+        // per-vertex function taps: the normals now describe
+        // exactly the surface that is emitted (the taps
+        // described the pre-relaxation function and cost four
+        // extra column evaluations per vertex).
+        for j in 0..<vz {
+            for i in 0..<vx {
+                let idx = vIdx(i, j)
+                guard verts[idx].support != nil else { continue }
+                let c = verts[idx].topY
+                let hx = (i + 1 < vx && verts[vIdx(i + 1, j)].support != nil)
+                    ? verts[vIdx(i + 1, j)].topY : c
+                let lx = (i > 0 && verts[vIdx(i - 1, j)].support != nil)
+                    ? verts[vIdx(i - 1, j)].topY : c
+                let hz = (j + 1 < vz && verts[vIdx(i, j + 1)].support != nil)
+                    ? verts[vIdx(i, j + 1)].topY : c
+                let lz = (j > 0 && verts[vIdx(i, j - 1)].support != nil)
+                    ? verts[vIdx(i, j - 1)].topY : c
+                let gx = (hx - lx) / (2 * cs)
+                let gz = (hz - lz) / (2 * cs)
+                verts[idx].normal = simd_normalize(SIMD3<Float>(-gx, 1, -gz))
             }
         }
         // (d) Cell predicates — decided BEFORE any triangle
@@ -2264,20 +2415,32 @@ final class Renderer {
                             }
                             return end.topY - end.snowH - 0.02
                         }
-                        let n3 = SIMD3<Float>(outward.x, 0, outward.y)
+                        let n3 = SIMD3<Float>(outward.x, 0, outward.y) // winding reference only
+                        // v4.5 skirt shading: a purely horizontal
+                        // skirt normal receives only ~0.70 of the
+                        // env irradiance a snow top gets from the
+                        // gradient sky (host audit: numerical
+                        // integration of envColor), which read as
+                        // dark slate walls. A pile's edge is a
+                        // steep SLOPE, not a cliff — the vertex
+                        // normals tilt up (ny = 0.84, env
+                        // response 0.95) and the old blanket 0.94
+                        // shade factor is gone, so the boundary
+                        // reads as snow meeting the ground.
+                        let sn = simd_normalize(SIMD3<Float>(outward.x * 0.55, 0.85, outward.y * 0.55))
                         let base = UInt32(positions.count / 3)
                         for (g, end) in [(ga, va), (gb, vb)] {
                             positions.append(contentsOf: [vX(g % vx), end.topY + 0.0015, vZ(g / vx)])
-                            normals.append(contentsOf: [n3.x, 0, n3.z])
+                            normals.append(contentsOf: [sn.x, sn.y, sn.z])
                             uvs.append(contentsOf: [0, 0])
-                            let sh = end.shade * 0.94
+                            let sh = end.shade
                             colors.append(contentsOf: [sh, sh, sh])
                         }
                         for (g, end) in [(ga, va), (gb, vb)] {
                             positions.append(contentsOf: [vX(g % vx), bottomY(g, end), vZ(g / vx)])
-                            normals.append(contentsOf: [n3.x, 0, n3.z])
+                            normals.append(contentsOf: [sn.x, sn.y, sn.z])
                             uvs.append(contentsOf: [0, 0])
-                            let sh = end.shade * 0.94
+                            let sh = end.shade
                             colors.append(contentsOf: [sh, sh, sh])
                         }
                         // (topA, topB, botB) + (topA, botB, botA),
@@ -2403,7 +2566,9 @@ final class Renderer {
         for soup in particleSoupsStored { mats.append(soup.material) }
         // v4.3: the player figure's material is ALWAYS last —
         // the same order composeDynamic bakes its triangles in.
+        // v4.5: the head entry's material follows the body's.
         if let fig = playerFigureEntry { mats.append(fig.material) }
+        if let head = playerHeadEntry { mats.append(head.material) }
         return mats
     }
 
@@ -2501,48 +2666,74 @@ final class Renderer {
     /// net) composes the dynamic layer; a same-count pose
     /// swap only marks the figure's slice dirty and
     /// flushDynamic() re-bakes its vertices at the next draw.
+    /// v4.5: the mesh is split (PlayerModel.splitHead) into a
+    /// BODY entry under playerFigureKey (material flags 0, as
+    /// before) and a HEAD entry under playerHeadKey whose
+    /// material carries FLAG_PLAYER_HEAD — same matrix, posed
+    /// in lockstep, composed immediately after the body.
     func setPlayerFigure(mesh: MeshData?, matrix: float4x4) {
         guard let mesh else {
-            if playerFigureEntry != nil {
+            if playerFigureEntry != nil || playerHeadEntry != nil {
                 playerFigureEntry = nil
+                playerHeadEntry = nil
+                playerFigureFullMesh = nil
                 dynDirtyKeys.remove(playerFigureKey)
+                dynDirtyKeys.remove(playerHeadKey)
                 composeDynamic(structureChanged: true)
             }
             return
         }
-        if var existing = playerFigureEntry {
+        playerFigureFullMesh = mesh
+        let split = PlayerModel.splitHead(mesh)
+        var needsCompose = false
+        needsCompose = upsertFigurePart(
+            entry: &playerFigureEntry, key: playerFigureKey,
+            mesh: split.body, matrix: matrix, flags: 0) || needsCompose
+        needsCompose = upsertFigurePart(
+            entry: &playerHeadEntry, key: playerHeadKey,
+            mesh: split.head, matrix: matrix, flags: flagPlayerHead) || needsCompose
+        if needsCompose { composeDynamic(structureChanged: true) }
+    }
+
+    /// One half of the split figure: same-count pose swaps
+    /// mark the slice dirty (returns false); a first install
+    /// or count mismatch asks the caller to compose (true).
+    private func upsertFigurePart(entry: inout DynEntry?, key: UUID,
+                                  mesh: MeshData, matrix: float4x4,
+                                  flags: UInt32) -> Bool {
+        if var existing = entry {
             existing.mesh = mesh
             existing.matrix = matrix
-            playerFigureEntry = existing
-            if let slice = dynSlices[playerFigureKey],
+            entry = existing
+            if let slice = dynSlices[key],
                slice.vertexCount == mesh.vertexCount, !slice.remapped {
-                dynDirtyKeys.insert(playerFigureKey)
-            } else {
-                composeDynamic(structureChanged: true)
+                dynDirtyKeys.insert(key)
+                return false
             }
-        } else {
-            var mat = GPUMaterial()
-            mat.baseColor = SIMD4<Float>(1, 1, 1, 0)
-            mat.emissive = SIMD4<Float>(0, 0, 0, 0)
-            mat.glassParams = SIMD4<Float>(0, 0, 1.5, 0)
-            mat.tint = SIMD4<Float>(1, 1, 1, 1)
-            mat.texIndex = 0
-            mat.flags = 0
-            mat.pad = SIMD2<UInt32>(0x3F800000, 0) // exposure 1.0
-            playerFigureEntry = DynEntry(key: playerFigureKey, mesh: mesh,
-                                         matrix: matrix, material: mat,
-                                         objectID: nil)
-            composeDynamic(structureChanged: true)
+            return true
         }
+        var mat = GPUMaterial()
+        mat.baseColor = SIMD4<Float>(1, 1, 1, 0)
+        mat.emissive = SIMD4<Float>(0, 0, 0, 0)
+        mat.glassParams = SIMD4<Float>(0, 0, 1.5, 0)
+        mat.tint = SIMD4<Float>(1, 1, 1, 1)
+        mat.texIndex = 0
+        mat.flags = flags
+        mat.pad = SIMD2<UInt32>(0x3F800000, 0) // exposure 1.0
+        entry = DynEntry(key: key, mesh: mesh, matrix: matrix,
+                         material: mat, objectID: nil)
+        return true
     }
 
     /// Cheap figure move: update the matrix only and mark the
-    /// slice dirty — the re-bake happens in flushDynamic() at
+    /// slices dirty — the re-bake happens in flushDynamic() at
     /// the top of draw(), exactly like updateDynamicMatrix.
     func setPlayerFigureMatrix(_ m: float4x4) {
         guard playerFigureEntry != nil else { return }
         playerFigureEntry?.matrix = m
         dynDirtyKeys.insert(playerFigureKey)
+        playerHeadEntry?.matrix = m
+        if playerHeadEntry != nil { dynDirtyKeys.insert(playerHeadKey) }
     }
 
     /// Particle soups (at most 8 kept), appended after the
@@ -2667,12 +2858,21 @@ final class Renderer {
         // particle soups) — the one consistent order used by
         // fullMaterialTable, the pick mapping and the emissive
         // scan. objectID nil → the sentinel → unpickable.
+        // v4.5: two soups — body, then head — with consecutive
+        // material offsets matching fullMaterialTable's order.
         if !capped, let fig = playerFigureEntry {
             let world = fig.mesh.baked(by: fig.matrix)
             slices[fig.key] = appendSoup(
                 world: world,
                 matOffset: dynEntries.count + particleSoupsStored.count,
                 objectID: nil)
+            if let head = playerHeadEntry {
+                let headWorld = head.mesh.baked(by: head.matrix)
+                slices[head.key] = appendSoup(
+                    world: headWorld,
+                    matOffset: dynEntries.count + particleSoupsStored.count + 1,
+                    objectID: nil)
+            }
         }
 
         cpuDynPositions = positions
@@ -2719,7 +2919,8 @@ final class Renderer {
             // path — its key resolves to the reserved entry
             // when it is not a session dynamic entry.
             guard let pair = dynEntries.first(where: { $0.key == key })
-                    ?? (key == playerFigureKey ? playerFigureEntry : nil),
+                    ?? (key == playerFigureKey ? playerFigureEntry : nil)
+                    ?? (key == playerHeadKey ? playerHeadEntry : nil),
                   let slice = dynSlices[key], slice.vertexCount > 0 else { continue }
             let world = pair.local.baked(by: pair.matrix)
             guard world.vertexCount == slice.vertexCount, !slice.remapped else { continue }
@@ -3004,6 +3205,9 @@ final class Renderer {
         // to BOTH kernels, so a failed AS/buffer can never be
         // traversed against the dynamic attribute arrays.
         u.dynTriCount = UInt32(dynUsable ? dynTriCount : 0)
+        // v4.5: Play-eye head exclusion, forwarded to both
+        // kernels through the one uniforms() both consume.
+        u.hidePlayerHead = hidePlayerHead ? 1 : 0
         return u
     }
 
