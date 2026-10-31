@@ -2216,8 +2216,8 @@ final class Renderer {
                     var baseNB = base
                     if let s = sampleSupport(grid, x: x, z: z),
                        abs(s.y - sup) < 0.01 {
-                        let taper: Float = s.flatNY > 0.5
-                            ? wgfSmooth(0.55, 0.75, s.ny) : 0
+                        // Same column math as sheetColumn.
+                        let taper = wgfSmooth(0.55, 0.75, s.interpNY)
                         let fH = wgfSnowHeight(x, z, amount: s.amount) * taper
                         baseNB = imprintedSnowHeight(
                             x: x, z: z, hostY: s.y, hostID: s.hostID,
