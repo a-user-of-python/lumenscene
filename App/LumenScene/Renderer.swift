@@ -71,6 +71,7 @@ struct GPUUniforms {
     var rainFrac: Float = 0  // v3.2: live rain intensity (retained for layout; v3.3: unused by the trace kernel)
     var dynTriCount: UInt32 = 0  // v4: dynamic-layer triangles (unified ids start at triCount)
     var hidePlayerHead: UInt32 = 0  // v4.5: Play-eye primary-ray head exclusion (was padDyn; layout unchanged)
+    var freezeFrac: Float = 0  // v4.7: puddle freeze fraction 0...1 (tail field; mirrors Shaders.metal Uniforms)
 }
 
 struct ReprojUniforms {
@@ -501,7 +502,13 @@ final class Renderer {
     /// persists across rebuilds — and, via the session, across
     /// saves (WeatherState.plowCells). The session pushes the
     /// saved layer in at load and pulls it back out on save.
-    var snowPlow: [Int64: (d: Float, a: Float)] = [:]
+    var snowPlow: [Int64: (d: Float, a: Float, s: Float)] = [:]
+    /// v4.7: cumulative snowfall total (metres), written by the
+    /// session every tick alongside weatherSnowAmount. Plow
+    /// trails fade as this advances, even at the depth cap.
+    var snowfallTotal: Float = 0
+    /// v4.7: puddle freeze fraction 0...1, written every tick.
+    var weatherFreeze: Float = 0
 
     /// Pack a displacement-layer cell coordinate into its
     /// dictionary key (mirrors supportKey's packing).
@@ -518,11 +525,14 @@ final class Renderer {
         var out: [SnowPlowCell] = []
         out.reserveCapacity(snowPlow.count)
         for (key, cell) in snowPlow {
-            let fade = max(0, 1 - abs(aNow - cell.a) / 0.25)
+            let fadeA = max(0, min(1, 1 - abs(aNow - cell.a) / 0.25))
+            let fadeS = max(0, min(1, 1 - (snowfallTotal - cell.s) / 0.25))
+            let fade = min(fadeA, fadeS)
             if abs(cell.d) * fade < 0.002 { continue }
             out.append(SnowPlowCell(gx: Int32(truncatingIfNeeded: key >> 32),
                                     gz: Int32(bitPattern: UInt32(truncatingIfNeeded: key)),
-                                    d: Double(cell.d), a: Double(cell.a)))
+                                    d: Double(cell.d), a: Double(cell.a),
+                                    s: Double(cell.s)))
         }
         out.sort { ($0.gx, $0.gz) < ($1.gx, $1.gz) }
         return out
@@ -1953,7 +1963,9 @@ final class Renderer {
         let gx = Int((x / 0.20).rounded(.down))
         let gz = Int((z / 0.20).rounded(.down))
         guard let c = snowPlow[Renderer.snowPlowKey(gx, gz)] else { return 0 }
-        let fade = max(0, 1 - abs(weatherSnowAmount - c.a) / 0.25)
+        let fadeA = max(0, min(1, 1 - abs(weatherSnowAmount - c.a) / 0.25))
+        let fadeS = max(0, min(1, 1 - (snowfallTotal - c.s) / 0.25))
+        let fade = min(fadeA, fadeS)
         return c.d * fade
     }
 
@@ -1966,7 +1978,7 @@ final class Renderer {
         if abs(value) < 0.002 {
             snowPlow.removeValue(forKey: key)
         } else {
-            snowPlow[key] = (d: value, a: aNow)
+            snowPlow[key] = (d: value, a: aNow, s: snowfallTotal)
         }
     }
 
@@ -1977,8 +1989,10 @@ final class Renderer {
         if increment == 0 { return }
         let key = Renderer.snowPlowKey(Int((x / 0.20).rounded(.down)),
                                        Int((z / 0.20).rounded(.down)))
-        let fadedOld = snowPlow[key].map {
-            $0.d * max(0, 1 - abs(aNow - $0.a) / 0.25) } ?? 0
+        let fadedOld = snowPlow[key].map { cell -> Float in
+            let fadeA = max(0, min(1, 1 - abs(aNow - cell.a) / 0.25))
+            let fadeS = max(0, min(1, 1 - (snowfallTotal - cell.s) / 0.25))
+            return cell.d * min(fadeA, fadeS) } ?? 0
         setPlowCell(x: x, z: z, value: fadedOld + increment, aNow: aNow)
     }
 
@@ -3978,6 +3992,7 @@ final class Renderer {
         // v4.5: Play-eye head exclusion, forwarded to both
         // kernels through the one uniforms() both consume.
         u.hidePlayerHead = hidePlayerHead ? 1 : 0
+        u.freezeFrac = weatherFreeze
         return u
     }
 
@@ -4229,7 +4244,7 @@ final class Renderer {
         var p = TonemapParams(samples: max(sampleCount, 1), exposure: exposure)
         if shimmer {
             p.shimmerTime = weatherDynTime
-            p.shimmerRain = weatherMode == 1 ? weatherDynRain : 0
+            p.shimmerRain = (weatherMode == 1 ? weatherDynRain : 0) * (1 - weatherFreeze)
             p.wetLevel = weatherWet
         }
         return p

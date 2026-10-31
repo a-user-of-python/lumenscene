@@ -82,6 +82,7 @@ struct Uniforms {
     float rainFrac;            // v3.2: live rain intensity (retained for layout; v3.3: unused by the trace kernel)
     uint dynTriCount;          // v4: dynamic-layer triangle count (unified ids start at triCount)
     uint hidePlayerHead;       // v4.5: 1 while the camera is the Play first-person eye — the player figure's head/hair (FLAG_PLAYER_HEAD) are excluded from PRIMARY hits only (was padDyn; layout unchanged)
+    float freezeFrac;          // v4.7: puddle freeze fraction 0...1 (tail field; mirrors Renderer.swift GPUUniforms)
 };
 
 struct Material {
@@ -662,6 +663,11 @@ kernel void pathTraceKernel(
             albedo *= (1.0f - 0.5f * puddle);
             gloss = max(gloss, puddle);
             shadingN = normalize(mix(shadingN, geoN, puddle));
+            // v4.7: mask puddles freeze coherently with sheets.
+            if (u.freezeFrac > 0.001f) {
+                float3 iceCol = float3(0.55f, 0.65f, 0.75f);
+                albedo = mix(albedo, iceCol, clamp(puddle * u.freezeFrac, 0.0f, 1.0f) * 0.92f);
+            }
         }
         // 3. Snow: whitened, gloss killed, normal mounded by the
         // drift gradient (or softened toward the face, as v3).
@@ -712,6 +718,11 @@ kernel void pathTraceKernel(
             // against the floor beneath, and tracks the camera.
             gloss = 0.97f;
             shadingN = geoN;
+            // v4.7: frozen sheets shade as pale ice (still mirror).
+            if (u.freezeFrac > 0.001f) {
+                float3 iceCol = float3(0.55f, 0.65f, 0.75f);
+                albedo = mix(albedo, iceCol, clamp(u.freezeFrac, 0.0f, 1.0f) * 0.92f);
+            }
         }
 
         // ---- Glass: reflect / refract with Fresnel. Past the

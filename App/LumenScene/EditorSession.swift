@@ -85,6 +85,8 @@ final class EditorSession: ObservableObject {
     private var playBuildupSnow: Double = 0
     private var playGeoStepWet: Int = 0
     private var playGeoStepSnow: Int = 0
+    private var playSnowfallTotal: Double = 0
+    private var playBuildupFreeze: Double = 0
 
     /// v4.1 (§3.4): Play player speed in m/s. Session-only (NOT
     /// persisted); Play entry resets it to the v4.0 constant.
@@ -162,6 +164,11 @@ final class EditorSession: ObservableObject {
     /// the app speaks is derived: p = A / maxDepth (see below).
     private var buildupWet: Double = 0
     private var buildupSnow: Double = 0
+    /// v4.7: cumulative snowfall clock (metres fallen, uncapped,
+    /// non-published per frame like the other accumulators).
+    private var snowfallTotal: Double = 0
+    /// v4.7: puddle freeze fraction 0...1 (non-published).
+    private var buildupFreeze: Double = 0
 
     // MARK: v4.3 snow depth / exposure / footprints / player figure
 
@@ -275,6 +282,8 @@ final class EditorSession: ObservableObject {
         // that is exactly the old build-up).
         buildupSnow = project.scene.weather.snowAmount
             ?? (project.scene.weather.snow * project.scene.weather.maxDepth)
+        snowfallTotal = project.scene.weather.snowfallTotal ?? 0
+        buildupFreeze = min(1, max(0, project.scene.weather.puddleFreeze ?? 0))
         // v4.3 (§4): seed the per-object exposure map. A persisted
         // value wins; absent means the object had fully caught
         // up with the ambient snow (old projects keep their look).
@@ -295,10 +304,13 @@ final class EditorSession: ObservableObject {
         // v4.6: hand the renderer the saved plow layer BEFORE
         // the first rebuild, so a project saved with trails
         // opens with them in place. Old files have none.
+        renderer.snowfallTotal = Float(snowfallTotal)
+        renderer.weatherFreeze = Float(buildupFreeze)
         renderer.snowPlow = Dictionary(
             uniqueKeysWithValues: (project.scene.weather.plowCells ?? []).map {
                 (Renderer.snowPlowKey(Int($0.gx), Int($0.gz)),
-                 (d: Float($0.d), a: Float($0.a)))
+                 (d: Float($0.d), a: Float($0.a),
+                  s: Float($0.s ?? snowfallTotal)))
             })
         // v3.4: seed the renderer's quantised geometry levels
         // from the saved build-up BEFORE the first rebuild, so a
@@ -885,6 +897,8 @@ final class EditorSession: ObservableObject {
             playBuildupSnow = buildupSnow
             playGeoStepWet = geoStepWet
             playGeoStepSnow = geoStepSnow
+            playSnowfallTotal = snowfallTotal
+            playBuildupFreeze = buildupFreeze
             // v4.1 (Appendix B): every new session state resets
             // on Play entry.
             playSpeed = 2.4
@@ -947,6 +961,8 @@ final class EditorSession: ObservableObject {
             // session state (Appendix B: resets in BOTH branches).
             buildupWet = playBuildupWet
             buildupSnow = playBuildupSnow
+            snowfallTotal = playSnowfallTotal
+            buildupFreeze = playBuildupFreeze
             geoStepWet = playGeoStepWet
             geoStepSnow = playGeoStepSnow
             renderer.weatherGeoWet = Float(geoStepWet) / 24
@@ -1518,6 +1534,11 @@ final class EditorSession: ObservableObject {
         // byte-identical saves.
         let plow = renderer.exportSnowPlow()
         project.scene.weather.plowCells = plow.isEmpty ? nil : plow
+        // v4.7: snowfall clock + freeze fraction persist the
+        // same way — nil at their zero values so untouched
+        // projects keep byte-identical saves.
+        project.scene.weather.snowfallTotal = snowfallTotal == 0 ? nil : snowfallTotal
+        project.scene.weather.puddleFreeze = buildupFreeze == 0 ? nil : buildupFreeze
     }
 
     /// v4.3: the quantised exposure step of one A-value, in
@@ -1616,6 +1637,42 @@ final class EditorSession: ObservableObject {
         bakedExposureSteps = snowExposureA.mapValues { exposureStep(for: $0) }
         scheduleRebuild(geometry: true)
         kickRender()
+    }
+
+    /// v4.7 (Weather sheet): set the temperature (°C), or nil
+    /// to clear it back to legacy behaviour. An explicit user
+    /// action, so the published write is legitimate (same
+    /// precedent as setMaxSnowDepth; not undoable).
+    func setTemperature(_ c: Double?) {
+        project.scene.weather.temperature = c.map { min(30, max(-20, $0)) }
+        renderer.resetAccumulation()
+        kickRender()
+    }
+
+    /// v4.7: live temperature accessors for the UI.
+    var liveTemperature: Double? { project.scene.weather.temperature }
+    var liveFreeze: Double { buildupFreeze }
+    var liveSnowfallTotal: Double { snowfallTotal }
+    /// Formatted temperature with the real minus sign, e.g.
+    /// "+10.0 °C" / "−4.5 °C" / "0.0 °C".
+    var liveTemperatureText: String {
+        guard let t = liveTemperature else { return "" }
+        if t > 0 { return String(format: "+%.1f °C", t) }
+        if t < 0 { return "−" + String(format: "%.1f °C", abs(t)) }
+        return "0.0 °C"
+    }
+    /// v4.7: footer status line wording by regime (nil when
+    /// temperature is unset — legacy projects show nothing).
+    var temperatureStatusText: String? {
+        guard let t = liveTemperature else { return nil }
+        let txt = liveTemperatureText
+        if t < 0 {
+            return buildupFreeze >= 0.99 ? "\(txt) — puddles frozen"
+                                         : "\(txt) — puddles freezing"
+        }
+        if t == 0 { return "\(txt) — freezing point" }
+        if buildupSnow > 0.005 { return "\(txt) — snow melting" }
+        return "\(txt) — above freezing"
     }
 
     /// v4.3 (Weather sheet): re-roll this project's snow pattern.
@@ -1887,13 +1944,34 @@ final class EditorSession: ObservableObject {
             // the v3/v4.2 level rates × 0.3 exactly.
             let depth = snowMaxDepth > 0 ? snowMaxDepth : 0.3
             let snowAmountBefore = buildupSnow
-            switch mode {
+            // v4.7: phase layer. temperature == nil is LEGACY:
+            // effMode == stored mode and every term below is
+            // exactly v4.6. When set, sub-freezing turns stored
+            // rain into snow and above-freezing turns stored
+            // snow into rain, for dynamics and display alike.
+            let temperature = project.scene.weather.temperature
+            var effMode = mode
+            if let t = temperature {
+                if t <= 0 && mode == 1 { effMode = 2 }
+                if t > 0 && mode == 2 { effMode = 1 }
+            }
+            // v4.7: cumulative snowfall clock — advances by the
+            // pre-cap growth increment whenever the EFFECTIVE
+            // mode is snow, so plow trails heal even at the cap.
+            if effMode == 2 {
+                snowfallTotal += (depth / 100) * weatherRateScale * dynIntensity * Double(dt)
+            }
+            switch effMode {
             case 1:
                 buildupWet = min(1, buildupWet + Double(dt) * weatherRateScale / 75 * dynIntensity)
                 // Rain melts snow: the old level rate (1/300,
                 // intensity-blended) × maxDepth, in A units.
-                buildupSnow = max(0, buildupSnow - depth * Double(dt) * weatherRateScale / 300
-                                        * (0.6 + 0.4 * dynIntensity))
+                // v4.7: suppressed when temperature is set — the
+                // temperature melt below governs shrink instead.
+                if temperature == nil {
+                    buildupSnow = max(0, buildupSnow - depth * Double(dt) * weatherRateScale / 300
+                                            * (0.6 + 0.4 * dynIntensity))
+                }
             case 2:
                 if buildupSnow < snowMaxDepth {
                     // 100 s to the target depth, surge-scaled —
@@ -1904,15 +1982,42 @@ final class EditorSession: ObservableObject {
                     // The target was lowered under deep snow:
                     // slow COMPACTION toward it (900 s scale,
                     // half rate), never below it while snowing.
+                    // Compaction stays in all regimes (v4.7).
                     buildupSnow = max(snowMaxDepth, buildupSnow
                         - (depth / 900) * 0.5 * weatherRateScale * Double(dt))
                 }
             case 0:
                 buildupWet = max(0, buildupWet - Double(dt) * weatherRateScale / 600)
                 // Full melt in ~15 min at the default depth.
-                buildupSnow = max(0, buildupSnow - (depth / 900) * weatherRateScale * Double(dt))
+                // v4.7: suppressed when temperature is set (the
+                // temperature melt governs; freezing air never
+                // thaws) — legacy only when temperature is nil.
+                if temperature == nil {
+                    buildupSnow = max(0, buildupSnow - (depth / 900) * weatherRateScale * Double(dt))
+                }
             default:
                 break
+            }
+            // v4.7: temperature melt + meltwater + freeze.
+            if let t = temperature {
+                if t > 0 {
+                    let beforeMelt = buildupSnow
+                    let meltRate = (depth / 900) * (t / 2.5) * weatherRateScale
+                    buildupSnow = max(0, buildupSnow - meltRate * Double(dt))
+                    let melted = beforeMelt - buildupSnow
+                    if melted > 0 {
+                        buildupWet = min(1, buildupWet + melted * 0.5)
+                    }
+                    buildupFreeze = max(0, buildupFreeze
+                        - Double(dt) * (1 + t / 10) / 180)
+                } else {
+                    buildupFreeze = min(1, buildupFreeze
+                        + Double(dt) * (1 + (-t) / 5) / 240)
+                }
+            } else if buildupFreeze > 0 {
+                // Defensive: with temperature unset the freeze
+                // fraction eases to 0 at the +10 °C thaw rate.
+                buildupFreeze = max(0, buildupFreeze - Double(dt) * 2 / 180)
             }
             // v4.3 (§4): per-object exposure follows the ambient
             // A. Growth (snowing only) lifts every entry below A
@@ -1920,7 +2025,7 @@ final class EditorSession: ObservableObject {
             // exactly by their age. Any shrink clamps entries
             // down to A. All in the non-published map.
             let dA = buildupSnow - snowAmountBefore
-            if dA > 0, mode == 2 {
+            if dA > 0, effMode == 2 {
                 let cap = Float(buildupSnow)
                 let delta = Float(dA)
                 for key in snowExposureA.keys {
@@ -1931,7 +2036,19 @@ final class EditorSession: ObservableObject {
                 clampExposuresToAmbient()
             }
         }
-        renderer.weatherMode = project.scene.weather.mode
+        // v4.7: renderer sees the EFFECTIVE mode (phase layer
+        // recomputed here for the every-frame writes; when
+        // temperature is nil this is exactly the stored mode).
+        let rendererEffMode: Int = {
+            let stored = project.scene.weather.mode
+            guard let t = project.scene.weather.temperature else { return stored }
+            if t <= 0 && stored == 1 { return 2 }
+            if t > 0 && stored == 2 { return 1 }
+            return stored
+        }()
+        renderer.weatherMode = rendererEffMode
+        renderer.snowfallTotal = Float(snowfallTotal)
+        renderer.weatherFreeze = Float(buildupFreeze)
         renderer.weatherWet = Float(buildupWet)
         // v4.3: the continuous shading level is the clamped
         // PROGRESS; the absolute amount and target depth travel
@@ -1943,7 +2060,7 @@ final class EditorSession: ObservableObject {
         renderer.weatherDynTime = Float(weatherClock
             .truncatingRemainder(dividingBy: 3600))
         renderer.weatherDynIntensity = Float(dynIntensity)
-        renderer.weatherDynRain = project.scene.weather.mode == 1
+        renderer.weatherDynRain = rendererEffMode == 1
             ? Float(dynIntensity) : 0
         renderer.weatherWind = dynWind
         // v3.4: weather GEOMETRY follows the build-up in

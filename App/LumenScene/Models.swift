@@ -260,6 +260,17 @@ struct WeatherState: Codable, Equatable {
     /// only cells a plow has touched are stored. nil in old
     /// files = no trails (pristine snow).
     var plowCells: [SnowPlowCell]? = nil
+    /// v4.7: cumulative snowfall clock (metres of snow fallen,
+    /// uncapped). Plow trails heal as this advances, even when
+    /// A is pinned at the cap. nil in old files = 0.
+    var snowfallTotal: Double? = nil
+    /// v4.7: air temperature in °C. nil = NEVER SET = legacy
+    /// behaviour exactly (no phase conversion, no temperature
+    /// melt/freeze). When set it governs rain/snow phase,
+    /// snowpack melt, and puddle freeze.
+    var temperature: Double? = nil
+    /// v4.7: puddle freeze fraction 0...1. nil in old files = 0.
+    var puddleFreeze: Double? = nil
 }
 
 /// v4.6: one touched cell of the snow displacement layer.
@@ -278,6 +289,11 @@ struct SnowPlowCell: Codable, Equatable {
     var gz: Int32
     var d: Double
     var a: Double
+    /// v4.7: cumulative snowfall total when last touched.
+    /// nil on decode = legacy cell; the session's import maps
+    /// nil to the project's loaded snowfallTotal, so a legacy
+    /// trail's heal clock starts at load.
+    var s: Double? = nil
 }
 
 // MARK: - Trigger areas
@@ -431,6 +447,7 @@ extension CameraState {
 extension WeatherState {
     private enum CodingKeys: String, CodingKey {
         case mode, wetness, snow, maxDepth, seed, snowAmount
+        case plowCells, snowfallTotal, temperature, puddleFreeze
     }
 
     // Hand-written defensive Decodable (previously synthesised):
@@ -449,6 +466,10 @@ extension WeatherState {
         maxDepth = (try? c.decodeIfPresent(Double.self, forKey: .maxDepth)) ?? nil ?? 0.3
         seed = (try? c.decodeIfPresent(UInt32.self, forKey: .seed)) ?? nil ?? 0
         snowAmount = (try? c.decodeIfPresent(Double.self, forKey: .snowAmount)) ?? nil
+        plowCells = (try? c.decodeIfPresent([SnowPlowCell].self, forKey: .plowCells)) ?? nil
+        snowfallTotal = (try? c.decodeIfPresent(Double.self, forKey: .snowfallTotal)) ?? nil
+        temperature = (try? c.decodeIfPresent(Double.self, forKey: .temperature)) ?? nil
+        puddleFreeze = (try? c.decodeIfPresent(Double.self, forKey: .puddleFreeze)) ?? nil
     }
 }
 

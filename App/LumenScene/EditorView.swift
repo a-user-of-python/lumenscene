@@ -314,12 +314,42 @@ struct EditorView: View {
             set: { session.setMaxSnowDepth($0) })
     }
 
+    /// v4.7: binding for the Temperature slider — writes go
+    /// through the session's explicit settings call.
+    private var temperatureBinding: Binding<Double> {
+        Binding(
+            get: { session.project.scene.weather.temperature ?? 10.0 },
+            set: { session.setTemperature($0) })
+    }
+
     /// v4.3: the Snow settings sheet (from the Weather menu):
     /// the user-set Max Snow Depth, the per-project snow pattern
     /// seed with a re-roll, and the live depth readout.
     private var snowSettingsSheet: some View {
         NavigationStack {
             Form {
+                Section {
+                    if session.project.scene.weather.temperature == nil {
+                        Text("Not set — rain and snow behave as they always have.")
+                            .foregroundStyle(.secondary)
+                        Button("Set temperature") { session.setTemperature(10.0) }
+                    } else {
+                        HStack {
+                            Text("Temperature")
+                            Spacer()
+                            Text(session.liveTemperatureText)
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        Slider(value: temperatureBinding, in: -20...30, step: 0.5)
+                        Text("At or below freezing, rain falls as snow and puddles freeze into ice. Above freezing, snow falls as rain and the snowpack melts, faster the warmer it is.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button("Clear temperature") { session.setTemperature(nil) }
+                    }
+                } header: {
+                    Text("Temperature")
+                }
                 Section {
                     HStack {
                         Text("Max Snow Depth")
@@ -513,6 +543,15 @@ struct EditorView: View {
                 Text(String(format: "Snow depth: %.2f m of %.2f m max",
                             session.liveSnowAmount,
                             session.project.scene.weather.maxDepth))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, session.temperatureStatusText == nil ? 8 : 2)
+            }
+            // v4.7: temperature status, only when temperature
+            // is set — e.g. "−4.5 °C — puddles freezing".
+            if let tempStatus = session.temperatureStatusText {
+                Text(tempStatus)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
