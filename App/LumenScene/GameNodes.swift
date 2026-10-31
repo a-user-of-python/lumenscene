@@ -104,18 +104,8 @@ extension LogicNode {
     // encode(to:) stays synthesised — see Models.swift.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        if let decoded = try? c.decodeIfPresent(UUID.self, forKey: .id),
-           let value = decoded {
-            id = value
-        } else {
-            id = UUID()
-        }
-        if let decoded = try? c.decodeIfPresent(String.self, forKey: .kind),
-           let value = decoded {
-            kind = value
-        } else {
-            kind = ""
-        }
+        id = (try? c.decodeIfPresent(UUID.self, forKey: .id)) ?? nil ?? UUID()
+        kind = (try? c.decodeIfPresent(String.self, forKey: .kind)) ?? nil ?? ""
         var decodedParams: [String: NodeParam] = [:]
         if let paramContainer = try? c.nestedContainer(keyedBy: AnyParamKey.self,
                                                        forKey: .params) {
@@ -126,18 +116,8 @@ extension LogicNode {
             }
         }
         params = decodedParams
-        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .x),
-           let value = decoded {
-            x = value
-        } else {
-            x = 0
-        }
-        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .y),
-           let value = decoded {
-            y = value
-        } else {
-            y = 0
-        }
+        x = (try? c.decodeIfPresent(Double.self, forKey: .x)) ?? nil ?? 0
+        y = (try? c.decodeIfPresent(Double.self, forKey: .y)) ?? nil ?? 0
     }
 }
 
@@ -165,36 +145,11 @@ extension NodeLink {
     init(from decoder: Decoder) throws {
         let zero = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        if let decoded = try? c.decodeIfPresent(UUID.self, forKey: .id),
-           let value = decoded {
-            id = value
-        } else {
-            id = UUID()
-        }
-        if let decoded = try? c.decodeIfPresent(UUID.self, forKey: .from),
-           let value = decoded {
-            from = value
-        } else {
-            from = zero
-        }
-        if let decoded = try? c.decodeIfPresent(String.self, forKey: .fromPin),
-           let value = decoded {
-            fromPin = value
-        } else {
-            fromPin = "out"
-        }
-        if let decoded = try? c.decodeIfPresent(UUID.self, forKey: .to),
-           let value = decoded {
-            to = value
-        } else {
-            to = zero
-        }
-        if let decoded = try? c.decodeIfPresent(String.self, forKey: .toPin),
-           let value = decoded {
-            toPin = value
-        } else {
-            toPin = "in"
-        }
+        id = (try? c.decodeIfPresent(UUID.self, forKey: .id)) ?? nil ?? UUID()
+        from = (try? c.decodeIfPresent(UUID.self, forKey: .from)) ?? nil ?? zero
+        fromPin = (try? c.decodeIfPresent(String.self, forKey: .fromPin)) ?? nil ?? "out"
+        to = (try? c.decodeIfPresent(UUID.self, forKey: .to)) ?? nil ?? zero
+        toPin = (try? c.decodeIfPresent(String.self, forKey: .toPin)) ?? nil ?? "in"
     }
 }
 
