@@ -100,6 +100,7 @@ constant uint FLAG_GLASS = 2u;
 constant uint FLAG_TRIPLANAR = 4u;
 constant uint FLAG_FIT = 8u;
 constant uint FLAG_SHEET = 16u;   // v3.4: puddle water sheet (real geometry)
+constant uint FLAG_SNOW = 32u;    // v4.4: snow sheet (real geometry, always snow material)
 
 // MARK: - RNG (xorshift128, seeded per pixel + frame)
 
@@ -521,6 +522,16 @@ kernel void pathTraceKernel(
         // no snow cover, no second puddle mask on the water
         // itself (the sheet's placement already IS the mask).
         bool isSheet = (mat.flags & FLAG_SHEET) != 0u;
+        // v4.4: snow sheet geometry (FLAG_SNOW) shades as
+        // snow and only snow — it skips the weather block
+        // below exactly like the water sheet does (no wet
+        // darkening, no gloss change, no SECOND snow cover
+        // computed over the snow itself), and since the flag
+        // replaces the host material entirely, the glass and
+        // emissive branches above can never claim it either:
+        // its albedo is the material's snow colour times the
+        // per-vertex drift shade baked CPU-side.
+        bool isSnow = (mat.flags & FLAG_SNOW) != 0u;
         // Shaped weather field: defaults are exactly the
         // v3 global behaviour (wetF = wet, snowCover = snowGlobal,
         // no puddle, drift 0.5, depth = snowGlobal). The shaped
@@ -541,7 +552,7 @@ kernel void pathTraceKernel(
         // the un-faded case identical to no field at all.
         float4 wfield = float4(0.0f, 0.5f, 0.5f, 0.489f);
         float fieldFade = 0.0f;
-        if (!isSheet && (u.wetLevel > 0.001f || u.snowLevel > 0.001f) && bounce <= 1u) {
+        if (!isSheet && !isSnow && (u.wetLevel > 0.001f || u.snowLevel > 0.001f) && bounce <= 1u) {
             // ONE bilinear fetch replaces the ~75 per-hit hash
             // evaluations of the procedural v3.1/v3.2 block. The
             // field window is 64 m across, centred on the
@@ -608,7 +619,7 @@ kernel void pathTraceKernel(
             depth = u.snowLevel * mix(0.3f, 1.7f, drift);
             snowCover = smoothstep(0.45f, 0.75f, depth) * upFace;
         }
-        if (!isSheet) {
+        if (!isSheet && !isSnow) {
         // 1. Wet: darkened, glossier.
         if (wetF > 0.001f) {
             albedo *= (1.0f - 0.45f * wetF);
@@ -666,7 +677,7 @@ kernel void pathTraceKernel(
                 shadingN = normalize(mix(shadingN, geoN, snowCover * 0.6f));
             }
         }
-        } // !isSheet — weather steps 1-3 skipped for water sheets
+        } // !isSheet && !isSnow — weather steps 1-3 skipped for water and snow sheets
         if (isSheet) {
             // Standing water: near-mirror gloss, and the shading
             // normal is the sheet's real (flat) surface normal,
@@ -944,6 +955,13 @@ kernel void guideKernel(
         // v3.4: water sheets are pure reflection — view-dependent,
         // never seeded from history (same treatment as glass).
         reusable = 0.0f;
+    } else if ((mat.flags & FLAG_SNOW) != 0u) {
+        // v4.4: the snow sheet is a matte diffuse surface —
+        // full history reuse, and the weather mirror below
+        // must not run for it (its puddle term would restart
+        // history on snow that happens to lie over a puddle
+        // area of the field, and its gloss model describes
+        // the HOST surface under the snow, not the snow).
     } else if (reusable > 0.5f) {
         // v3.4 (reflection ghosting fix): history reuse is
         // anchored on the primary hit POSITION — the right anchor

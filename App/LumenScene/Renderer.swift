@@ -454,12 +454,15 @@ final class Renderer {
     var objectSnowAmounts: [UUID: Float] = [:]
     /// v4.3: player footprint stamps in snow, newest last
     /// (the session caps the list). Consumed by the imprint
-    /// pass in appendWeatherGeometry at rebuild time.
+    /// pass in appendSnowSheet at rebuild time.
     var snowFootprints: [SnowFootprint] = []
     /// True when the last geometry rebuild emitted water sheets —
     /// the material table then carries the sheet material last,
     /// and updateMaterialsOnly must reproduce it exactly.
     private var sceneHasSheetMaterial = false
+    /// v4.4: same discipline for the snow sheet's material,
+    /// which sits right after the sheet material in the table.
+    private var sceneHasSnowMaterial = false
     // v3.4 dynamic resolution (motion frames only): a multiplier
     // on the tier's motion scale, driven by the delivered frame
     // cadence from command-buffer completion deltas. 1.0 is the
@@ -975,7 +978,6 @@ final class Renderer {
             guard let local = includedLocalMesh(for: obj, meshes: meshes) else { continue }
             included.append((obj, local, local.baked(by: obj.transform.matrix)))
         }
-        let sheetMatIndex = UInt32(included.count)
         let weatherGeoActive = weatherGeoWet > 0.001 || weatherGeoSnow > 0.001
             || weatherSnowAmount > 0.001
             || objectSnowAmounts.values.contains { $0 > 0.001 }
@@ -986,36 +988,54 @@ final class Renderer {
         // fresh here, nothing is stored between rebuilds.
         let snowIntruders = buildSnowIntruders(included: included)
         var triBudget = 220_000
-        var sheetEmitted = false
         for (obj, _, world) in included {
             let matIndex = UInt32(materials.count)
             materials.append(gpuMaterialForObject(obj))
             objectOrder.append(obj.id)
-            if weatherGeoActive {
-                appendWeatherGeometry(world: world, objectID: obj.id,
-                                      snowAmount: objectSnowAmounts[obj.id] ?? weatherSnowAmount,
-                                      intruders: snowIntruders,
-                                      matIndex: matIndex, sheetIndex: sheetMatIndex,
-                                      positions: &positions, normals: &normals,
-                                      uvs: &uvArr, colors: &colArr,
-                                      indices: &indices, triMats: &triMats,
-                                      triObjects: &triObjects,
-                                      budget: &triBudget, sheetEmitted: &sheetEmitted)
-            } else {
-                let vBase = UInt32(positions.count / 3)
-                positions += world.positions
-                normals += world.normals
-                uvArr += world.uvs
-                colArr += world.colors
-                for t in 0..<world.triangleCount {
-                    let a = world.indices[3 * t], b = world.indices[3 * t + 1], c = world.indices[3 * t + 2]
-                    indices += [vBase + a, vBase + b, vBase + c]
-                    triMats.append(matIndex)
-                    triObjects.append(obj.id)
-                }
+            // v4.4: host geometry is appended FLAT, always.
+            // Snow and puddle water are no longer carved out
+            // of the host's own triangles — through v4.3
+            // appendWeatherGeometry subdivided up-facing host
+            // triangles and displaced them, which bound the
+            // snow surface to the host's tessellation (a
+            // 2-triangle plane grew crystalline facets and
+            // zero-depth trenches along its own edges at deep
+            // accumulation) and to the host's material (snow
+            // on glass shaded as glass). The weather sheet
+            // pass below now owns all of it.
+            let vBase = UInt32(positions.count / 3)
+            positions += world.positions
+            normals += world.normals
+            uvArr += world.uvs
+            colArr += world.colors
+            for t in 0..<world.triangleCount {
+                let a = world.indices[3 * t], b = world.indices[3 * t + 1], c = world.indices[3 * t + 2]
+                indices += [vBase + a, vBase + b, vBase + c]
+                triMats.append(matIndex)
+                triObjects.append(obj.id)
             }
         }
+        // v4.4: the weather sheet pass — one world-space
+        // lattice draped over the sampled support surfaces,
+        // emitting the snow sheet (FLAG_SNOW material) and
+        // the puddle water sheets (FLAG_SHEET material). The
+        // material indices are deterministic — sheet first,
+        // then snow, both right after the object materials —
+        // so updateMaterialsOnly reproduces the table exactly
+        // via sceneHasSheetMaterial / sceneHasSnowMaterial.
+        var sheetEmitted = false
+        var snowEmitted = false
+        if weatherGeoActive {
+            appendSnowSheet(included: included, intruders: snowIntruders,
+                            positions: &positions, normals: &normals,
+                            uvs: &uvArr, colors: &colArr,
+                            indices: &indices, triMats: &triMats,
+                            triObjects: &triObjects, budget: &triBudget,
+                            sheetEmitted: &sheetEmitted,
+                            snowEmitted: &snowEmitted)
+        }
         sceneHasSheetMaterial = sheetEmitted
+        sceneHasSnowMaterial = snowEmitted
         cachedStaticMaterials = materials
 
         triCount = indices.count / 3
@@ -1346,6 +1366,33 @@ final class Renderer {
         return g
     }
 
+    /// v4.4: the snow material — one shared entry appended
+    /// after the puddle sheet material whenever the snow
+    /// sheet emitted geometry. FLAG_SNOW (32) routes it to
+    /// the snow branch of the trace kernel: opaque, matte,
+    /// blue-white — snow shades as snow whatever the object
+    /// underneath is made of (glass, emissive, textured).
+    /// Through v4.3 the snow geometry carried the HOST
+    /// object's material index, so snow lying on a glass box
+    /// took the glass path and refracted like glass (Sean's
+    /// device report 2026-10-31: "snow still turns to glass
+    /// on glass objects").
+    private func snowMaterial() -> GPUMaterial {
+        var g = GPUMaterial()
+        g.baseColor = SIMD4<Float>(0.88, 0.91, 0.97, 0)
+        g.emissive = SIMD4<Float>(0, 0, 0, 0)
+        g.glassParams = SIMD4<Float>(0, 0, 1.0, 0)
+        g.tint = SIMD4<Float>(1, 1, 1, 1)
+        g.texIndex = 0
+        g.flags = 32
+        // Same audit rule as the sheet material: every table
+        // entry carries an explicit exposure factor (1.0).
+        // The kernels skip the weather block for FLAG_SNOW,
+        // so this is belt-and-braces.
+        g.pad = SIMD2<UInt32>(0x3F800000, 0)
+        return g
+    }
+
     // MARK: - Weather geometry (v3.4: snow and puddles become solid)
     //
     // Through v3.3, build-up weather was shading only: snow
@@ -1357,26 +1404,30 @@ final class Renderer {
     // makes both REAL, inside rebuild(), from the same fields
     // the shader shades with:
     //
-    //   * SNOW: up-facing triangles are subdivided (target edge
-    //     ~0.22 m) and their vertices displaced upward by the
-    //     drift-shaped snow depth, up to ~0.30 m at full cover.
-    //     A barycentric edge fade pins every original triangle
-    //     boundary to zero displacement, so displaced patches
-    //     meet undisplaced neighbours with no cracks, and objects
-    //     standing on snowy ground read as sitting IN the snow.
-    //     Vertex normals come from the heightfield gradient, so
-    //     drifts shade like solids — and since the displaced
-    //     triangles live in the acceleration structure, they
-    //     occlude, reflect and cast real shadows.
-    //   * PUDDLES: where the mirrored puddle mask is strong at a
-    //     subdivided triangle's centre, a water SHEET triangle
-    //     is emitted above the surface — up to ~13 mm at the
+    //   * SNOW (v3.4–v4.3 form): up-facing triangles were
+    //     subdivided and displaced upward by the drift-shaped
+    //     snow depth, with a barycentric edge fade pinning
+    //     every original triangle boundary to zero. v4.4
+    //     REPLACED that construction with the independent
+    //     lattice sheet further below (see "Snow support
+    //     field + weather sheet"): the fade carved full-depth
+    //     trenches along host edges at the new metre-scale
+    //     depths, the displaced surface inherited the host's
+    //     tessellation AND its material, and Sean's device
+    //     verdicts followed. The height FIELD below (drift,
+    //     coverage, accumulation) is unchanged — only the
+    //     surface built from it changed.
+    //   * PUDDLES: where the mirrored puddle mask is strong at
+    //     a lattice cell's centre, a water SHEET quad is
+    //     emitted above the surface — up to ~13 mm at the
     //     pool centre by depth, rim vertices tucked 2.5 mm
     //     BELOW the surface, so the edge is a tiny sloped wall
     //     that catches light at grazing angles instead of a
     //     painted outline. Sheets carry the host object's id
     //     (tapping a puddle selects its floor) and the shared
-    //     FLAG_SHEET material.
+    //     FLAG_SHEET material. (v3.4 emitted them per
+    //     subdivided host triangle; v4.4 emits them from the
+    //     same lattice as the snow sheet.)
     //
     // The field functions below are exact CPU mirrors of the
     // shader's baked-field formulas (same hashes, same
@@ -1384,8 +1435,8 @@ final class Renderer {
     // drifts and pools are. Levels arrive quantised to steps of
     // 1/24 (the session rebuilds only when a step is crossed),
     // and a scene-wide budget caps added triangles; past the
-    // budget a surface keeps the v3.3 shading-only look rather
-    // than blowing the frame budget. Per-frame cost of all of
+    // budget the sheet simply stops growing rather than
+    // blowing the frame budget. Per-frame cost of all of
     // this is zero: the result is ordinary static geometry in
     // the same single acceleration structure.
 
@@ -1710,10 +1761,23 @@ final class Renderer {
                 inside = qx < 0 && qz < 0
                 if inside { insideDepth = min(-qx, -qz) }
             }
-            // Contact: the intruder's bottom must reach the
-            // (current) snow top. Airborne objects don't dent.
+            // Contact: the intruder's body must actually
+            // overlap the snow column at this vertex — its
+            // bottom reaches the (current) snow top AND its
+            // top rises above the host surface. Airborne
+            // objects don't dent (first test). v4.4: the
+            // second test matters — without it the ground
+            // plane (bottom 0, top 0) "crushed" the snow on
+            // every raised support standing on it, because
+            // its footprint covers the whole scene: a box
+            // top at y = 1 had its snow silently erased by
+            // the floor beneath it (host-side audit, v4.4:
+            // box-top centre 0.000 m vs 1.768 m of field
+            // snow). An intruder below the support cannot
+            // touch the snow lying on top of it.
             let snowTop = hostY + h
-            guard intr.bottomY < snowTop + 0.001 else { continue }
+            guard intr.bottomY < snowTop + 0.001,
+                  intr.worldMax.y > hostY + 0.001 else { continue }
             let hC = wgfClamp(intr.bottomY - 0.02 - hostY, 0, h)
             guard hC < h else { continue } // no compression → no rim either
             // Blend: soft inner lip inside, 0.30 m falloff outside.
@@ -1747,236 +1811,521 @@ final class Renderer {
         return h
     }
 
-    /// Append one object's world mesh with weather geometry
-    /// applied (see the section comment above).
-    private func appendWeatherGeometry(world: MeshData, objectID: UUID,
-                                       snowAmount: Float, intruders: [SnowIntruder],
-                                       matIndex: UInt32, sheetIndex: UInt32,
-                                       positions: inout [Float], normals: inout [Float],
-                                       uvs: inout [Float], colors: inout [Float],
-                                       indices: inout [UInt32], triMats: inout [UInt32],
-                                       triObjects: inout [UUID],
-                                       budget: inout Int, sheetEmitted: inout Bool) {
+    // MARK: - Snow support field + weather sheet (v4.4)
+    //
+    // The snow surface no longer derives from the host mesh.
+    // A regular lattice in world XZ (0.20 m cells, coarsened
+    // only if the support extent would break the triangle
+    // envelope) is draped over the scene's snow-holding
+    // surfaces: at each lattice vertex the SUPPORT — the
+    // topmost up-facing surface under that point, sampled
+    // from the real triangles, so a sphere gets a true curved
+    // cap and a rooftop its own height — plus the v4.3 snow
+    // HEIGHT function (drift field, absolute accumulation vs
+    // maxDepth, per-object exposure via the support host's
+    // own amount, imprints, footprints) gives the sheet's
+    // top. Because the height is a single-valued function of
+    // (x, z), the sheet is continuous by construction: no
+    // barycentric edge fade, no trenches along host triangle
+    // borders, no folds (a heightfield graph's geometric
+    // normal always has a positive Y component). Vertex
+    // normals are taps of the SAME total height function
+    // (support + snow), so the shading can never disagree
+    // with the surface the way the v4.3 fade-vs-taps mismatch
+    // did (audit: mean normal error 34 degrees inside the old
+    // fade band, 0.6 degrees for the tap scheme on the total
+    // function). Snow triangles carry the shared FLAG_SNOW
+    // material — never the host's — and puddle water sheets
+    // are emitted from the same lattice with the shared
+    // FLAG_SHEET material. Perimeter skirts drop from any
+    // sheet edge that was CUT at depth (a support ending in
+    // mid-air, a footprint cliff) to the support below, so
+    // deep snow never shows a torn open edge. Picking a snow
+    // or water triangle still selects the object whose
+    // surface carries it.
+
+    /// One snow-holding host triangle, registered in the
+    /// support index.
+    private struct SnowSupportTri {
+        var p0: SIMD3<Float>
+        var p1: SIMD3<Float>
+        var p2: SIMD3<Float>
+        var n0: SIMD3<Float>
+        var n1: SIMD3<Float>
+        var n2: SIMD3<Float>
+        var flatNY: Float
+        var hostID: UUID
+        /// The host object's own accumulated snow (v4.3
+        /// exposure) — the sheet above this host deepens with
+        /// the host's exposure, not the ambient amount.
+        var amount: Float
+    }
+
+    /// The support sampled at one point: the topmost
+    /// snow-holding surface there.
+    private struct SnowSupport {
+        var y: Float
+        var flatNY: Float
+        /// Barycentric-interpolated shading-normal Y of the
+        /// support — smooth over curved surfaces, where the
+        /// snow-shedding taper reads it.
+        var interpNY: Float
+        var hostID: UUID
+        var amount: Float
+    }
+
+    private func supportKey(_ gx: Int, _ gz: Int) -> Int64 {
+        (Int64(gx) << 32) ^ Int64(UInt32(bitPattern: Int32(gz)))
+    }
+
+    /// XZ spatial hash (0.5 m cells) of every included static
+    /// object's snow-holding triangles (flat normal Y > 0.5 —
+    /// steeper than ~60 degrees cannot hold snow or a puddle;
+    /// the shedding taper handles the rest).
+    private func buildSupportIndex(
+        included: [(obj: SceneObject, local: MeshData, world: MeshData)]
+    ) -> [Int64: [SnowSupportTri]] {
+        var grid: [Int64: [SnowSupportTri]] = [:]
+        for (obj, _, world) in included {
+            let amount = objectSnowAmounts[obj.id] ?? weatherSnowAmount
+            func wPos(_ idx: UInt32) -> SIMD3<Float> {
+                let i = Int(idx) * 3
+                return SIMD3<Float>(world.positions[i], world.positions[i + 1], world.positions[i + 2])
+            }
+            func wNrm(_ idx: UInt32) -> SIMD3<Float> {
+                let i = Int(idx) * 3
+                return SIMD3<Float>(world.normals[i], world.normals[i + 1], world.normals[i + 2])
+            }
+            for t in 0..<world.triangleCount {
+                let ia = world.indices[3 * t]
+                let ib = world.indices[3 * t + 1]
+                let ic = world.indices[3 * t + 2]
+                let p0 = wPos(ia), p1 = wPos(ib), p2 = wPos(ic)
+                let cr = simd_cross(p1 - p0, p2 - p0)
+                let cl = simd_length(cr)
+                if cl < 1e-12 { continue }
+                let flatNY = cr.y / cl
+                if flatNY <= 0.5 { continue }
+                let tri = SnowSupportTri(p0: p0, p1: p1, p2: p2,
+                                         n0: wNrm(ia), n1: wNrm(ib), n2: wNrm(ic),
+                                         flatNY: flatNY, hostID: obj.id,
+                                         amount: amount)
+                let gx0 = Int((min(p0.x, min(p1.x, p2.x)) / 0.5).rounded(.down))
+                let gx1 = Int((max(p0.x, max(p1.x, p2.x)) / 0.5).rounded(.down))
+                let gz0 = Int((min(p0.z, min(p1.z, p2.z)) / 0.5).rounded(.down))
+                let gz1 = Int((max(p0.z, max(p1.z, p2.z)) / 0.5).rounded(.down))
+                for gx in gx0...gx1 {
+                    for gz in gz0...gz1 {
+                        grid[supportKey(gx, gz), default: []].append(tri)
+                    }
+                }
+            }
+        }
+        return grid
+    }
+
+    /// The topmost snow-holding support at (x, z): among the
+    /// candidate triangles containing the point (XZ
+    /// barycentric), the highest interpolated surface wins.
+    private func sampleSupport(_ grid: [Int64: [SnowSupportTri]],
+                               x: Float, z: Float) -> SnowSupport? {
+        let gx = Int((x / 0.5).rounded(.down))
+        let gz = Int((z / 0.5).rounded(.down))
+        guard let cand = grid[supportKey(gx, gz)] else { return nil }
+        var best: SnowSupport? = nil
+        for tri in cand {
+            let ax = tri.p0.x, az = tri.p0.z
+            let bx = tri.p1.x, bz = tri.p1.z
+            let cx = tri.p2.x, cz = tri.p2.z
+            let den = (bz - cz) * (ax - cx) + (cx - bx) * (az - cz)
+            if abs(den) < 1e-12 { continue }
+            let wa = ((bz - cz) * (x - cx) + (cx - bx) * (z - cz)) / den
+            let wb = ((cz - az) * (x - cx) + (ax - cx) * (z - cz)) / den
+            let wc = 1 - wa - wb
+            if wa < -1e-5 || wb < -1e-5 || wc < -1e-5 { continue }
+            let y = tri.p0.y * wa + tri.p1.y * wb + tri.p2.y * wc
+            if let b = best, y <= b.y { continue }
+            let ny = tri.n0.y * wa + tri.n1.y * wb + tri.n2.y * wc
+            best = SnowSupport(y: y, flatNY: tri.flatNY,
+                               interpNY: wgfClamp(ny, 0, 1),
+                               hostID: tri.hostID, amount: tri.amount)
+        }
+        return best
+    }
+
+    /// The full snow column at (x, z): sampled support + the
+    /// v4.3 height function for the support host's own
+    /// accumulation, shed by the support's steepness, then
+    /// imprinted. `pre` lets a lattice vertex reuse the
+    /// support it already sampled at its exact position;
+    /// gradient taps pass nil and sample their own point, so
+    /// the taps and the vertex heights are the same function.
+    private func sheetColumn(x: Float, z: Float,
+                             grid: [Int64: [SnowSupportTri]],
+                             intruders: [SnowIntruder],
+                             snowPossible: Bool,
+                             pre: SnowSupport? = nil)
+        -> (support: SnowSupport, snowH: Float, topY: Float)? {
+        guard let s = pre ?? sampleSupport(grid, x: x, z: z) else { return nil }
+        var snowH: Float = 0
+        if snowPossible {
+            // Steep supports shed their snow: full depth on
+            // the flat, none where the surface tips past
+            // interpNY 0.55 (~57 degrees), full hold from
+            // 0.75 (~41 degrees). On curved supports the
+            // interpolated normal makes the pile feather out
+            // smoothly around the cap.
+            let taper = wgfSmooth(0.55, 0.75, s.interpNY)
+            snowH = imprintedSnowHeight(
+                x: x, z: z, hostY: s.y, hostID: s.hostID,
+                fieldH: wgfSnowHeight(x, z, amount: s.amount) * taper,
+                intruders: intruders)
+        }
+        return (s, snowH, s.y + snowH)
+    }
+
+    /// The v4.4 weather sheet pass: lattice over the support
+    /// union, snow sheet + puddle water sheets, charged
+    /// against the shared weather budget like the v3.4/v4.3
+    /// subdivision was.
+    private func appendSnowSheet(
+        included: [(obj: SceneObject, local: MeshData, world: MeshData)],
+        intruders: [SnowIntruder],
+        positions: inout [Float], normals: inout [Float],
+        uvs: inout [Float], colors: inout [Float],
+        indices: inout [UInt32], triMats: inout [UInt32],
+        triObjects: inout [UUID],
+        budget: inout Int,
+        sheetEmitted: inout Bool, snowEmitted: inout Bool) {
         let wet = weatherGeoWet
-        let snow = weatherGeoSnow
-        // v4.3: weatherGeoSnow remains the session's quantised
-        // on/off GATE for geometry snow; the actual depth now
-        // comes from this object's absolute accumulation
-        // (snowAmount = A_obj). The amount itself also opens
-        // the gate so a rebuild driven by amounts alone works.
-        let snowActive = snow > 0.001 || snowAmount > 0.001
+        let snowPossible = weatherGeoSnow > 0.001 || weatherSnowAmount > 0.001
+            || objectSnowAmounts.values.contains { $0 > 0.001 }
+        guard wet > 0.001 || snowPossible else { return }
+        let grid = buildSupportIndex(included: included)
+        guard !grid.isEmpty else { return }
+        // Extent: union of the included objects' world XZ
+        // bounds, clipped to the field's domain.
+        var lo = SIMD2<Float>(Float.greatestFiniteMagnitude, Float.greatestFiniteMagnitude)
+        var hi = -lo
+        for (_, _, world) in included {
+            let b = world.bounds
+            lo = simd_min(lo, SIMD2<Float>(b.min.x, b.min.z))
+            hi = simd_max(hi, SIMD2<Float>(b.max.x, b.max.z))
+        }
+        lo = simd_max(lo, SIMD2<Float>(-40, -40))
+        hi = simd_min(hi, SIMD2<Float>(40, 40))
+        let extX = hi.x - lo.x, extZ = hi.y - lo.y
+        guard extX > 0.01, extZ > 0.01 else { return }
+        // Cell size: 0.20 m — fine enough that drift features
+        // (~0.4 m and up) read as smooth piles. It coarsens
+        // only when the support extent would break the
+        // triangle envelope (~190k of the shared 220k).
+        var cs: Float = 0.20
+        if 2 * (extX / cs) * (extZ / cs) > 190_000 {
+            cs = sqrtf(2 * extX * extZ / 190_000)
+        }
+        let nx = max(1, Int((extX / cs).rounded(.up)))
+        let nz = max(1, Int((extZ / cs).rounded(.up)))
+        let ox = lo.x, oz = lo.y
+        let vx = nx + 1, vz = nz + 1
 
-        func wPos(_ idx: UInt32) -> SIMD3<Float> {
-            let i = Int(idx) * 3
-            return SIMD3<Float>(world.positions[i], world.positions[i + 1], world.positions[i + 2])
+        struct SheetVert {
+            var support: SnowSupport? = nil
+            var snowH: Float = 0
+            var topY: Float = 0
+            var normal: SIMD3<Float> = SIMD3<Float>(0, 1, 0)
+            var shade: Float = 1
+            var mask: Float = 0
+            var depth01: Float = 0
+            var snowCover: Float = 0
         }
-        func wNrm(_ idx: UInt32) -> SIMD3<Float> {
-            let i = Int(idx) * 3
-            return SIMD3<Float>(world.normals[i], world.normals[i + 1], world.normals[i + 2])
-        }
-        func wCol(_ idx: UInt32) -> SIMD3<Float> {
-            let i = Int(idx) * 3
-            return SIMD3<Float>(world.colors[i], world.colors[i + 1], world.colors[i + 2])
-        }
-        func wUV(_ idx: UInt32) -> SIMD2<Float> {
-            let i = Int(idx) * 2
-            return SIMD2<Float>(world.uvs[i], world.uvs[i + 1])
-        }
-        // One undisplaced triangle with its source attributes —
-        // the v3.3 shading-only look.
-        func emitFlat(_ a: UInt32, _ b: UInt32, _ c: UInt32) {
-            let base = UInt32(positions.count / 3)
-            for v in [a, b, c] {
-                let p = wPos(v), n = wNrm(v), t = wUV(v), cl = wCol(v)
-                positions.append(contentsOf: [p.x, p.y, p.z])
-                normals.append(contentsOf: [n.x, n.y, n.z])
-                uvs.append(contentsOf: [t.x, t.y])
-                colors.append(contentsOf: [cl.x, cl.y, cl.z])
-            }
-            indices.append(contentsOf: [base, base + 1, base + 2])
-            triMats.append(matIndex)
-            triObjects.append(objectID)
-        }
+        var verts = [SheetVert](repeating: SheetVert(), count: vx * vz)
+        func vIdx(_ i: Int, _ j: Int) -> Int { j * vx + i }
+        func vX(_ i: Int) -> Float { ox + Float(i) * cs }
+        func vZ(_ j: Int) -> Float { oz + Float(j) * cs }
 
-        for t in 0..<world.triangleCount {
-            let ia = world.indices[3 * t]
-            let ib = world.indices[3 * t + 1]
-            let ic = world.indices[3 * t + 2]
-            let p0 = wPos(ia), p1 = wPos(ib), p2 = wPos(ic)
-            let cr = simd_cross(p1 - p0, p2 - p0)
-            let cl = simd_length(cr)
-            if cl < 1e-12 { emitFlat(ia, ib, ic); continue }
-            let geoN = cr / cl
-            let longest = max(simd_length(p1 - p0),
-                              max(simd_length(p2 - p1), simd_length(p0 - p2)))
-            if geoN.y <= 0.62 || budget <= 0 { emitFlat(ia, ib, ic); continue }
-            // Cheap reject: a small triangle whose corners and
-            // centre are all snow-free and pool-free stays flat.
-            // Displaced neighbours pin their shared border to
-            // zero height, so this cannot open a crack.
-            if longest <= 2.0 {
-                var maxH: Float = 0
-                var maxM: Float = 0
-                for q in [p0, p1, p2, (p0 + p1 + p2) / 3] {
-                    if snowActive {
-                        maxH = max(maxH, wgfSnowHeight(q.x, q.z, amount: snowAmount))
-                    }
-                    if wet > 0.001 {
-                        maxM = max(maxM, wgfPuddle(q.x, q.z, y: q.y,
-                                                   geoNY: geoN.y, level: wet).mask)
-                    }
-                }
-                if maxH < 0.001 && maxM < 0.08 { emitFlat(ia, ib, ic); continue }
+        // (a) Sample the support at every lattice vertex.
+        for j in 0..<vz {
+            for i in 0..<vx {
+                verts[vIdx(i, j)].support = sampleSupport(grid, x: vX(i), z: vZ(j))
             }
-            var n = Int((longest / 0.22).rounded(.up))
-            n = max(1, min(n, 56))
-            while n > 1 && n * n > budget { n -= 1 }
-            if n < 2 { emitFlat(ia, ib, ic); continue }
-            budget -= n * n
-
-            // Triangular lattice: vertex (i, j) carries
-            // barycentric weights (1-(i+j)/n, i/n, j/n) over
-            // (p0, p1, p2), indexed row-major by gIdx.
-            let nf = Float(n)
-            var gPos: [SIMD3<Float>] = []
-            var gUV: [SIMD2<Float>] = []
-            var gMask: [Float] = []
-            var gDepth: [Float] = []
-            var gSnow: [Float] = []
-            gPos.reserveCapacity((n + 1) * (n + 2) / 2)
-            let vBase = UInt32(positions.count / 3)
-            for i in 0...n {
-                for j in 0...(n - i) {
-                    let wb = Float(i) / nf, wc = Float(j) / nf
-                    let wa = 1 - wb - wc
-                    let pos = p0 * wa + p1 * wb + p2 * wc
-                    var nrm = wNrm(ia) * wa + wNrm(ib) * wb + wNrm(ic) * wc
-                    let nl = simd_length(nrm)
-                    if nl > 1e-6 { nrm /= nl }
-                    var disp = pos
-                    var snowC: Float = 0
-                    if snowActive {
-                        snowC = wgfSnowCover(pos.x, pos.z, amount: snowAmount)
-                        let edgeFade = wgfSmooth(0, 0.18, min(wa, min(wb, wc)))
-                        // v4.3: the imprint helper adjusts the
-                        // field height at the centre vertex AND
-                        // at the ±e gradient taps (each tap
-                        // passes its own field height, with the
-                        // centre's hostY + host id), so troughs,
-                        // rims and footprints shade with normals
-                        // that follow the crush. The barycentric
-                        // edge fade still pins original borders
-                        // to zero after the imprint.
-                        let rawH = wgfSnowHeight(pos.x, pos.z, amount: snowAmount)
-                        let h = imprintedSnowHeight(
-                            x: pos.x, z: pos.z, hostY: pos.y, hostID: objectID,
-                            fieldH: rawH, intruders: intruders) * edgeFade
-                        if h > 0.0005 {
-                            disp.y += h
-                            let e: Float = 0.05
-                            let gx = (imprintedSnowHeight(
-                                        x: pos.x + e, z: pos.z, hostY: pos.y,
-                                        hostID: objectID,
-                                        fieldH: wgfSnowHeight(pos.x + e, pos.z, amount: snowAmount),
-                                        intruders: intruders)
-                                      - imprintedSnowHeight(
-                                        x: pos.x - e, z: pos.z, hostY: pos.y,
-                                        hostID: objectID,
-                                        fieldH: wgfSnowHeight(pos.x - e, pos.z, amount: snowAmount),
-                                        intruders: intruders)) / (2 * e)
-                            let gz = (imprintedSnowHeight(
-                                        x: pos.x, z: pos.z + e, hostY: pos.y,
-                                        hostID: objectID,
-                                        fieldH: wgfSnowHeight(pos.x, pos.z + e, amount: snowAmount),
-                                        intruders: intruders)
-                                      - imprintedSnowHeight(
-                                        x: pos.x, z: pos.z - e, hostY: pos.y,
-                                        hostID: objectID,
-                                        fieldH: wgfSnowHeight(pos.x, pos.z - e, amount: snowAmount),
-                                        intruders: intruders)) / (2 * e)
-                            let sn = simd_normalize(SIMD3<Float>(-gx, 1, -gz))
-                            let blend = min(h / 0.03, 1)
-                            nrm = simd_normalize(nrm * (1 - blend) + sn * blend)
-                        }
+        }
+        // (b) Dilation: a vertex with support on BOTH sides
+        // of an axis is a sub-cell gap in the support (a
+        // narrow slot between triangles), not a real edge —
+        // bridge it with the average of its neighbours so
+        // the sheet cannot tear there. True boundaries (an
+        // edge with support on one side only) are untouched;
+        // they end in skirts, below.
+        for _ in 0..<2 {
+            var filled: [(Int, SnowSupport)] = []
+            for j in 0..<vz {
+                for i in 0..<vx {
+                    let idx = vIdx(i, j)
+                    if verts[idx].support != nil { continue }
+                    let e = i + 1 < vx ? verts[vIdx(i + 1, j)].support : nil
+                    let w = i > 0 ? verts[vIdx(i - 1, j)].support : nil
+                    let n = j + 1 < vz ? verts[vIdx(i, j + 1)].support : nil
+                    let s = j > 0 ? verts[vIdx(i, j - 1)].support : nil
+                    var bridged: SnowSupport? = nil
+                    if let a = e, let b = w {
+                        bridged = SnowSupport(y: (a.y + b.y) / 2,
+                                              flatNY: min(a.flatNY, b.flatNY),
+                                              interpNY: min(a.interpNY, b.interpNY),
+                                              hostID: a.hostID, amount: a.amount)
+                    } else if let a = n, let b = s {
+                        bridged = SnowSupport(y: (a.y + b.y) / 2,
+                                              flatNY: min(a.flatNY, b.flatNY),
+                                              interpNY: min(a.interpNY, b.interpNY),
+                                              hostID: a.hostID, amount: a.amount)
                     }
-                    gSnow.append(snowC)
-                    var mask: Float = 0, depth01: Float = 0
-                    if wet > 0.001 {
-                        let pm = wgfPuddle(pos.x, pos.z, y: pos.y,
-                                           geoNY: geoN.y, level: wet)
-                        mask = pm.mask; depth01 = pm.depth
-                    }
-                    gMask.append(mask); gDepth.append(depth01)
-                    gPos.append(disp)
-                    let tuv = wUV(ia) * wa + wUV(ib) * wb + wUV(ic) * wc
-                    gUV.append(tuv)
-                    let col = wCol(ia) * wa + wCol(ib) * wb + wCol(ic) * wc
-                    positions.append(contentsOf: [disp.x, disp.y, disp.z])
-                    normals.append(contentsOf: [nrm.x, nrm.y, nrm.z])
-                    uvs.append(contentsOf: [tuv.x, tuv.y])
-                    colors.append(contentsOf: [col.x, col.y, col.z])
+                    if let bridged { filled.append((idx, bridged)) }
                 }
             }
-            func gIdx(_ i: Int, _ j: Int) -> Int {
-                i * (n + 1) - i * (i - 1) / 2 + j
-            }
-            // One water sheet triangle over a subdivided
-            // triangle: centre vertices ride up to ~13 mm above
-            // the surface by pool depth; rim vertices tuck
-            // 2.5 mm below it, so the edge is a tiny sloped
-            // wall — a real rim, not a painted outline.
-            func emitSheet(_ a: Int, _ b: Int, _ c: Int) {
-                // v4.1 (F6): sheets are charged against the
-                // same 220k weather budget as the subdivision
-                // that spawned them; when it is exhausted no
-                // further sheets are emitted.
-                guard budget > 0 else { return }
-                budget -= 1
-                var order = [a, b, c]
-                if simd_cross(gPos[b] - gPos[a], gPos[c] - gPos[a]).y < 0 {
-                    order = [a, c, b]
+            if filled.isEmpty { break }
+            for (idx, s) in filled { verts[idx].support = s }
+        }
+        // (c) Column heights, normals, puddle data.
+        for j in 0..<vz {
+            for i in 0..<vx {
+                let idx = vIdx(i, j)
+                guard let s = verts[idx].support else { continue }
+                let x = vX(i), z = vZ(j)
+                if let col = sheetColumn(x: x, z: z, grid: grid,
+                                         intruders: intruders,
+                                         snowPossible: snowPossible, pre: s) {
+                    verts[idx].snowH = col.snowH
+                    verts[idx].topY = col.topY
+                } else {
+                    verts[idx].topY = s.y
                 }
-                let base = UInt32(positions.count / 3)
-                for k in order {
-                    let gp = gPos[k]
-                    let off: Float = gMask[k] < 0.45 ? -0.0025
-                        : 0.0035 + 0.0095 * gDepth[k]
-                    positions.append(contentsOf: [gp.x, gp.y + off, gp.z])
-                    normals.append(contentsOf: [0, 1, 0])
-                    uvs.append(contentsOf: [gUV[k].x, gUV[k].y])
-                    colors.append(contentsOf: [1, 1, 1])
+                // Normal from taps of the total height
+                // function (support + snow, imprints and
+                // all) — the same taps that placed every
+                // other vertex, so shading and silhouette
+                // agree. A tap with no support counts as the
+                // centre height (one-sided fall-back).
+                let e: Float = 0.05
+                func tapH(_ tx: Float, _ tz: Float) -> Float {
+                    sheetColumn(x: tx, z: tz, grid: grid,
+                                intruders: intruders,
+                                snowPossible: snowPossible)?.topY
+                        ?? verts[idx].topY
                 }
-                indices.append(contentsOf: [base, base + 1, base + 2])
-                triMats.append(sheetIndex)
-                triObjects.append(objectID)
-                sheetEmitted = true
-            }
-            func emitSub(_ a: Int, _ b: Int, _ c: Int) {
-                var bb = b, cc = c
-                // Winding repair against the host face:
-                // displacement must never flip a subtriangle
-                // inside-out.
-                if simd_dot(simd_cross(gPos[bb] - gPos[a],
-                                       gPos[cc] - gPos[a]), geoN) < 0 {
-                    swap(&bb, &cc)
-                }
-                indices.append(contentsOf: [vBase + UInt32(a),
-                                            vBase + UInt32(bb),
-                                            vBase + UInt32(cc)])
-                triMats.append(matIndex)
-                triObjects.append(objectID)
+                let gx = (tapH(x + e, z) - tapH(x - e, z)) / (2 * e)
+                let gz = (tapH(x, z + e) - tapH(x, z - e)) / (2 * e)
+                verts[idx].normal = simd_normalize(SIMD3<Float>(-gx, 1, -gz))
+                // Vertex tint mirrors the shader's crevice
+                // term (drift crests bright, hollows shaded):
+                // the sheet's own material skips the weather
+                // block, so the variation is baked here.
+                verts[idx].shade = 0.82 + 0.18 * wgfDrift(x, z)
+                verts[idx].snowCover = wgfSnowCover(x, z, amount: s.amount)
                 if wet > 0.001 {
-                    let mC = (gMask[a] + gMask[bb] + gMask[cc]) / 3
-                    let sC = (gSnow[a] + gSnow[bb] + gSnow[cc]) / 3
-                    if mC * (1 - sC) > 0.5 { emitSheet(a, bb, cc) }
+                    let pm = wgfPuddle(x, z, y: s.y, geoNY: s.flatNY, level: wet)
+                    verts[idx].mask = pm.mask
+                    verts[idx].depth01 = pm.depth
                 }
             }
-            for i in 0..<n {
-                for j in 0..<(n - i) {
-                    emitSub(gIdx(i, j), gIdx(i + 1, j), gIdx(i, j + 1))
+        }
+        // (d) Cell predicates — decided BEFORE any triangle
+        // is emitted, so the material indices are exact.
+        var snowCells = [Bool](repeating: false, count: nx * nz)
+        var sheetCells = [Bool](repeating: false, count: nx * nz)
+        var anySnow = false, anySheet = false
+        for j in 0..<nz {
+            for i in 0..<nx {
+                let corners = [vIdx(i, j), vIdx(i + 1, j), vIdx(i, j + 1), vIdx(i + 1, j + 1)]
+                let sup = corners.filter { verts[$0].support != nil }
+                if sup.count >= 3,
+                   let maxH = sup.map({ verts[$0].snowH }).max(), maxH > 0.0005 {
+                    snowCells[j * nx + i] = true
+                    anySnow = true
                 }
-                for j in 0..<(n - 1 - i) {
-                    emitSub(gIdx(i + 1, j + 1), gIdx(i, j + 1), gIdx(i + 1, j))
+                if wet > 0.001, sup.count == 4 {
+                    let mC = corners.reduce(Float(0)) { $0 + verts[$1].mask } / 4
+                    let sC = corners.reduce(Float(0)) { $0 + verts[$1].snowCover } / 4
+                    if mC * (1 - sC) > 0.5 {
+                        sheetCells[j * nx + i] = true
+                        anySheet = true
+                    }
+                }
+            }
+        }
+        guard anySnow || anySheet else { return }
+        sheetEmitted = anySheet
+        snowEmitted = anySnow
+        let sheetIndex = UInt32(included.count)
+        let snowIndex = UInt32(included.count) + (anySheet ? 1 : 0)
+
+        // (e) Emission. Snow vertices are shared between
+        // cells through the lattice; a vertex enters the soup
+        // at its column top + 1.5 mm (a film offset that keeps
+        // the sheet clear of the host surface beneath it —
+        // no z-fighting where the snow feathers out, no gap
+        // where it is deep).
+        var remap = [Int32](repeating: -1, count: vx * vz)
+        func emitSnowVert(_ gi: Int) -> UInt32 {
+            if remap[gi] >= 0 { return UInt32(remap[gi]) }
+            let v = verts[gi]
+            let base = UInt32(positions.count / 3)
+            positions.append(contentsOf: [vX(gi % vx), v.topY + 0.0015, vZ(gi / vx)])
+            normals.append(contentsOf: [v.normal.x, v.normal.y, v.normal.z])
+            uvs.append(contentsOf: [0, 0])
+            colors.append(contentsOf: [v.shade, v.shade, v.shade])
+            remap[gi] = Int32(base)
+            return base
+        }
+        func triHost(_ corners: [Int]) -> UUID? {
+            for c in corners {
+                if let s = verts[c].support { return s.hostID }
+            }
+            return nil
+        }
+        // Winding is normalised from the emitted positions:
+        // every sheet triangle must face up (+Y). A
+        // heightfield graph always admits this; the check is
+        // what makes it unconditional.
+        func emitTri(_ a: UInt32, _ b: UInt32, _ c: UInt32,
+                     mat: UInt32, obj: UUID) {
+            func p(_ idx: UInt32) -> SIMD3<Float> {
+                let k = Int(idx) * 3
+                return SIMD3<Float>(positions[k], positions[k + 1], positions[k + 2])
+            }
+            var bb = b, cc = c
+            if simd_cross(p(bb) - p(a), p(cc) - p(a)).y < 0 { swap(&bb, &cc) }
+            indices.append(contentsOf: [a, bb, cc])
+            triMats.append(mat)
+            triObjects.append(obj)
+        }
+
+        if anySnow {
+            // Snow cells: a quad where all four corners are
+            // supported, a single triangle where exactly
+            // three are (support edges lose at most a
+            // sub-cell notch — never a floating lip).
+            snowLoop: for j in 0..<nz {
+                for i in 0..<nx {
+                    if !snowCells[j * nx + i] { continue }
+                    let ring = [vIdx(i, j), vIdx(i + 1, j), vIdx(i + 1, j + 1), vIdx(i, j + 1)]
+                    let sup = ring.filter { verts[$0].support != nil }
+                    guard sup.count >= 3, let host = triHost(ring) else { continue }
+                    let ev = sup.map { emitSnowVert($0) }
+                    if sup.count == 4 {
+                        if budget < 2 { break snowLoop }
+                        budget -= 2
+                        emitTri(ev[0], ev[1], ev[2], mat: snowIndex, obj: host)
+                        emitTri(ev[0], ev[2], ev[3], mat: snowIndex, obj: host)
+                    } else {
+                        if budget < 1 { break snowLoop }
+                        budget -= 1
+                        emitTri(ev[0], ev[1], ev[2], mat: snowIndex, obj: host)
+                    }
+                }
+            }
+            // Skirts: where a snow cell borders a cell with
+            // no snow (or the grid edge) and the shared edge
+            // still carries real depth, the sheet was CUT,
+            // not feathered — a support ending in mid-air, a
+            // deep imprint cliff. Drop a vertical quad to
+            // the support sampled just outside the edge (or
+            // to just under the edge's own support when there
+            // is none) so the pile has a closed side.
+            skirtLoop: for j in 0..<nz {
+                for i in 0..<nx {
+                    if !snowCells[j * nx + i] { continue }
+                    // (edge end grid verts, neighbour cell, outward XZ)
+                    let edges: [(Int, Int, Int, Int, SIMD2<Float>)] = [
+                        (vIdx(i, j), vIdx(i, j + 1), i - 1, j, SIMD2<Float>(-1, 0)),
+                        (vIdx(i + 1, j), vIdx(i + 1, j + 1), i + 1, j, SIMD2<Float>(1, 0)),
+                        (vIdx(i, j), vIdx(i + 1, j), i, j - 1, SIMD2<Float>(0, -1)),
+                        (vIdx(i, j + 1), vIdx(i + 1, j + 1), i, j + 1, SIMD2<Float>(0, 1)),
+                    ]
+                    for (ga, gb, ni, nj, outward) in edges {
+                        let neighbourSnow = ni >= 0 && ni < nx && nj >= 0 && nj < nz
+                            && snowCells[nj * nx + ni]
+                        if neighbourSnow { continue }
+                        let va = verts[ga], vb = verts[gb]
+                        if va.support == nil || vb.support == nil { continue }
+                        if min(va.snowH, vb.snowH) <= 0.05 { continue }
+                        guard let host = triHost([ga, gb]) else { continue }
+                        if budget < 2 { break skirtLoop }
+                        budget -= 2
+                        // Bottom of the skirt at each end:
+                        // the column just outside the edge,
+                        // if it has one; otherwise a lip just
+                        // under this edge's own support.
+                        func bottomY(_ g: Int, _ end: SheetVert) -> Float {
+                            let gi = g % vx, gj = g / vx
+                            let oi = gi + Int(outward.x), oj = gj + Int(outward.y)
+                            if oi >= 0, oi < vx, oj >= 0, oj < vz,
+                               verts[vIdx(oi, oj)].support != nil {
+                                return verts[vIdx(oi, oj)].topY
+                            }
+                            return end.topY - end.snowH - 0.02
+                        }
+                        let n3 = SIMD3<Float>(outward.x, 0, outward.y)
+                        let base = UInt32(positions.count / 3)
+                        for (g, end) in [(ga, va), (gb, vb)] {
+                            positions.append(contentsOf: [vX(g % vx), end.topY + 0.0015, vZ(g / vx)])
+                            normals.append(contentsOf: [n3.x, 0, n3.z])
+                            uvs.append(contentsOf: [0, 0])
+                            let sh = end.shade * 0.94
+                            colors.append(contentsOf: [sh, sh, sh])
+                        }
+                        for (g, end) in [(ga, va), (gb, vb)] {
+                            positions.append(contentsOf: [vX(g % vx), bottomY(g, end), vZ(g / vx)])
+                            normals.append(contentsOf: [n3.x, 0, n3.z])
+                            uvs.append(contentsOf: [0, 0])
+                            let sh = end.shade * 0.94
+                            colors.append(contentsOf: [sh, sh, sh])
+                        }
+                        // (topA, topB, botB) + (topA, botB, botA),
+                        // orientation checked against outward.
+                        func emitSkirtTri(_ a: UInt32, _ b: UInt32, _ c: UInt32) {
+                            func p(_ idx: UInt32) -> SIMD3<Float> {
+                                let k = Int(idx) * 3
+                                return SIMD3<Float>(positions[k], positions[k + 1], positions[k + 2])
+                            }
+                            var bb = b, cc = c
+                            if simd_dot(simd_cross(p(bb) - p(a), p(cc) - p(a)), n3) < 0 {
+                                swap(&bb, &cc)
+                            }
+                            indices.append(contentsOf: [a, bb, cc])
+                            triMats.append(snowIndex)
+                            triObjects.append(host)
+                        }
+                        emitSkirtTri(base, base + 1, base + 3)
+                        emitSkirtTri(base, base + 3, base + 2)
+                    }
+                }
+            }
+        }
+        if anySheet {
+            // Puddle water sheets from the same lattice:
+            // vertices ride the sheet's own offsets (pool
+            // centre up to ~13 mm by depth, rim vertices
+            // tucked 2.5 mm below), exactly the v3.4 sheet
+            // profile, on the lattice's column tops.
+            sheetLoop: for j in 0..<nz {
+                for i in 0..<nx {
+                    if !sheetCells[j * nx + i] { continue }
+                    let ring = [vIdx(i, j), vIdx(i + 1, j), vIdx(i + 1, j + 1), vIdx(i, j + 1)]
+                    guard let host = triHost(ring) else { continue }
+                    if budget < 2 { break sheetLoop }
+                    budget -= 2
+                    let base = UInt32(positions.count / 3)
+                    for g in ring {
+                        let v = verts[g]
+                        let off: Float = v.mask < 0.45 ? -0.0025
+                            : 0.0035 + 0.0095 * v.depth01
+                        positions.append(contentsOf: [vX(g % vx), v.topY + off, vZ(g / vx)])
+                        normals.append(contentsOf: [0, 1, 0])
+                        uvs.append(contentsOf: [0, 0])
+                        colors.append(contentsOf: [1, 1, 1])
+                    }
+                    emitTri(base, base + 1, base + 2, mat: sheetIndex, obj: host)
+                    emitTri(base, base + 2, base + 3, mat: sheetIndex, obj: host)
                 }
             }
         }
@@ -2017,6 +2366,7 @@ final class Renderer {
     // mirrors + GPU buffers (slots 11-17) + its own AS. The
     // material table is contractual everywhere:
     //   [static object materials…, sheetMaterial if emitted,
+    //    snowMaterial if emitted (v4.4),
     //    dynamic entry materials in entry order,
     //    particle soup materials in soup order,
     //    the player figure's material last (v4.3)]
@@ -2041,12 +2391,14 @@ final class Renderer {
     /// Index of the first dynamic material in the full table.
     private var dynMatBase: Int {
         cachedStaticMaterials.count + (sceneHasSheetMaterial ? 1 : 0)
+            + (sceneHasSnowMaterial ? 1 : 0)
     }
 
     /// The full GPU material table, in the contractual order.
     private func fullMaterialTable() -> [GPUMaterial] {
         var mats = cachedStaticMaterials
         if sceneHasSheetMaterial { mats.append(sheetMaterial()) }
+        if sceneHasSnowMaterial { mats.append(snowMaterial()) }
         for entry in dynEntries { mats.append(entry.material) }
         for soup in particleSoupsStored { mats.append(soup.material) }
         // v4.3: the player figure's material is ALWAYS last —
