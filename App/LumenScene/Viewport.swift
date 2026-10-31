@@ -104,12 +104,15 @@ struct MetalViewport: UIViewRepresentable {
         @objc private func handleOrbit(_ g: UIPanGestureRecognizer) {
             guard let view = g.view else { return }
             // Edit mode: a drag that starts on the selected object
-            // moves the object instead of orbiting.
+            // moves the object instead of orbiting. v4.6: with a
+            // multi set, a drag starting on ANY member moves the
+            // whole set (the session decides membership).
             if session.mode == .edit {
-                if g.state == .began, let sel = session.selection,
+                if g.state == .began,
                    let (ndc, aspect) = ndc(for: g, in: view),
-                   session.pickAt(ndc: ndc, aspect: aspect) == sel,
-                   session.beginObjectDrag(id: sel, ndc: ndc, aspect: aspect) {
+                   let picked = session.pickAt(ndc: ndc, aspect: aspect),
+                   session.dragSetContains(picked),
+                   session.beginObjectDrag(id: picked, ndc: ndc, aspect: aspect) {
                     draggingObject = true
                     return
                 }

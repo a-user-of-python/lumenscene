@@ -419,6 +419,13 @@ final class Renderer {
     /// Manipulation preview: this object (if any) renders cheap —
     /// emissive objects stop emitting, glass renders opaque.
     var previewObjectID: UUID?
+    /// v4.6: objects carrying the selection highlight (the
+    /// multi-select set, or the single selection). A material-
+    /// path tint ONLY — flags are untouched, so a highlighted
+    /// emissive still casts its light and a highlighted glass
+    /// object still transmits; the session syncs this on every
+    /// selection change and refreshes via updateMaterialsOnly.
+    var highlightObjectIDs: Set<UUID> = []
 
     /// Stage-lighting cut: when true, NO object is flagged
     /// emissive (emissive surfaces shade with their emissive
@@ -1369,6 +1376,17 @@ final class Renderer {
                 flags |= 2
             }
         }
+        // v4.6: selection highlight — a warm tint blended into
+        // the base colour so every selected object reads at a
+        // glance in the 3D view (the tree row alone was easy to
+        // lose). Applied after the preview branch and never to
+        // flags: lighting behaviour is unchanged. Glass keeps
+        // transmitting (its base colour tints the transmission,
+        // so the mark shows through the glass look).
+        if highlightObjectIDs.contains(obj.id) {
+            let tint = SIMD3<Float>(1.0, 0.60, 0.16)
+            base = base + (tint - base) * 0.38
+        }
         if m.triplanar { flags |= 4 }
         if m.textureFit { flags |= 8 }
         g.baseColor = SIMD4<Float>(base, 0)
@@ -1746,11 +1764,12 @@ final class Renderer {
         /// static hosts and so intrude on every host.
         var staticID: UUID?
         /// v4.6: identity key source for DYNAMIC intruders
-        /// (the session's DynEntry key); nil for statics (they
-        /// use staticID) and for the player figure (the
-        /// recorder skips it — its transient footprint stamps
-        /// are its snow interaction, unchanged).
-        var plowKey: String?
+        /// (the session's DynEntry key — a UUID); nil for
+        /// statics (they use staticID) and for the player
+        /// figure (the recorder skips it — its transient
+        /// footprint stamps are its snow interaction,
+        /// unchanged).
+        var plowKey: UUID?
         var inverse: float4x4
         /// World-space bottom of the intruder (min y).
         var bottomY: Float
@@ -1766,7 +1785,7 @@ final class Renderer {
 
     private func makeSnowIntruder(staticID: UUID?, local: MeshData,
                                   matrix: float4x4, world: MeshData?,
-                                  isCircle: Bool, plowKey: String? = nil) -> SnowIntruder? {
+                                  isCircle: Bool, plowKey: UUID? = nil) -> SnowIntruder? {
         guard local.vertexCount > 0 else { return nil }
         let lb = local.bounds
         let wMin: SIMD3<Float>
@@ -2195,7 +2214,7 @@ final class Renderer {
                     // whose support came from gap dilation have
                     // no direct sample and fall back to baseH.
                     var baseNB = base
-                    if let s = sampleSupport(grid: grid, x: x, z: z),
+                    if let s = sampleSupport(grid, x: x, z: z),
                        abs(s.y - sup) < 0.01 {
                         let taper: Float = s.flatNY > 0.5
                             ? wgfSmooth(0.55, 0.75, s.ny) : 0

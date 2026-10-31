@@ -368,6 +368,21 @@ struct EditorView: View {
         }
     }
 
+    /// v4.6: tree taps route through here — in Multi Select
+    /// mode a row tap toggles membership instead of replacing
+    /// the selection.
+    private var treeSelectionBinding: Binding<UUID?> {
+        Binding(
+            get: { session.selection },
+            set: { newValue in
+                if session.multiSelectMode {
+                    if let id = newValue { session.toggleMultiSelection(id) }
+                } else {
+                    session.selection = newValue
+                }
+            })
+    }
+
     // MARK: Object tree (left)
 
     private var treePanel: some View {
@@ -375,6 +390,20 @@ struct EditorView: View {
             HStack {
                 Text("Objects").font(.headline)
                 Spacer()
+                // v4.6: Multi Select tool toggle. On: taps (tree
+                // or viewport) add/remove objects from the set;
+                // off: the set clears (switching tools clears).
+                Button {
+                    session.multiSelectMode.toggle()
+                } label: {
+                    Label("Multi", systemImage: session.multiSelectMode
+                          ? "checklist.checked" : "checklist")
+                        .labelStyle(.titleAndIcon)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(session.multiSelectMode ? .accentColor : .secondary)
+                .help("Multi Select: tap several objects to select them together")
                 Menu {
                     Button("Box") { session.addPrimitive("box") }
                     Button("Sphere") { session.addPrimitive("sphere") }
@@ -389,9 +418,17 @@ struct EditorView: View {
                 }
             }
             .padding(10)
-            List(selection: $session.selection) {
+            List(selection: treeSelectionBinding) {
                 ForEach(session.project.scene.objects) { obj in
                     HStack(spacing: 8) {
+                        // v4.6: set membership mark in the tree —
+                        // every selected object shows it, not
+                        // just the primary row highlight.
+                        if session.multiSelectMode
+                            && session.multiSelection.contains(obj.id) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(Color.accentColor)
+                        }
                         Image(systemName: obj.source == "model" ? "cube" : icon(for: obj.primitiveKind))
                             .foregroundStyle(.secondary)
                         Text(obj.name).lineLimit(1)
@@ -455,7 +492,9 @@ struct EditorView: View {
                 }
                 .frame(maxHeight: 132)
             }
-            Text("Tap an object in the view to select it.")
+            Text(session.multiSelectMode
+                 ? "Multi Select is on: tap objects in the view or the list to add or remove them. Drag any selected object to move them all. Tap empty space to clear."
+                 : "Tap an object in the view to select it.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(8)
@@ -524,6 +563,8 @@ struct EditorView: View {
         if let areaID = session.selectedArea,
            session.project.scene.areas.contains(where: { $0.id == areaID }) {
             AreaPropertiesView(session: session, areaID: areaID)
+        } else if session.multiSelectMode && session.multiSelection.count > 1 {
+            MultiSelectionPropertiesView(session: session)
         } else if let obj = session.selectedObject {
             ObjectPropertiesView(session: session, objectID: obj.id,
                                  fieldFocus: $fieldFocus)
@@ -611,7 +652,10 @@ struct EditorView: View {
             if press.phase == .down { session.deleteSelected() }
             return .handled
         case .escape:
-            if press.phase == .down, session.mode == .play { session.toggleMode() }
+            if press.phase == .down {
+                if session.mode == .play { session.toggleMode() }
+                else if session.multiSelectMode { session.multiSelectMode = false }
+            }
             return .handled
         default:
             break
@@ -1009,6 +1053,61 @@ struct ObjectPropertiesView: View {
 /// selected: name, centre and size, member count, delete. Areas
 /// are not undoable (session precedent), so edits write straight
 /// through session.updateArea — no beginEdit().
+/// v4.6: the properties panel for a multi-selection (2+
+/// objects). Deliberately small: what is group-safe (move by
+/// dragging in the view, visibility, delete, clear) is here;
+/// single-object editing (name, transform numbers, material,
+/// rotate) is NOT — it applies to one object at a time, and
+/// pretending otherwise would silently edit only the primary.
+/// The panel says so in plain words.
+struct MultiSelectionPropertiesView: View {
+    @ObservedObject var session: EditorSession
+
+    var body: some View {
+        let count = session.multiSelection.count
+        let members = session.project.scene.objects
+            .filter { session.multiSelection.contains($0.id) }
+        let anyVisible = members.contains { $0.visible }
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Label("\(count) objects selected", systemImage: "checklist.checked")
+                    .font(.headline)
+                Text(members.map(\.name).joined(separator: ", "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4)
+                Divider()
+                Text("Drag any selected object in the view to move them all together. Each one still pushes snow on its own when dragged through it.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Button {
+                    session.toggleVisibilityForMultiSelection()
+                } label: {
+                    Label(anyVisible ? "Hide All" : "Show All",
+                          systemImage: anyVisible ? "eye.slash" : "eye")
+                }
+                Button(role: .destructive) {
+                    session.deleteMultiSelection()
+                } label: {
+                    Label("Delete All \(count) Objects", systemImage: "trash")
+                }
+                Button {
+                    session.clearMultiSelection()
+                } label: {
+                    Label("Clear Selection", systemImage: "xmark.circle")
+                }
+                Divider()
+                Text("Name, position, rotation and material editing work on one object at a time. Turn Multi off (or tap a single object with Multi off) to edit those.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(Color(white: 0.11))
+    }
+}
+
 struct AreaPropertiesView: View {
     @ObservedObject var session: EditorSession
     let areaID: UUID

@@ -18,7 +18,26 @@ final class EditorSession: ObservableObject {
     @Published var selection: UUID? {
         // An object selection and an area selection are mutually
         // exclusive: the properties panel shows exactly one editor.
-        didSet { if selection != nil, selectedArea != nil { selectedArea = nil } }
+        didSet {
+            if selection != nil, selectedArea != nil { selectedArea = nil }
+            syncHighlightToRenderer()
+        }
+    }
+    /// v4.6 (workstream 2): MULTI-SELECT. `multiSelectMode` is
+    /// the tree-panel tool toggle; `multiSelection` is the set
+    /// it builds. `selection` stays the PRIMARY (last tapped)
+    /// member — with a set of one, everything behaves exactly
+    /// as the old single selection. Leaving the tool (or
+    /// entering Play) clears the set: switching tools clears,
+    /// per normal editor behaviour.
+    @Published var multiSelectMode: Bool = false {
+        didSet {
+            if !multiSelectMode { multiSelection = [] }
+            syncHighlightToRenderer()
+        }
+    }
+    @Published var multiSelection: Set<UUID> = [] {
+        didSet { syncHighlightToRenderer() }
     }
     /// v4.0: the trigger area selected in the tree's Areas section
     /// (edited in the properties panel instead of an object).
@@ -375,6 +394,20 @@ final class EditorSession: ObservableObject {
         if let sel = selection, !snap.objects.contains(where: { $0.id == sel }) {
             selection = nil
         }
+        // v4.6: prune the multi set to objects that exist in
+        // the restored snapshot (undoing a group delete brings
+        // the objects back as scene objects; the SET itself is
+        // not part of the snapshot and stays cleared/pruned).
+        if !multiSelection.isEmpty {
+            multiSelection = multiSelection.filter { id in
+                snap.objects.contains { $0.id == id }
+            }
+            if multiSelection.count == 1 { selection = multiSelection.first }
+            if multiSelection.isEmpty && selection != nil,
+               !snap.objects.contains(where: { $0.id == selection }) {
+                selection = nil
+            }
+        }
         // v4.3: objects that (re)appear via undo/redo join the
         // exposure map at their snapshot value (absent = caught
         // up); entries for vanished objects are pruned.
@@ -499,11 +532,21 @@ final class EditorSession: ObservableObject {
     }
 
     private var dragState: (id: UUID, planeY: Float, grabOffset: SIMD2<Float>)?
+    /// v4.6: group-drag bookkeeping — every member's start XZ,
+    /// captured at drag start; members move by the grabbed
+    /// object's delta (each keeps its own height — only XZ is
+    /// ever written, exactly as in a single drag).
+    private var groupDragMembers: [(id: UUID, start: SIMD2<Double>)] = []
+    private var groupDragPrimaryStart: SIMD2<Double>?
     var isDraggingObject: Bool { dragState != nil }
 
     /// Start dragging the given object across the horizontal plane
     /// through its current height. Returns false when the ray
-    /// can't reach that plane (camera level with it).
+    /// can't reach that plane (camera level with it). v4.6: when
+    /// the grabbed object is a member of a multi set (count > 1),
+    /// the drag moves the WHOLE set together — one beginEdit, so
+    /// the group move is a single undo step, and every member
+    /// stays its own snow intruder (a group drag plows per-object).
     func beginObjectDrag(id: UUID, ndc: SIMD2<Float>, aspect: Float) -> Bool {
         guard mode == .edit, let obj = project.scene.object(id: id) else { return false }
         let (origin, dir) = rayFor(ndc: ndc, aspect: aspect)
@@ -517,6 +560,16 @@ final class EditorSession: ObservableObject {
         applyDragRenderState()
         dragState = (id, planeY, SIMD2<Float>(Float(obj.transform.position[0]) - grab.x,
                                               Float(obj.transform.position[2]) - grab.z))
+        groupDragMembers = []
+        groupDragPrimaryStart = nil
+        if multiSelectMode && multiSelection.count > 1 && multiSelection.contains(id) {
+            groupDragPrimaryStart = SIMD2<Double>(obj.transform.position[0],
+                                                  obj.transform.position[2])
+            groupDragMembers = project.scene.objects
+                .filter { multiSelection.contains($0.id) && $0.id != id }
+                .map { (id: $0.id, start: SIMD2<Double>($0.transform.position[0],
+                                                        $0.transform.position[2])) }
+        }
         return true
     }
 
@@ -531,6 +584,18 @@ final class EditorSession: ObservableObject {
         let grab = origin + dir * t
         project.scene.objects[idx].transform.position[0] = Double(grab.x + ds.grabOffset.x)
         project.scene.objects[idx].transform.position[2] = Double(grab.z + ds.grabOffset.y)
+        // v4.6: group members follow the grabbed object's delta.
+        if let start = groupDragPrimaryStart {
+            let delta = SIMD2<Double>(
+                project.scene.objects[idx].transform.position[0] - start.x,
+                project.scene.objects[idx].transform.position[2] - start.y)
+            for member in groupDragMembers {
+                if let mi = project.scene.objects.firstIndex(where: { $0.id == member.id }) {
+                    project.scene.objects[mi].transform.position[0] = member.start.x + delta.x
+                    project.scene.objects[mi].transform.position[2] = member.start.y + delta.y
+                }
+            }
+        }
         noteCameraActivity()
         scheduleRebuild(geometry: true)
     }
@@ -538,6 +603,8 @@ final class EditorSession: ObservableObject {
     func endObjectDrag() {
         guard dragState != nil else { return }
         dragState = nil
+        groupDragMembers = []
+        groupDragPrimaryStart = nil
         dragPreviewID = nil
         applyDragRenderState()
     }
@@ -589,6 +656,13 @@ final class EditorSession: ObservableObject {
     }
 
     func deleteSelected() {
+        // v4.6: with a multi set, Delete removes the whole set
+        // (one undo step) — the keyboard and the properties
+        // panel both land here.
+        if multiSelectMode && multiSelection.count > 1 {
+            deleteMultiSelection()
+            return
+        }
         guard let sel = selection,
               let idx = project.scene.objects.firstIndex(where: { $0.id == sel }) else { return }
         beginEdit()
@@ -612,6 +686,101 @@ final class EditorSession: ObservableObject {
                 scene.objects[i].visible.toggle()
             }
         }
+    }
+
+    // MARK: Multi-select (v4.6 workstream 2)
+
+    /// Push the effective selection highlight into the
+    /// renderer (material-path tint; no rebuild, no AS work).
+    /// The highlighted set is the multi set while the tool is
+    /// on, otherwise the single selection — so the object you
+    /// picked is marked in the 3D view in both modes.
+    private func syncHighlightToRenderer() {
+        let ids: Set<UUID>
+        if multiSelectMode {
+            ids = multiSelection
+        } else if let sel = selection {
+            ids = [sel]
+        } else {
+            ids = []
+        }
+        if renderer.highlightObjectIDs != ids {
+            renderer.highlightObjectIDs = ids
+            if !renderer.updateMaterialsOnly(scene: project.scene, meshes: meshes) {
+                renderer.rebuild(scene: project.scene, meshes: meshes)
+            }
+            kickRender()
+        }
+    }
+
+    /// One tap in Multi Select mode (viewport or tree): add
+    /// the object to the set, or remove it if it's already in.
+    /// The tapped object becomes the primary selection when
+    /// added; removing the primary promotes another member.
+    func toggleMultiSelection(_ id: UUID) {
+        guard project.scene.objects.contains(where: { $0.id == id }) else { return }
+        if multiSelection.contains(id) {
+            multiSelection.remove(id)
+            if selection == id {
+                selection = multiSelection.first
+            }
+            status = multiSelection.isEmpty
+                ? "Multi Select: nothing selected."
+                : "Multi Select: \(multiSelection.count) object\(multiSelection.count == 1 ? "" : "s") selected."
+        } else {
+            multiSelection.insert(id)
+            selection = id
+            if let name = project.scene.objects.first(where: { $0.id == id })?.name {
+                status = "Multi Select: \(name) added (\(multiSelection.count) selected)."
+            }
+        }
+    }
+
+    func clearMultiSelection() {
+        multiSelection = []
+        selection = nil
+    }
+
+    /// Delete the whole set as ONE undo step.
+    func deleteMultiSelection() {
+        let ids = multiSelection
+        guard ids.count > 1 else { deleteSelected(); return }
+        beginEdit()
+        project.scene.objects.removeAll { ids.contains($0.id) }
+        for id in ids {
+            snowExposureA.removeValue(forKey: id)
+            bakedExposureSteps.removeValue(forKey: id)
+        }
+        multiSelection = []
+        selection = nil
+        renderer.objectSnowAmounts = snowExposureA
+        renderer.rebuild(scene: project.scene, meshes: meshes)
+        kickRender()
+        status = "Deleted \(ids.count) objects."
+    }
+
+    /// Group-safe visibility: hide all members, or show all
+    /// if every member is hidden.
+    func toggleVisibilityForMultiSelection() {
+        let ids = multiSelection
+        guard ids.count > 1 else { return }
+        let anyVisible = project.scene.objects.contains { ids.contains($0.id) && $0.visible }
+        beginEdit()
+        mutateScene { scene in
+            for i in scene.objects.indices where ids.contains(scene.objects[i].id) {
+                scene.objects[i].visible = !anyVisible
+            }
+        }
+        status = anyVisible ? "Hid \(ids.count) objects." : "Showed \(ids.count) objects."
+    }
+
+    /// Can a viewport drag starting on `id` move something?
+    /// (The single selection, or any member of the multi set.)
+    func dragSetContains(_ id: UUID) -> Bool {
+        if multiSelectMode && multiSelection.count > 1 {
+            return multiSelection.contains(id)
+        }
+        return selection == id
     }
 
     // MARK: Model import (STL / OBJ / USD via ModelIO)
@@ -701,6 +870,9 @@ final class EditorSession: ObservableObject {
     func toggleMode() {
         pressedKeys.removeAll() // a held key must not survive the switch
         touchVector = .zero // a stuck joystick must not survive either
+        // v4.6: multi-select is an edit-mode tool — entering
+        // Play switches tools, which clears the set.
+        if multiSelectMode { multiSelectMode = false }
         if mode == .edit {
             // Entering Play. FIRST take the restore snapshot —
             // before the runtime touches anything — then clear
@@ -2024,6 +2196,17 @@ final class EditorSession: ObservableObject {
                                      + basis.up * (ndc.y * tanH))
             if let hit = renderer.pick(origin: basis.origin, dir: dir) {
                 runtime.handleTap(objectID: hit)
+            }
+            return
+        }
+        if multiSelectMode {
+            // Multi Select tool: taps toggle membership; a tap
+            // on empty space clears the set.
+            if let hit = pickAt(ndc: ndc, aspect: aspect) {
+                toggleMultiSelection(hit)
+            } else {
+                clearMultiSelection()
+                status = "Multi Select: cleared."
             }
             return
         }
