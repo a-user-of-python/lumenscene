@@ -909,7 +909,7 @@ final class Renderer {
                 pu.time = Float(CACurrentMediaTime().truncatingRemainder(dividingBy: 3600))
                 pu.mode = UInt32(weatherMode)
                 penc.setVertexBytes(&pu, length: MemoryLayout<PrecipUniforms>.stride, index: 0)
-                penc.setBuffer(precipSeedBuffer, offset: 0, index: 1)
+                penc.setVertexBuffer(precipSeedBuffer, offset: 0, index: 1)
                 let particleCount = weatherMode == 1 ? 1600 : 1200
                 penc.drawPrimitives(type: .triangle, vertexStart: 0,
                                     vertexCount: particleCount * 6)
