@@ -36,6 +36,15 @@ final class EditorSession: ObservableObject {
     /// published values when the displayed percentage changes.
     private var buildupWet: Double = 0
     private var buildupSnow: Double = 0
+    /// v3.4: quantised build-up steps (of 24) already baked into
+    /// the renderer's weather GEOMETRY (snow displacement +
+    /// puddle water sheets). -1 = nothing baked yet. Geometry
+    /// rebuilds are the expensive part of weather, so they run
+    /// only when a step boundary is crossed, at most ~1 per
+    /// 0.8 s; the shading levels stay continuous throughout.
+    private var geoStepWet = -1
+    private var geoStepSnow = -1
+    private var lastGeoRebuildAt: CFTimeInterval = 0
 
     /// Weather dynamics (v3.2 — same non-published discipline
     /// as the build-up accumulators): a clock that runs while
@@ -71,6 +80,14 @@ final class EditorSession: ObservableObject {
         buildupSnow = project.scene.weather.snow
         renderer.onNeedsFrame = { [weak self] in self?.kickRender() }
         _ = renderer.reloadTextureArraysIfNeeded()
+        // v3.4: seed the renderer's quantised geometry levels
+        // from the saved build-up BEFORE the first rebuild, so a
+        // project saved with snow/puddles opens with its solid
+        // weather already in place.
+        geoStepWet = Int((buildupWet * 24).rounded())
+        geoStepSnow = Int((buildupSnow * 24).rounded())
+        renderer.weatherGeoWet = Float(geoStepWet) / 24
+        renderer.weatherGeoSnow = Float(geoStepSnow) / 24
         renderer.rebuild(scene: project.scene, meshes: meshes)
         if !renderer.rayTracingSupported {
             status = "This device does not support Metal ray tracing."
@@ -476,6 +493,13 @@ final class EditorSession: ObservableObject {
         buildupSnow = 0
         project.scene.weather.wetness = 0
         project.scene.weather.snow = 0
+        // v3.4: the solid weather geometry goes too — a full
+        // rebuild at zero levels removes sheets + displacement.
+        geoStepWet = 0
+        geoStepSnow = 0
+        renderer.weatherGeoWet = 0
+        renderer.weatherGeoSnow = 0
+        renderer.rebuild(scene: project.scene, meshes: meshes)
         renderer.resetAccumulation()
         kickRender()
         status = "Ground build-up cleared."
@@ -547,6 +571,23 @@ final class EditorSession: ObservableObject {
         renderer.weatherDynRain = project.scene.weather.mode == 1
             ? Float(dynIntensity) : 0
         renderer.weatherWind = dynWind
+        // v3.4: weather GEOMETRY follows the build-up in
+        // quantised steps of 1/24, coalesced to at most one
+        // geometry rebuild per ~0.8 s. A step is ~4% of full
+        // cover — at full snow that's about a centimetre of
+        // drift growth per rebuild, arriving in the same short
+        // accumulation-reset bursts scene edits already use.
+        let stepWet = Int((buildupWet * 24).rounded())
+        let stepSnow = Int((buildupSnow * 24).rounded())
+        if (stepWet != geoStepWet || stepSnow != geoStepSnow),
+           now - lastGeoRebuildAt >= 0.8 {
+            geoStepWet = stepWet
+            geoStepSnow = stepSnow
+            lastGeoRebuildAt = now
+            renderer.weatherGeoWet = Float(stepWet) / 24
+            renderer.weatherGeoSnow = Float(stepSnow) / 24
+            renderer.rebuild(scene: project.scene, meshes: meshes)
+        }
         // Published sync only when the displayed (whole-percent)
         // value actually changes.
         if Int((buildupWet * 100).rounded()) != Int((project.scene.weather.wetness * 100).rounded())

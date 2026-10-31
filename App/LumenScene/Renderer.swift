@@ -211,6 +211,30 @@ final class Renderer {
     var weatherMode: Int = 0
     var weatherWet: Float = 0
     var weatherSnow: Float = 0
+    /// v3.4: QUANTISED build-up levels (steps of 1/24) that the
+    /// current geometry was baked for. rebuild() turns these into
+    /// real snow displacement + puddle water sheets; the session
+    /// updates them only when a step boundary is crossed, so the
+    /// expensive geometry path runs in short, coalesced bursts
+    /// while the shading levels above stay continuous.
+    var weatherGeoWet: Float = 0
+    var weatherGeoSnow: Float = 0
+    /// True when the last geometry rebuild emitted water sheets —
+    /// the material table then carries the sheet material last,
+    /// and updateMaterialsOnly must reproduce it exactly.
+    private var sceneHasSheetMaterial = false
+    // v3.4 dynamic resolution (motion frames only): a multiplier
+    // on the tier's motion scale, driven by the delivered frame
+    // cadence from command-buffer completion deltas. 1.0 is the
+    // tier's nominal scale — it only ever trims WHILE MOVING, in
+    // small steps with a cooldown, when frames are demonstrably
+    // missing the 60 fps cadence, and it resets to 1.0 when the
+    // scene settles. The settled image is always full quality.
+    private var dynScale: Float = 1.0
+    private var dynCadenceEMA: Double = 0
+    private var dynLastCompletion: CFTimeInterval = 0
+    private var dynFramesSinceAdjust = 0
+    private let dynLock = NSLock()
     /// Weather dynamics (v3.2), written by the session every
     /// tick alongside the levels: a slow surge clock, the live
     /// intensity it produces, the rain-only intensity the trace
@@ -503,6 +527,12 @@ final class Renderer {
         var triObjects: [UUID] = []
         var objectOrder: [UUID] = []
 
+        // Gather the included objects first: the puddle sheet
+        // material (when any sheet is emitted) must sit at a
+        // deterministic index — right after the last object
+        // material — so updateMaterialsOnly can reproduce the
+        // exact same material table without the geometry.
+        var included: [(obj: SceneObject, world: MeshData)] = []
         for obj in scene.objects where obj.visible {
             let local: MeshData
             if obj.source == "primitive" {
@@ -514,22 +544,42 @@ final class Renderer {
                 continue
             }
             if local.isEmpty { continue }
-            let world = local.baked(by: obj.transform.matrix)
+            included.append((obj, local.baked(by: obj.transform.matrix)))
+        }
+        let sheetMatIndex = UInt32(included.count)
+        let weatherGeoActive = weatherGeoWet > 0.001 || weatherGeoSnow > 0.001
+        var triBudget = 220_000
+        var sheetEmitted = false
+        for (obj, world) in included {
             let matIndex = UInt32(materials.count)
             materials.append(gpuMaterial(for: obj))
             objectOrder.append(obj.id)
-            let vBase = UInt32(positions.count / 3)
-            positions += world.positions
-            normals += world.normals
-            uvArr += world.uvs
-            colArr += world.colors
-            for t in 0..<world.triangleCount {
-                let a = world.indices[3 * t], b = world.indices[3 * t + 1], c = world.indices[3 * t + 2]
-                indices += [vBase + a, vBase + b, vBase + c]
-                triMats.append(matIndex)
-                triObjects.append(obj.id)
+            if weatherGeoActive {
+                appendWeatherGeometry(world: world, objectID: obj.id,
+                                      matIndex: matIndex, sheetIndex: sheetMatIndex,
+                                      positions: &positions, normals: &normals,
+                                      uvs: &uvArr, colors: &colArr,
+                                      indices: &indices, triMats: &triMats,
+                                      triObjects: &triObjects,
+                                      budget: &triBudget, sheetEmitted: &sheetEmitted)
+            } else {
+                let vBase = UInt32(positions.count / 3)
+                positions += world.positions
+                normals += world.normals
+                uvArr += world.uvs
+                colArr += world.colors
+                for t in 0..<world.triangleCount {
+                    let a = world.indices[3 * t], b = world.indices[3 * t + 1], c = world.indices[3 * t + 2]
+                    indices += [vBase + a, vBase + b, vBase + c]
+                    triMats.append(matIndex)
+                    triObjects.append(obj.id)
+                }
             }
         }
+        if sheetEmitted {
+            materials.append(sheetMaterial())
+        }
+        sceneHasSheetMaterial = sheetEmitted
 
         triCount = indices.count / 3
         cpuPositions = positions
@@ -576,6 +626,9 @@ final class Renderer {
             guard let obj = scene.object(id: id) else { return false }
             materials.append(gpuMaterial(for: obj))
         }
+        // v3.4: reproduce the geometry rebuild's material table
+        // exactly — the puddle sheet material rides last.
+        if sceneHasSheetMaterial { materials.append(sheetMaterial()) }
         uploadEmissiveIndex(materials: materials)
         matBuffer = makeBuffer(materials)
         resetAccumulation()
@@ -654,6 +707,384 @@ final class Renderer {
         g.texIndex = texIndexValue(forPreset: m.texturePreset)
         g.flags = flags
         return g
+    }
+
+    /// v3.4: the puddle water material — one shared entry appended
+    /// after all object materials whenever the geometry contains
+    /// water sheets. FLAG_SHEET (16) routes it to the water
+    /// shading branch of the trace kernel; the dark blue-grey is
+    /// the water body colour seen where the mirror reflection is
+    /// weak (steep view angles).
+    private func sheetMaterial() -> GPUMaterial {
+        var g = GPUMaterial()
+        g.baseColor = SIMD4<Float>(0.030, 0.045, 0.060, 0)
+        g.emissive = SIMD4<Float>(0, 0, 0, 0)
+        g.glassParams = SIMD4<Float>(0, 0.05, 1.33, 0)
+        g.tint = SIMD4<Float>(1, 1, 1, 1)
+        g.texIndex = 0
+        g.flags = 16
+        return g
+    }
+
+    // MARK: - Weather geometry (v3.4: snow and puddles become solid)
+    //
+    // Through v3.3, build-up weather was shading only: snow
+    // whitened albedo, puddles were a gloss mask painted on the
+    // floor. In a path tracer that has no silhouette, no
+    // parallax and no occlusion — obvious at grazing angles
+    // (device verdict 2026-10-30: "Snow isn't 3D — it's just
+    // whiter and whiter, and neither are puddles"). This pass
+    // makes both REAL, inside rebuild(), from the same fields
+    // the shader shades with:
+    //
+    //   * SNOW: up-facing triangles are subdivided (target edge
+    //     ~0.22 m) and their vertices displaced upward by the
+    //     drift-shaped snow depth, up to ~0.30 m at full cover.
+    //     A barycentric edge fade pins every original triangle
+    //     boundary to zero displacement, so displaced patches
+    //     meet undisplaced neighbours with no cracks, and objects
+    //     standing on snowy ground read as sitting IN the snow.
+    //     Vertex normals come from the heightfield gradient, so
+    //     drifts shade like solids — and since the displaced
+    //     triangles live in the acceleration structure, they
+    //     occlude, reflect and cast real shadows.
+    //   * PUDDLES: where the mirrored puddle mask is strong at a
+    //     subdivided triangle's centre, a water SHEET triangle
+    //     is emitted above the surface — up to ~13 mm at the
+    //     pool centre by depth, rim vertices tucked 2.5 mm
+    //     BELOW the surface, so the edge is a tiny sloped wall
+    //     that catches light at grazing angles instead of a
+    //     painted outline. Sheets carry the host object's id
+    //     (tapping a puddle selects its floor) and the shared
+    //     FLAG_SHEET material.
+    //
+    // The field functions below are exact CPU mirrors of the
+    // shader's baked-field formulas (same hashes, same
+    // constants), so geometry and shading agree on where the
+    // drifts and pools are. Levels arrive quantised to steps of
+    // 1/24 (the session rebuilds only when a step is crossed),
+    // and a scene-wide budget caps added triangles; past the
+    // budget a surface keeps the v3.3 shading-only look rather
+    // than blowing the frame budget. Per-frame cost of all of
+    // this is zero: the result is ordinary static geometry in
+    // the same single acceleration structure.
+
+    private func wgfHash(_ x0: UInt32) -> UInt32 {
+        var x = x0
+        x ^= x >> 16; x = x &* 0x7feb352d
+        x ^= x >> 15; x = x &* 0x846ca68b
+        x ^= x >> 16
+        return x
+    }
+
+    private func wgfLattice(_ ix: Int32, _ iy: Int32) -> Float {
+        let h = wgfHash((UInt32(bitPattern: ix) &* 0x8da6b343)
+                        ^ (UInt32(bitPattern: iy) &* 0xd8163841))
+        return Float(h >> 8) * (1.0 / 16777216.0)
+    }
+
+    private func wgfNoise(_ px: Float, _ py: Float) -> Float {
+        let flx = px.rounded(.down), fly = py.rounded(.down)
+        let ix = Int32(flx), iy = Int32(fly)
+        let fx = px - flx, fy = py - fly
+        let sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy)
+        let v00 = wgfLattice(ix, iy), v10 = wgfLattice(ix + 1, iy)
+        let v01 = wgfLattice(ix, iy + 1), v11 = wgfLattice(ix + 1, iy + 1)
+        let lo = v00 + (v10 - v00) * sx
+        let hi = v01 + (v11 - v01) * sx
+        return lo + (hi - lo) * sy
+    }
+
+    private func wgfFbm(_ px: Float, _ py: Float) -> Float {
+        0.55 * wgfNoise(px, py)
+            + 0.30 * wgfNoise(px * 2, py * 2)
+            + 0.15 * wgfNoise(px * 4, py * 4)
+    }
+
+    private func wgfSmooth(_ e0: Float, _ e1: Float, _ v: Float) -> Float {
+        let t = min(1, max(0, (v - e0) / (e1 - e0)))
+        return t * t * (3 - 2 * t)
+    }
+
+    private func wgfClamp(_ v: Float, _ lo: Float, _ hi: Float) -> Float {
+        min(hi, max(lo, v))
+    }
+
+    /// Window fade of the baked field (1 inside ±29 m, 0 at ±32 m).
+    private func wgfFade(_ x: Float, _ z: Float) -> Float {
+        (1 - wgfSmooth(29, 32, abs(x))) * (1 - wgfSmooth(29, 32, abs(z)))
+    }
+
+    /// Drift field (baked texture B channel), window-faded.
+    private func wgfDrift(_ x: Float, _ z: Float) -> Float {
+        if abs(x) > 40 || abs(z) > 40 { return 0.5 }
+        let raw = wgfFbm(x * 0.5 + 9.17, z * 0.5 + 27.3)
+        return 0.5 + (raw - 0.5) * wgfFade(x, z)
+    }
+
+    /// Broad pooling field (baked texture A channel), faded.
+    private func wgfBroad(_ x: Float, _ z: Float) -> Float {
+        if abs(x) > 40 || abs(z) > 40 { return 0.489 }
+        let raw = wgfFbm(x * 0.32 + 17.31, z * 0.32 + 3.97)
+        return 0.489 + (raw - 0.489) * wgfFade(x, z)
+    }
+
+    /// Metaball puddle potential (baked texture R channel), faded.
+    private func wgfPotential(_ x: Float, _ z: Float) -> Float {
+        if abs(x) > 40 || abs(z) > 40 { return 0 }
+        let px = x / 1.15, py = z / 1.15
+        let wx = wgfFbm(px * 0.16 + 3.1, py * 0.16 + 7.7)
+        let wy = wgfFbm(px * 0.16 + 11.9, py * 0.16 + 1.3)
+        let qx = px + (wx - 0.5), qy = py + (wy - 0.5)
+        let fqx = qx.rounded(.down), fqy = qy.rounded(.down)
+        let ix = Int32(fqx), iy = Int32(fqy)
+        let fx = qx - fqx, fy = qy - fqy
+        var sum: Float = 0
+        for j in -1...1 {
+            for i in -1...1 {
+                let cx = ix + Int32(i), cy = iy + Int32(j)
+                let h = wgfHash((UInt32(bitPattern: cx) &* 0x8da6b343)
+                                ^ (UInt32(bitPattern: cy) &* 0xd8163841))
+                let r0 = Float(h >> 8) * (1.0 / 16777216.0)
+                let h2 = wgfHash(h ^ 0x9e3779b9)
+                let r1 = Float(h2 >> 8) * (1.0 / 16777216.0)
+                let h3 = wgfHash(h2 ^ 0x85ebca6b)
+                let cr = Float(h3 >> 8) * (1.0 / 16777216.0)
+                let a = powf(wgfClamp((0.58 - cr) / 0.58, 0, 1), 0.7)
+                if a <= 0.001 { continue }
+                let ddx = (Float(i) + r0) - fx
+                let ddy = (Float(j) + r1) - fy
+                let d = sqrtf(ddx * ddx + ddy * ddy)
+                let s = wgfClamp(1 - (d / 1.45) * (d / 1.45), 0, 1)
+                sum += a * s * s
+            }
+        }
+        return sum * wgfFade(x, z)
+    }
+
+    /// Snow depth (metres) the geometry carries at (x, z) for a
+    /// quantised level: drift-shaped, and zero exactly where the
+    /// shader's snow coverage is zero, so the silhouette and the
+    /// whitening agree.
+    private func wgfSnowHeight(_ x: Float, _ z: Float, level: Float) -> Float {
+        let d = level * (0.3 + 1.4 * wgfDrift(x, z))
+        let cover = wgfSmooth(0.45, 0.75, d)
+        return 0.30 * cover * min(d / 1.35, 1)
+    }
+
+    private func wgfSnowCover(_ x: Float, _ z: Float, level: Float) -> Float {
+        wgfSmooth(0.45, 0.75, level * (0.3 + 1.4 * wgfDrift(x, z)))
+    }
+
+    /// The trace kernel's puddle mask, mirrored: (mask, depth01)
+    /// where depth01 says how deep into the pool the point sits.
+    private func wgfPuddle(_ x: Float, _ z: Float, y: Float, geoNY: Float,
+                           level: Float) -> (mask: Float, depth: Float) {
+        let upFace = wgfSmooth(0.5, 0.85, geoNY)
+        if upFace <= 0 || level <= 0.001 { return (0, 0) }
+        let elevBias = wgfClamp(0.10 - y * 0.55, -0.22, 0.38)
+        let slopeShed = wgfClamp((geoNY - 0.70) / 0.30, 0, 1)
+        let thr = (1.15 + (0.08 - 1.15) * powf(level, 1.15)) - elevBias * 0.45
+        let pot = wgfPotential(x, z)
+        var m = wgfSmooth(thr - 0.14, thr + 0.14, pot)
+            * (0.78 + 0.45 * wgfBroad(x, z))
+        m = wgfClamp(m, 0, 1) * slopeShed * upFace
+            * wgfFade(x, z) * wgfSmooth(0.03, 0.15, level)
+        return (m, wgfClamp((pot - thr) / 0.5, 0, 1))
+    }
+
+    /// Append one object's world mesh with weather geometry
+    /// applied (see the section comment above).
+    private func appendWeatherGeometry(world: MeshData, objectID: UUID,
+                                       matIndex: UInt32, sheetIndex: UInt32,
+                                       positions: inout [Float], normals: inout [Float],
+                                       uvs: inout [Float], colors: inout [Float],
+                                       indices: inout [UInt32], triMats: inout [UInt32],
+                                       triObjects: inout [UUID],
+                                       budget: inout Int, sheetEmitted: inout Bool) {
+        let wet = weatherGeoWet
+        let snow = weatherGeoSnow
+
+        func wPos(_ idx: UInt32) -> SIMD3<Float> {
+            let i = Int(idx) * 3
+            return SIMD3<Float>(world.positions[i], world.positions[i + 1], world.positions[i + 2])
+        }
+        func wNrm(_ idx: UInt32) -> SIMD3<Float> {
+            let i = Int(idx) * 3
+            return SIMD3<Float>(world.normals[i], world.normals[i + 1], world.normals[i + 2])
+        }
+        func wCol(_ idx: UInt32) -> SIMD3<Float> {
+            let i = Int(idx) * 3
+            return SIMD3<Float>(world.colors[i], world.colors[i + 1], world.colors[i + 2])
+        }
+        func wUV(_ idx: UInt32) -> SIMD2<Float> {
+            let i = Int(idx) * 2
+            return SIMD2<Float>(world.uvs[i], world.uvs[i + 1])
+        }
+        // One undisplaced triangle with its source attributes —
+        // the v3.3 shading-only look.
+        func emitFlat(_ a: UInt32, _ b: UInt32, _ c: UInt32) {
+            let base = UInt32(positions.count / 3)
+            for v in [a, b, c] {
+                let p = wPos(v), n = wNrm(v), t = wUV(v), cl = wCol(v)
+                positions.append(contentsOf: [p.x, p.y, p.z])
+                normals.append(contentsOf: [n.x, n.y, n.z])
+                uvs.append(contentsOf: [t.x, t.y])
+                colors.append(contentsOf: [cl.x, cl.y, cl.z])
+            }
+            indices.append(contentsOf: [base, base + 1, base + 2])
+            triMats.append(matIndex)
+            triObjects.append(objectID)
+        }
+
+        for t in 0..<world.triangleCount {
+            let ia = world.indices[3 * t]
+            let ib = world.indices[3 * t + 1]
+            let ic = world.indices[3 * t + 2]
+            let p0 = wPos(ia), p1 = wPos(ib), p2 = wPos(ic)
+            let cr = simd_cross(p1 - p0, p2 - p0)
+            let cl = simd_length(cr)
+            if cl < 1e-12 { emitFlat(ia, ib, ic); continue }
+            let geoN = cr / cl
+            let longest = max(simd_length(p1 - p0),
+                              max(simd_length(p2 - p1), simd_length(p0 - p2)))
+            if geoN.y <= 0.62 || budget <= 0 { emitFlat(ia, ib, ic); continue }
+            // Cheap reject: a small triangle whose corners and
+            // centre are all snow-free and pool-free stays flat.
+            // Displaced neighbours pin their shared border to
+            // zero height, so this cannot open a crack.
+            if longest <= 2.0 {
+                var maxH: Float = 0
+                var maxM: Float = 0
+                for q in [p0, p1, p2, (p0 + p1 + p2) / 3] {
+                    if snow > 0.001 {
+                        maxH = max(maxH, wgfSnowHeight(q.x, q.z, level: snow))
+                    }
+                    if wet > 0.001 {
+                        maxM = max(maxM, wgfPuddle(q.x, q.z, y: q.y,
+                                                   geoNY: geoN.y, level: wet).mask)
+                    }
+                }
+                if maxH < 0.001 && maxM < 0.08 { emitFlat(ia, ib, ic); continue }
+            }
+            var n = Int((longest / 0.22).rounded(.up))
+            n = max(1, min(n, 56))
+            while n > 1 && n * n > budget { n -= 1 }
+            if n < 2 { emitFlat(ia, ib, ic); continue }
+            budget -= n * n
+
+            // Triangular lattice: vertex (i, j) carries
+            // barycentric weights (1-(i+j)/n, i/n, j/n) over
+            // (p0, p1, p2), indexed row-major by gIdx.
+            let nf = Float(n)
+            var gPos: [SIMD3<Float>] = []
+            var gUV: [SIMD2<Float>] = []
+            var gMask: [Float] = []
+            var gDepth: [Float] = []
+            var gSnow: [Float] = []
+            gPos.reserveCapacity((n + 1) * (n + 2) / 2)
+            let vBase = UInt32(positions.count / 3)
+            for i in 0...n {
+                for j in 0...(n - i) {
+                    let wb = Float(i) / nf, wc = Float(j) / nf
+                    let wa = 1 - wb - wc
+                    let pos = p0 * wa + p1 * wb + p2 * wc
+                    var nrm = wNrm(ia) * wa + wNrm(ib) * wb + wNrm(ic) * wc
+                    let nl = simd_length(nrm)
+                    if nl > 1e-6 { nrm /= nl }
+                    var disp = pos
+                    var snowC: Float = 0
+                    if snow > 0.001 {
+                        snowC = wgfSnowCover(pos.x, pos.z, level: snow)
+                        let edgeFade = wgfSmooth(0, 0.18, min(wa, min(wb, wc)))
+                        let h = wgfSnowHeight(pos.x, pos.z, level: snow) * edgeFade
+                        if h > 0.0005 {
+                            disp.y += h
+                            let e: Float = 0.05
+                            let gx = (wgfSnowHeight(pos.x + e, pos.z, level: snow)
+                                      - wgfSnowHeight(pos.x - e, pos.z, level: snow)) / (2 * e)
+                            let gz = (wgfSnowHeight(pos.x, pos.z + e, level: snow)
+                                      - wgfSnowHeight(pos.x, pos.z - e, level: snow)) / (2 * e)
+                            let sn = simd_normalize(SIMD3<Float>(-gx, 1, -gz))
+                            let blend = min(h / 0.03, 1)
+                            nrm = simd_normalize(nrm * (1 - blend) + sn * blend)
+                        }
+                    }
+                    gSnow.append(snowC)
+                    var mask: Float = 0, depth01: Float = 0
+                    if wet > 0.001 {
+                        let pm = wgfPuddle(pos.x, pos.z, y: pos.y,
+                                           geoNY: geoN.y, level: wet)
+                        mask = pm.mask; depth01 = pm.depth
+                    }
+                    gMask.append(mask); gDepth.append(depth01)
+                    gPos.append(disp)
+                    let tuv = wUV(ia) * wa + wUV(ib) * wb + wUV(ic) * wc
+                    gUV.append(tuv)
+                    let col = wCol(ia) * wa + wCol(ib) * wb + wCol(ic) * wc
+                    positions.append(contentsOf: [disp.x, disp.y, disp.z])
+                    normals.append(contentsOf: [nrm.x, nrm.y, nrm.z])
+                    uvs.append(contentsOf: [tuv.x, tuv.y])
+                    colors.append(contentsOf: [col.x, col.y, col.z])
+                }
+            }
+            func gIdx(_ i: Int, _ j: Int) -> Int {
+                i * (n + 1) - i * (i - 1) / 2 + j
+            }
+            // One water sheet triangle over a subdivided
+            // triangle: centre vertices ride up to ~13 mm above
+            // the surface by pool depth; rim vertices tuck
+            // 2.5 mm below it, so the edge is a tiny sloped
+            // wall — a real rim, not a painted outline.
+            func emitSheet(_ a: Int, _ b: Int, _ c: Int) {
+                var order = [a, b, c]
+                if simd_cross(gPos[b] - gPos[a], gPos[c] - gPos[a]).y < 0 {
+                    order = [a, c, b]
+                }
+                let base = UInt32(positions.count / 3)
+                for k in order {
+                    let gp = gPos[k]
+                    let off: Float = gMask[k] < 0.45 ? -0.0025
+                        : 0.0035 + 0.0095 * gDepth[k]
+                    positions.append(contentsOf: [gp.x, gp.y + off, gp.z])
+                    normals.append(contentsOf: [0, 1, 0])
+                    uvs.append(contentsOf: [gUV[k].x, gUV[k].y])
+                    colors.append(contentsOf: [1, 1, 1])
+                }
+                indices.append(contentsOf: [base, base + 1, base + 2])
+                triMats.append(sheetIndex)
+                triObjects.append(objectID)
+                sheetEmitted = true
+            }
+            func emitSub(_ a: Int, _ b: Int, _ c: Int) {
+                var bb = b, cc = c
+                // Winding repair against the host face:
+                // displacement must never flip a subtriangle
+                // inside-out.
+                if simd_dot(simd_cross(gPos[bb] - gPos[a],
+                                       gPos[cc] - gPos[a]), geoN) < 0 {
+                    swap(&bb, &cc)
+                }
+                indices.append(contentsOf: [vBase + UInt32(a),
+                                            vBase + UInt32(bb),
+                                            vBase + UInt32(cc)])
+                triMats.append(matIndex)
+                triObjects.append(objectID)
+                if wet > 0.001 {
+                    let mC = (gMask[a] + gMask[bb] + gMask[cc]) / 3
+                    let sC = (gSnow[a] + gSnow[bb] + gSnow[cc]) / 3
+                    if mC * (1 - sC) > 0.5 { emitSheet(a, bb, cc) }
+                }
+            }
+            for i in 0..<n {
+                for j in 0..<(n - i) {
+                    emitSub(gIdx(i, j), gIdx(i + 1, j), gIdx(i, j + 1))
+                }
+                for j in 0..<(n - 1 - i) {
+                    emitSub(gIdx(i + 1, j + 1), gIdx(i, j + 1), gIdx(i + 1, j))
+                }
+            }
+        }
     }
 
     private func buildAccelerationStructure() {
@@ -762,7 +1193,10 @@ final class Renderer {
         case 1: // High detail
             spp = 3; bounces = 6; glass = 6; maxSettle = 1536
         case 2: // Battery saver (user-chosen)
-            scale = 0.8; spp = 1; bounces = 4; glass = 3; maxSettle = 256
+            // v3.4: glass floor raised (was 3) — see the motion
+            // cap below; the mode's savings live in resolution,
+            // spp and the settle cap, not in starving glass.
+            scale = 0.8; spp = 1; bounces = 4; glass = 4; maxSettle = 256
         default:
             break
         }
@@ -774,7 +1208,13 @@ final class Renderer {
             scale = min(scale, qualityPreference == 2 ? 0.55 : 0.65)
             spp = qualityPreference == 2 ? 3 : 4
             bounces = min(bounces, 4)
-            glass = min(glass, 2)
+            // v3.4: Battery Saver keeps a higher glass floor in
+            // motion (3 refractions, not 2) — the old cap hit
+            // glass hardest and it went visibly fuzzy there,
+            // while the mode still saves real power through
+            // resolution (0.55), spp and settle caps. Other
+            // modes keep the v2 motion budget of 2.
+            glass = min(glass, qualityPreference == 2 ? 3 : 2)
             reuseCap = play ? 16 : 24
         }
         // Thermal state is an emergency brake only.
@@ -1034,8 +1474,15 @@ final class Renderer {
         // any other.
         let weatherLevelsQuiet = abs(weatherWet - lastTracedWet) <= 0.004
             && abs(weatherSnow - lastTracedSnow) <= 0.004
-        let pixelW = max(1, Int(Float(view.drawableSize.width) * t.scale))
-        let pixelH = max(1, Int(Float(view.drawableSize.height) * t.scale))
+        // v3.4 dynamic resolution: while moving, the tier scale
+        // is multiplied by dynScale (see the completion handler
+        // at the bottom of draw) so a scene that cannot hold the
+        // 60 fps cadence trades a little motion resolution —
+        // never rest resolution — instead of dropping frames.
+        dynLock.lock(); let dScale = dynScale; dynLock.unlock()
+        let effScale = t.scale * (moving ? dScale : 1.0)
+        let pixelW = max(1, Int(Float(view.drawableSize.width) * effScale))
+        let pixelH = max(1, Int(Float(view.drawableSize.height) * effScale))
         if accumTex[0] == nil || accumTex[0]!.width != pixelW || accumTex[0]!.height != pixelH {
             accumTex = [makeAccumTexture(width: pixelW, height: pixelH),
                         makeAccumTexture(width: pixelW, height: pixelH)]
@@ -1078,6 +1525,12 @@ final class Renderer {
             if weatherMode != 0 {
                 encodePrecip(cmd: cmd, drawable: drawable, camera: camera, view: view)
             }
+            // Settled: dynamic resolution stands down — the next
+            // motion starts from the tier's full motion scale.
+            dynLock.lock()
+            dynScale = 1.0; dynCadenceEMA = 0; dynLastCompletion = 0
+            dynFramesSinceAdjust = 0
+            dynLock.unlock()
             cmd.present(drawable)
             cmd.commit()
             wasMoving = moving
@@ -1181,6 +1634,48 @@ final class Renderer {
 
         // Precipitation overlay (live draw only).
         encodePrecip(cmd: cmd, drawable: drawable, camera: camera, view: view)
+
+        // v3.4 dynamic resolution feedback: the delivered cadence
+        // of traced frames (completion-to-completion) is the
+        // ground truth for "is this holding 60 fps". While moving,
+        // a cadence EMA clearly above the 16.7 ms vsync quantum
+        // means frames are landing on 33 ms steps — trim the
+        // motion resolution a notch (floor 0.70x of the tier
+        // scale); a locked 60 fps cadence earns it back. Steps
+        // are at most one per 45 traced frames, so the scale
+        // never hunts; rest frames never feed the EMA.
+        if traced {
+            let frameMoving = moving
+            cmd.addCompletedHandler { [weak self] _ in
+                guard let self else { return }
+                let now = ProcessInfo.processInfo.systemUptime
+                self.dynLock.lock()
+                if frameMoving {
+                    if self.dynLastCompletion > 0 {
+                        let dt = now - self.dynLastCompletion
+                        if dt > 0.004, dt < 0.25 {
+                            self.dynCadenceEMA = self.dynCadenceEMA == 0
+                                ? dt
+                                : self.dynCadenceEMA * 0.9 + dt * 0.1
+                        }
+                    }
+                    self.dynLastCompletion = now
+                    self.dynFramesSinceAdjust += 1
+                    if self.dynFramesSinceAdjust >= 45, self.dynCadenceEMA > 0 {
+                        if self.dynCadenceEMA > 0.0195, self.dynScale > 0.70 {
+                            self.dynScale = max(0.70, self.dynScale - 0.08)
+                            self.dynFramesSinceAdjust = 0
+                        } else if self.dynCadenceEMA < 0.0169, self.dynScale < 1.0 {
+                            self.dynScale = min(1.0, self.dynScale + 0.05)
+                            self.dynFramesSinceAdjust = 0
+                        }
+                    }
+                } else {
+                    self.dynLastCompletion = 0
+                }
+                self.dynLock.unlock()
+            }
+        }
 
         cmd.present(drawable)
         cmd.commit()

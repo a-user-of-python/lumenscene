@@ -96,6 +96,7 @@ constant uint FLAG_EMISSIVE = 1u;
 constant uint FLAG_GLASS = 2u;
 constant uint FLAG_TRIPLANAR = 4u;
 constant uint FLAG_FIT = 8u;
+constant uint FLAG_SHEET = 16u;   // v3.4: puddle water sheet (real geometry)
 
 // MARK: - RNG (xorshift128, seeded per pixel + frame)
 
@@ -417,6 +418,12 @@ kernel void pathTraceKernel(
         float wet = u.wetLevel * upFace;
         float snowGlobal = u.snowLevel * upFace;
         float gloss = (mat.texIndex > 0) ? clamp(1.0f - texRough, 0.0f, 1.0f) : 0.0f;
+        // v3.4: puddle water sheets are real geometry carrying
+        // FLAG_SHEET. They shade as near-mirror standing water and
+        // skip the whole weather block below — no wet darkening,
+        // no snow cover, no second puddle mask on the water
+        // itself (the sheet's placement already IS the mask).
+        bool isSheet = (mat.flags & FLAG_SHEET) != 0u;
         // Shaped weather field: defaults are exactly the
         // v3 global behaviour (wetF = wet, snowCover = snowGlobal,
         // no puddle, drift 0.5, depth = snowGlobal). The shaped
@@ -437,7 +444,7 @@ kernel void pathTraceKernel(
         // the un-faded case identical to no field at all.
         float4 wfield = float4(0.0f, 0.5f, 0.5f, 0.489f);
         float fieldFade = 0.0f;
-        if ((u.wetLevel > 0.001f || u.snowLevel > 0.001f) && bounce <= 1u) {
+        if (!isSheet && (u.wetLevel > 0.001f || u.snowLevel > 0.001f) && bounce <= 1u) {
             // ONE bilinear fetch replaces the ~75 per-hit hash
             // evaluations of the procedural v3.1/v3.2 block. The
             // field window is 64 m across, centred on the
@@ -504,6 +511,7 @@ kernel void pathTraceKernel(
             depth = u.snowLevel * mix(0.3f, 1.7f, drift);
             snowCover = smoothstep(0.45f, 0.75f, depth) * upFace;
         }
+        if (!isSheet) {
         // 1. Wet: darkened, glossier.
         if (wetF > 0.001f) {
             albedo *= (1.0f - 0.45f * wetF);
@@ -552,6 +560,15 @@ kernel void pathTraceKernel(
             if (!relief) {
                 shadingN = normalize(mix(shadingN, geoN, snowCover * 0.6f));
             }
+        }
+        } // !isSheet — weather steps 1-3 skipped for water sheets
+        if (isSheet) {
+            // Standing water: near-mirror gloss, and the shading
+            // normal is the sheet's real (flat) surface normal,
+            // so the reflection is stable, has true parallax
+            // against the floor beneath, and tracks the camera.
+            gloss = 0.97f;
+            shadingN = geoN;
         }
 
         // ---- Glass: reflect / refract with Fresnel. Past the
@@ -772,6 +789,40 @@ kernel void guideKernel(
         float3(normals[3 * i2], normals[3 * i2 + 1], normals[3 * i2 + 2]) * bc2);
     Material mat = materials[triMat[tri]];
     float reusable = (mat.flags & FLAG_GLASS) ? 0.0f : 1.0f;
+    if ((mat.flags & FLAG_SHEET) != 0u) {
+        // v3.4: water sheets are pure reflection — view-dependent,
+        // never seeded from history (same treatment as glass).
+        reusable = 0.0f;
+    } else if (reusable > 0.5f) {
+        // v3.4 (reflection ghosting fix): history reuse is
+        // anchored on the primary hit POSITION — the right anchor
+        // for diffuse radiance, the wrong one for reflections,
+        // whose content changes the instant the viewpoint moves.
+        // Position-anchored reuse smeared the old reflection
+        // across the new one for the life of the history tail
+        // (device report 2026-10-30: a light lingering in puddles
+        // ~1 s after the camera moved). Reflection-dominant first
+        // hits now restart like glass: near-mirror gloss at any
+        // angle, or strong gloss whose Fresnel term at this view
+        // angle makes the reflection carry the pixel. Diffuse and
+        // matte surfaces keep full reuse — the motion clarity
+        // the reprojection exists for is untouched there.
+        float glossEff = (mat.texIndex > 0)
+            ? clamp(1.0f - mat.glassParams.y, 0.0f, 1.0f) : 0.0f;
+        float upFace = smoothstep(0.5f, 0.85f, nInterp.y);
+        // Wet ground turns glossy in the trace kernel (wetF x
+        // 0.85, puddles mirror-flat); mirror that from the levels.
+        glossEff = max(glossEff,
+                       clamp(u.wetLevel * upFace, 0.0f, 1.0f) * 0.85f);
+        // Snow cover kills the gloss again in the trace kernel.
+        glossEff *= 1.0f - smoothstep(0.45f, 0.75f, u.snowLevel * upFace);
+        float cosV = clamp(dot(-ray.direction, nInterp), 0.15f, 1.0f);
+        float fres = 0.04f + 0.96f * pow(1.0f - cosV, 5.0f);
+        if (glossEff >= 0.92f
+            || (glossEff >= 0.55f && glossEff * fres > 0.18f)) {
+            reusable = 0.0f;
+        }
+    }
     guide.write(float4(hitPos, reusable), pixel);
     guideNormal.write(float4(nInterp, reusable), pixel);
 }
