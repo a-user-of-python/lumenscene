@@ -289,11 +289,11 @@ extension Scene {
     // MaterialProps above).
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        objects = try c.decodeIfPresent([SceneObject].self, forKey: .objects) ?? []
-        camera = try c.decodeIfPresent(CameraState.self, forKey: .camera) ?? CameraState()
-        weather = try c.decodeIfPresent(WeatherState.self, forKey: .weather) ?? WeatherState()
-        areas = try c.decodeIfPresent([TriggerArea].self, forKey: .areas) ?? []
-        graph = try c.decodeIfPresent(NodeGraph.self, forKey: .graph) ?? NodeGraph()
+        objects = (try? c.decodeIfPresent([SceneObject].self, forKey: .objects)) ?? nil ?? []
+        camera = (try? c.decodeIfPresent(CameraState.self, forKey: .camera)) ?? nil ?? CameraState()
+        weather = (try? c.decodeIfPresent(WeatherState.self, forKey: .weather)) ?? nil ?? WeatherState()
+        areas = (try? c.decodeIfPresent([TriggerArea].self, forKey: .areas)) ?? nil ?? []
+        graph = (try? c.decodeIfPresent(NodeGraph.self, forKey: .graph)) ?? nil ?? NodeGraph()
     }
 }
 
@@ -311,4 +311,168 @@ struct ProjectMeta: Identifiable {
     var name: String
     var modifiedAt: Date
     var thumbnailURL: URL?
+}
+
+// MARK: - Defensive decoding for the remaining model types (F18/F2)
+
+/// Normalises a decoded coordinate triple to exactly 3 elements:
+/// extra elements are truncated, missing ones are padded from
+/// `fallback`. Transform/Camera/TriggerArea arrays are indexed
+/// [0]...[2] all over the app, so a truncated array in a stored
+/// file must never reach those subscripts.
+private func normalisedTriple(_ value: [Double]?, fallback: [Double]) -> [Double] {
+    var result = value ?? fallback
+    if result.count > 3 { result = Array(result.prefix(3)) }
+    while result.count < 3 { result.append(fallback[result.count]) }
+    return result
+}
+
+extension Transform3 {
+    private enum CodingKeys: String, CodingKey {
+        case position, rotation, scale
+    }
+
+    // Hand-written defensive Decodable (previously synthesised):
+    // every field falls back to its property default, mistyped
+    // values included (F18), and each array is normalised to
+    // exactly 3 elements so `matrix` can index safely (F2).
+    // encode(to:) stays synthesised — see MaterialProps.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        var decodedPosition: [Double]?
+        if let decoded = try? c.decodeIfPresent([Double].self, forKey: .position) {
+            decodedPosition = decoded
+        }
+        var decodedRotation: [Double]?
+        if let decoded = try? c.decodeIfPresent([Double].self, forKey: .rotation) {
+            decodedRotation = decoded
+        }
+        var decodedScale: [Double]?
+        if let decoded = try? c.decodeIfPresent([Double].self, forKey: .scale) {
+            decodedScale = decoded
+        }
+        position = normalisedTriple(decodedPosition, fallback: [0, 0, 0])
+        rotation = normalisedTriple(decodedRotation, fallback: [0, 0, 0])
+        scale = normalisedTriple(decodedScale, fallback: [1, 1, 1])
+    }
+}
+
+extension CameraState {
+    private enum CodingKeys: String, CodingKey {
+        case target, azimuth, elevation, distance
+        case playPosition, playYaw, playPitch
+    }
+
+    // Hand-written defensive Decodable, same pattern as
+    // Transform3: defaults everywhere, and `target`/`playPosition`
+    // normalised to exactly 3 elements (F2/F18).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        var decodedTarget: [Double]?
+        if let decoded = try? c.decodeIfPresent([Double].self, forKey: .target) {
+            decodedTarget = decoded
+        }
+        var decodedPlayPosition: [Double]?
+        if let decoded = try? c.decodeIfPresent([Double].self, forKey: .playPosition) {
+            decodedPlayPosition = decoded
+        }
+        target = normalisedTriple(decodedTarget, fallback: [0, 1, 0])
+        playPosition = normalisedTriple(decodedPlayPosition, fallback: [0, 1.7, 3.5])
+        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .azimuth),
+           let value = decoded {
+            azimuth = value
+        } else {
+            azimuth = 35
+        }
+        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .elevation),
+           let value = decoded {
+            elevation = value
+        } else {
+            elevation = 22
+        }
+        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .distance),
+           let value = decoded {
+            distance = value
+        } else {
+            distance = 7
+        }
+        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .playYaw),
+           let value = decoded {
+            playYaw = value
+        } else {
+            playYaw = 0
+        }
+        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .playPitch),
+           let value = decoded {
+            playPitch = value
+        } else {
+            playPitch = 0
+        }
+    }
+}
+
+extension WeatherState {
+    private enum CodingKeys: String, CodingKey {
+        case mode, wetness, snow
+    }
+
+    // Hand-written defensive Decodable (previously synthesised):
+    // missing or mistyped keys fall back to the property defaults.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let decoded = try? c.decodeIfPresent(Int.self, forKey: .mode),
+           let value = decoded {
+            mode = value
+        } else {
+            mode = 0
+        }
+        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .wetness),
+           let value = decoded {
+            wetness = value
+        } else {
+            wetness = 0
+        }
+        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .snow),
+           let value = decoded {
+            snow = value
+        } else {
+            snow = 0
+        }
+    }
+}
+
+extension TriggerArea {
+    private enum CodingKeys: String, CodingKey {
+        case id, name, center, size
+    }
+
+    // Hand-written defensive Decodable (previously synthesised,
+    // which required every key despite the property defaults):
+    // missing or mistyped keys fall back to the defaults, and
+    // `center`/`size` are normalised to exactly 3 elements (F18).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let decoded = try? c.decodeIfPresent(UUID.self, forKey: .id),
+           let value = decoded {
+            id = value
+        } else {
+            id = UUID()
+        }
+        if let decoded = try? c.decodeIfPresent(String.self, forKey: .name),
+           let value = decoded {
+            name = value
+        } else {
+            name = "Area"
+        }
+        var decodedCenter: [Double]?
+        if let decoded = try? c.decodeIfPresent([Double].self, forKey: .center) {
+            decodedCenter = decoded
+        }
+        var decodedSize: [Double]?
+        if let decoded = try? c.decodeIfPresent([Double].self, forKey: .size) {
+            decodedSize = decoded
+        }
+        center = normalisedTriple(decodedCenter, fallback: [0, 1.5, 0])
+        size = normalisedTriple(decodedSize, fallback: [4, 3, 4])
+    }
 }

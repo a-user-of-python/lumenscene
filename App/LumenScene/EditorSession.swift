@@ -56,6 +56,55 @@ final class EditorSession: ObservableObject {
     /// stack bookkeeping) and must not run on the Play boundary.
     private var playSnapshot: Data?
     private var playWeatherMode: Int = 0
+    /// v4.1 (F15): Play-entry snapshot of the weather build-up
+    /// accumulators + quantised geometry steps, restored on Play
+    /// exit beside `playWeatherMode` — otherwise a Play session's
+    /// Set Weather / Clear (or Weather Control level set) would
+    /// leak into the authored scene, because save() syncs the
+    /// accumulators into the published project.
+    private var playBuildupWet: Double = 0
+    private var playBuildupSnow: Double = 0
+    private var playGeoStepWet: Int = 0
+    private var playGeoStepSnow: Int = 0
+
+    /// v4.1 (§3.4): Play player speed in m/s. Session-only (NOT
+    /// persisted); Play entry resets it to the v4.0 constant.
+    var playSpeed: Float = 2.4
+
+    /// v4.1 (§3.5): camera-shake state. Session-only, non-published
+    /// (same discipline as the weather accumulators). frameTick
+    /// perturbs the computed camera BASIS only while a shake is
+    /// active; the persisted CameraState is never written by it.
+    private var shakeAmplitude: Float = 0
+    private var shakeEndsAt: CFTimeInterval = 0
+    private var shakeDuration: Float = 0
+
+    /// v4.1 (§4.4): Weather Control scales. Session-only,
+    /// non-published; reset to 1.0 on Play entry (and exit).
+    private var weatherRateScale: Double = 1.0
+    private var weatherIntensityScale: Double = 1.0
+
+    /// v4.1 (F29): set by promoteObject instead of rebuilding
+    /// immediately; frameTick performs ONE coalesced rebuild (plus
+    /// runtime.collisionDidChange()) right after runtime.tick.
+    private var promotionRebuildPending: Bool = false
+
+    /// v4.1 (§7): one spawned clone. Clones are NOT scene objects:
+    /// they live only in this registry + the renderer's entry list
+    /// for the duration of a Play session.
+    struct SpawnedClone {
+        var cloneID: UUID        // fresh UUID(), also the DynEntry key
+        var sourceID: UUID       // authored object the clone came from
+        var transform: Transform3
+        var material: MaterialProps   // snapshot at spawn time
+        var triCount: Int
+    }
+    private var clones: [SpawnedClone] = []        // spawn order
+    private var cloneEntries: [DynamicEntry] = []  // renderer mirror, clones only
+
+    /// v4.1 (§7.2): live clone counts for the runtime's planner.
+    var liveCloneCount: Int { clones.count }
+    var liveCloneTriCount: Int { clones.reduce(0) { $0 + $1.triCount } }
 
     /// PROMOTION, the mechanism in one paragraph: the renderer
     /// draws static objects from one baked soup (rebuilt on edit)
@@ -166,6 +215,7 @@ final class EditorSession: ObservableObject {
             // live work (tweens, timers, particles); a showing
             // banner also keeps frames coming so its expiry lands.
             || (mode == .play && runtime.needsFrame)
+            || (mode == .play && shakeEndsAt > CACurrentMediaTime())
             || !playBanner.isEmpty
     }
 
@@ -528,6 +578,23 @@ final class EditorSession: ObservableObject {
             // from the scene exactly as authored.
             playSnapshot = snapshot()
             playWeatherMode = project.scene.weather.mode
+            // v4.1 (F15/§4.4): snapshot the weather build-up too.
+            playBuildupWet = buildupWet
+            playBuildupSnow = buildupSnow
+            playGeoStepWet = geoStepWet
+            playGeoStepSnow = geoStepSnow
+            // v4.1 (Appendix B): every new session state resets
+            // on Play entry.
+            playSpeed = 2.4
+            shakeAmplitude = 0
+            shakeEndsAt = 0
+            shakeDuration = 0
+            weatherRateScale = 1.0
+            weatherIntensityScale = 1.0
+            renderer.envIntensity = 1
+            clones.removeAll()
+            cloneEntries.removeAll()
+            promotionRebuildPending = false
             promotedIDs.removeAll()
             hiddenPromotedIDs.removeAll()
             areaHiddenPromotedIDs.removeAll()
@@ -544,9 +611,34 @@ final class EditorSession: ObservableObject {
             runtime.stop()
             renderer.setDynamicEntries([])
             dynamicEntries.removeAll()
+            // v4.1 (§7.4): clones die with the Play session; the
+            // setDynamicEntries([]) above already removed their
+            // renderer entries.
+            clones.removeAll()
+            cloneEntries.removeAll()
             renderer.setParticleSoups([])
             renderer.unloadedAreaIDs = []
             runtimeUnloaded.removeAll()
+            // v4.1 (F15/§4.4): restore the weather build-up BEFORE
+            // the snapshot restore, so its rebuild bakes the
+            // restored geometry levels, and reset every new
+            // session state (Appendix B: resets in BOTH branches).
+            buildupWet = playBuildupWet
+            buildupSnow = playBuildupSnow
+            geoStepWet = playGeoStepWet
+            geoStepSnow = playGeoStepSnow
+            renderer.weatherGeoWet = Float(geoStepWet) / 24
+            renderer.weatherGeoSnow = Float(geoStepSnow) / 24
+            project.scene.weather.wetness = buildupWet
+            project.scene.weather.snow = buildupSnow
+            weatherRateScale = 1.0
+            weatherIntensityScale = 1.0
+            playSpeed = 2.4
+            shakeAmplitude = 0
+            shakeEndsAt = 0
+            shakeDuration = 0
+            renderer.envIntensity = 1
+            promotionRebuildPending = false
             restorePlaySnapshot()
             if project.scene.weather.mode != playWeatherMode {
                 setWeatherMode(playWeatherMode)
@@ -592,8 +684,9 @@ final class EditorSession: ObservableObject {
     /// Bring one object under runtime control (see the promotion
     /// note on `promotedIDs`). The dynamic entry is built from the
     /// object's CURRENT transform/material, so promotion itself
-    /// never visibly changes the object; the static rebuild at the
-    /// end drops it from the baked soup in the same frame.
+    /// never visibly changes the object; the static rebuild that
+    /// drops it from the baked soup is DEFERRED (v4.1 F29) to
+    /// frameTick's single coalesced rebuild after runtime.tick.
     private func promoteObject(id: UUID) {
         guard mode == .play, !promotedIDs.contains(id),
               let idx = project.scene.objects.firstIndex(where: { $0.id == id })
@@ -610,7 +703,16 @@ final class EditorSession: ObservableObject {
         // never draw this object again this Play session.
         project.scene.objects[idx].visible = false
         syncDynamicEntry(id: id)
-        renderer.rebuild(scene: project.scene, meshes: meshes)
+        // v4.1 (F29): do NOT rebuild here. A Play-start chain that
+        // touches N objects in one tick would otherwise pay N full
+        // static rebuilds. Defer: frameTick performs ONE rebuild
+        // after runtime.tick (before the draw) when this flag is
+        // set, and calls runtime.collisionDidChange() with it —
+        // which also closes the promotion collision-ghost gap
+        // (recon §6.6). Callers must not assume the static rebuild
+        // has already happened when this returns; the dynamic
+        // entry above already carries the object for this frame.
+        promotionRebuildPending = true
         kickRender()
     }
 
@@ -627,7 +729,9 @@ final class EditorSession: ObservableObject {
             dynamicEntries.append(DynamicEntry(
                 key: id, mesh: mesh, matrix: obj.transform.matrix,
                 material: renderer.gpuMaterialForObject(obj), objectID: id))
-            renderer.setDynamicEntries(dynamicEntries)
+            // v4.1 (§7.1): the renderer's entry list is ALWAYS
+            // promoted entries (in order) + clone entries.
+            renderer.setDynamicEntries(dynamicEntries + cloneEntries)
         } else if !shouldShow, hasEntry {
             dynamicEntries.removeAll { $0.key == id }
             renderer.removeDynamicEntry(key: id)
@@ -650,6 +754,18 @@ final class EditorSession: ObservableObject {
         guard let idx = project.scene.objects.firstIndex(where: { $0.id == id })
         else { return }
         if !promotedIDs.contains(id) { promoteObject(id: id) }
+        // v4.1 (F19): promotion can FAIL (no/empty local mesh) —
+        // then there is no dynamic entry to move, and writing only
+        // the scene value would be silently invisible until some
+        // unrelated rebuild. Fall back to the static path instead.
+        guard promotedIDs.contains(id) else {
+            project.scene.objects[idx].transform = t
+            renderer.rebuild(scene: project.scene, meshes: meshes)
+            runtime.collisionDidChange()
+            renderer.resetAccumulation()
+            kickRender()
+            return
+        }
         project.scene.objects[idx].transform = t
         if let ei = dynamicEntries.firstIndex(where: { $0.key == id }) {
             dynamicEntries[ei].matrix = t.matrix
@@ -662,6 +778,14 @@ final class EditorSession: ObservableObject {
         guard let idx = project.scene.objects.firstIndex(where: { $0.id == id })
         else { return }
         if !promotedIDs.contains(id) { promoteObject(id: id) }
+        // v4.1 (F19): same unpromotable fallback as transforms.
+        guard promotedIDs.contains(id) else {
+            project.scene.objects[idx].material = m
+            renderer.rebuild(scene: project.scene, meshes: meshes)
+            renderer.resetAccumulation()
+            kickRender()
+            return
+        }
         project.scene.objects[idx].material = m
         let obj = project.scene.objects[idx]
         let gpu = renderer.gpuMaterialForObject(obj)
@@ -675,18 +799,28 @@ final class EditorSession: ObservableObject {
     func runtimeSetVisible(_ id: UUID, _ visible: Bool) {
         guard let idx = project.scene.objects.firstIndex(where: { $0.id == id })
         else { return }
+        // v4.1 (F28a): on the FIRST runtime visibility change of a
+        // non-promoted object, promote it — from then on flips are
+        // cheap entry add/removes instead of a full static rebuild
+        // per flip. Promotion hides the object from the static
+        // layer and the entry logic below carries its visibility:
+        // a hide-first change ends as hiddenPromoted with no entry
+        // (promoteObject adds the entry, then the hide removes it).
+        if !promotedIDs.contains(id) { promoteObject(id: id) }
         if promotedIDs.contains(id) {
             // Promoted: visibility is entry presence. The scene
             // flag stays false (promotion mechanism); the tracked
             // sets carry the truth.
             if visible { hiddenPromotedIDs.remove(id) } else { hiddenPromotedIDs.insert(id) }
             syncDynamicEntry(id: id)
-        } else if visible {
-            project.scene.objects[idx].visible = true
-            renderer.rebuild(scene: project.scene, meshes: meshes)
         } else {
-            project.scene.objects[idx].visible = false
+            // Promotion failed (F19-class object: no local mesh):
+            // legacy static path — write the flag and rebuild.
+            // v4.1 (F29): the collision grid must follow, as the
+            // area funnels already do.
+            project.scene.objects[idx].visible = visible
             renderer.rebuild(scene: project.scene, meshes: meshes)
+            runtime.collisionDidChange()
         }
         kickRender()
     }
@@ -701,6 +835,10 @@ final class EditorSession: ObservableObject {
     }
 
     func runtimeLoadArea(_ id: UUID) {
+        // v4.1 (F28b): no membership change → no rebuild, no
+        // collision rebuild. (Loading an already-loaded area was
+        // a full static rebuild on every call.)
+        guard runtimeUnloaded.contains(id) else { return }
         runtimeUnloaded.remove(id)
         renderer.unloadedAreaIDs = runtimeUnloaded
         // Promoted members come back too — if they were visible.
@@ -716,6 +854,8 @@ final class EditorSession: ObservableObject {
     }
 
     func runtimeUnloadArea(_ id: UUID) {
+        // v4.1 (F28b): no membership change → no work (above).
+        guard !runtimeUnloaded.contains(id) else { return }
         runtimeUnloaded.insert(id)
         renderer.unloadedAreaIDs = runtimeUnloaded
         // Hide promoted members' dynamic entries for as long as
@@ -741,19 +881,192 @@ final class EditorSession: ObservableObject {
         kickRender()
     }
 
+    /// v4.1 (F16): the teleport eye rule, made CONTINUOUS. The old
+    /// rule (eye = y + 1.7 below y = 1, eye = y at/above it) had a
+    /// 1.69 m cliff at y = 1.0 and put the eye below standing
+    /// height for targets between 1.0 and ~1.7. Now: below 1.0 the
+    /// target is a floor point (eye = y + 1.7); from 1.0 to 2.7
+    /// the added offset blends linearly down from 1.7 to 0; at or
+    /// above 2.7 the target IS the eye. Shared by teleport + pose.
+    private func teleportEyeY(forTargetY y: Double) -> Double {
+        if y < 1.0 { return y + 1.7 }
+        if y < 2.7 { return y + (2.7 - y) / 1.7 * 1.7 }
+        return y
+    }
+
     /// Teleport the Play camera. The target is an object's origin:
-    /// a floor-level marker (y < 1) means "stand here", so the eye
-    /// goes 1.7 m above it; a target already at eye height (or
-    /// higher) is used as the eye position as-is.
+    /// a floor-level marker means "stand here", so the eye goes
+    /// above it per the (continuous) eye rule in teleportEyeY.
     func runtimeTeleportPlayer(to t: SIMD3<Float>) {
-        let eyeY = t.y < 1.0 ? Double(t.y) + 1.7 : Double(t.y)
+        let eyeY = teleportEyeY(forTargetY: Double(t.y))
         project.scene.camera.playPosition = [Double(t.x), eyeY, Double(t.z)]
         noteCameraActivity()
+    }
+
+    /// v4.1 (§3.4): set the Play movement speed, absolute m/s,
+    /// clamped 0...20. Session-only; Play entry resets to 2.4.
+    func runtimeSetPlayerSpeed(_ metresPerSecond: Double) {
+        playSpeed = Float(min(20, max(0, metresPerSecond)))
+        kickRender()
+    }
+
+    /// v4.1 (§3.5): full Play-camera pose set — position is an
+    /// eye position, used verbatim (no teleport eye rule), plus
+    /// yaw/pitch in degrees (pitch clamped ±85, matching look
+    /// input).
+    func runtimeSetPlayerPose(position: SIMD3<Float>, yaw: Double, pitch: Double) {
+        project.scene.camera.playPosition = [Double(position.x), Double(position.y), Double(position.z)]
+        project.scene.camera.playYaw = yaw
+        project.scene.camera.playPitch = min(85, max(-85, pitch))
+        noteCameraActivity()
+    }
+
+    /// v4.1 (§3.5): camera shake. Session state only — frameTick
+    /// perturbs the computed basis while the shake is active,
+    /// decaying by remaining/duration; persisted camera state is
+    /// never written. A non-positive duration clears the shake.
+    func runtimeCameraShake(amplitude: Double, seconds: Double) {
+        let clampedAmplitude = min(2, max(0, amplitude))
+        let clampedSeconds = min(10, max(0.1, seconds))
+        if seconds <= 0 || amplitude <= 0 {
+            shakeAmplitude = 0
+            shakeEndsAt = 0
+            shakeDuration = 0
+        } else {
+            shakeAmplitude = Float(clampedAmplitude)
+            shakeDuration = Float(clampedSeconds)
+            shakeEndsAt = CACurrentMediaTime() + clampedSeconds
+        }
+        kickRender()
     }
 
     func runtimeSetWeather(mode weatherMode: Int, clear: Bool) {
         setWeatherMode(weatherMode)
         if clear { clearWeatherBuildup() }
+    }
+
+    /// v4.1 (§4.4, PINNED): Weather Control. Nil channels are left
+    /// untouched. Scales are session-only (reset on Play entry);
+    /// direct level sets write the accumulators AND the published
+    /// values (a sync point, like clearWeatherBuildup), quantised
+    /// geometry steps + renderer levels, then rebuild + reset.
+    func runtimeSetWeatherControl(rateScale: Double?, intensityScale: Double?,
+                                  wet: Double?, snow: Double?) {
+        if let rateScale { weatherRateScale = min(10, max(0, rateScale)) }
+        if let intensityScale { weatherIntensityScale = min(4, max(0, intensityScale)) }
+        if wet != nil || snow != nil {
+            if let wet { buildupWet = min(1, max(0, wet)) }
+            if let snow { buildupSnow = min(1, max(0, snow)) }
+            project.scene.weather.wetness = buildupWet
+            project.scene.weather.snow = buildupSnow
+            geoStepWet = Int((buildupWet * 24).rounded())
+            geoStepSnow = Int((buildupSnow * 24).rounded())
+            renderer.weatherGeoWet = Float(geoStepWet) / 24
+            renderer.weatherGeoSnow = Float(geoStepSnow) / 24
+            renderer.rebuild(scene: project.scene, meshes: meshes)
+            renderer.resetAccumulation()
+        }
+        kickRender()
+    }
+
+    /// v4.1 (§5): environment (sky) light intensity, 0...4.
+    /// A per-frame uniform — no rebuild, but accumulated history
+    /// is stale the moment it changes, so reset accumulation.
+    func runtimeSetEnvironmentIntensity(_ value: Double) {
+        renderer.envIntensity = Float(min(4, max(0, value)))
+        renderer.resetAccumulation()
+        kickRender()
+    }
+
+    /// v4.1: would this object render right now? For promoted ids
+    /// the entry-presence truth applies (promoted ∧ not
+    /// runtime-hidden ∧ not area-parked — syncDynamicEntry keeps
+    /// entry presence exactly equivalent to that); for everything
+    /// else, the scene visible flag ∧ its area (if any) is loaded.
+    func runtimeIsObjectVisible(_ id: UUID) -> Bool {
+        guard let obj = project.scene.object(id: id) else { return false }
+        if promotedIDs.contains(id) {
+            return !hiddenPromotedIDs.contains(id)
+                && !areaHiddenPromotedIDs.contains(id)
+        }
+        if !obj.visible { return false }
+        if let areaID = obj.areaID, runtimeUnloaded.contains(areaID) { return false }
+        return true
+    }
+
+    // MARK: v4.1 Clone spawn (§7, PINNED)
+
+    /// Batch spawn. Each request: source object id, world
+    /// transform, optional material override (nil = the source's
+    /// CURRENT material). Returns the clone ids actually spawned
+    /// (admission control may shorten the list; order preserved).
+    /// ONE setDynamicEntries call per batch. Clone entries always
+    /// carry objectID = nil (§6.5: unpickable by design — a tap on
+    /// a clone must never fire the source's tap nodes).
+    @discardableResult
+    func runtimeSpawnClones(_ requests: [(sourceID: UUID, transform: Transform3,
+                                          material: MaterialProps?)]) -> [UUID] {
+        guard mode == .play else { return [] }
+        // Admission caps (§7.3): the renderer's 90k dynamic budget
+        // truncates silently and order-dependently, so the session
+        // admits conservatively and in request order.
+        let maxClones = 64
+        let maxCloneTris = 45_000
+        let maxSourceTris = 8_000
+        var spawned: [UUID] = []
+        var newClones: [SpawnedClone] = []
+        var newEntries: [DynamicEntry] = []
+        var triTotal = liveCloneTriCount
+        for request in requests {
+            if clones.count + newClones.count >= maxClones { break }
+            guard let source = project.scene.object(id: request.sourceID),
+                  let mesh = localMesh(for: source), !mesh.isEmpty
+            else { continue }
+            let tris = mesh.triangleCount
+            if tris > maxSourceTris { continue }   // this request only is skipped
+            if triTotal + tris > maxCloneTris { break }   // remaining requests dropped
+            let cloneID = UUID()
+            let snapshotMaterial = request.material ?? source.material
+            var temp = source
+            temp.id = cloneID
+            temp.transform = request.transform
+            temp.material = snapshotMaterial
+            newClones.append(SpawnedClone(cloneID: cloneID, sourceID: request.sourceID,
+                                          transform: request.transform,
+                                          material: snapshotMaterial, triCount: tris))
+            newEntries.append(DynamicEntry(
+                key: cloneID, mesh: mesh, matrix: request.transform.matrix,
+                material: renderer.gpuMaterialForObject(temp), objectID: nil))
+            spawned.append(cloneID)
+            triTotal += tris
+        }
+        if !spawned.isEmpty {
+            clones.append(contentsOf: newClones)
+            cloneEntries.append(contentsOf: newEntries)
+            renderer.setDynamicEntries(dynamicEntries + cloneEntries)
+            kickRender()
+        }
+        return spawned
+    }
+
+    /// Despawn every live clone whose sourceID matches. No-op (no
+    /// renderer call) when nothing matches.
+    func runtimeDespawnClones(sourceID: UUID) {
+        let removed = Set(clones.filter { $0.sourceID == sourceID }.map(\.cloneID))
+        guard !removed.isEmpty else { return }
+        clones.removeAll { removed.contains($0.cloneID) }
+        cloneEntries.removeAll { removed.contains($0.key) }
+        renderer.setDynamicEntries(dynamicEntries + cloneEntries)
+        kickRender()
+    }
+
+    /// Despawn one clone by its clone id (runtime expiry path).
+    func runtimeDespawnClone(_ cloneID: UUID) {
+        guard clones.contains(where: { $0.cloneID == cloneID }) else { return }
+        clones.removeAll { $0.cloneID == cloneID }
+        cloneEntries.removeAll { $0.key == cloneID }
+        renderer.setDynamicEntries(dynamicEntries + cloneEntries)
+        kickRender()
     }
 
     // MARK: v4.0 Areas & graph editing (views call these)
@@ -896,16 +1209,23 @@ final class EditorSession: ObservableObject {
             } else {
                 dynIntensity = 0
             }
+            // v4.1 (§4.4): the Weather Control intensity scale
+            // applies AFTER the surge clamp (and after the
+            // mode-0 zeroing — 0 × scale stays 0), BEFORE the
+            // renderer writes below and BEFORE the build-up
+            // switch, so shading, precip and build-up scale
+            // together.
+            dynIntensity *= weatherIntensityScale
             switch mode {
             case 1:
-                buildupWet = min(1, buildupWet + Double(dt) / 75 * dynIntensity)
-                buildupSnow = max(0, buildupSnow - Double(dt) / 300
+                buildupWet = min(1, buildupWet + Double(dt) * weatherRateScale / 75 * dynIntensity)
+                buildupSnow = max(0, buildupSnow - Double(dt) * weatherRateScale / 300
                                         * (0.6 + 0.4 * dynIntensity))
             case 2:
-                buildupSnow = min(1, buildupSnow + Double(dt) / 100 * dynIntensity)
+                buildupSnow = min(1, buildupSnow + Double(dt) * weatherRateScale / 100 * dynIntensity)
             case 0:
-                buildupWet = max(0, buildupWet - Double(dt) / 600)
-                buildupSnow = max(0, buildupSnow - Double(dt) / 900)
+                buildupWet = max(0, buildupWet - Double(dt) * weatherRateScale / 600)
+                buildupSnow = max(0, buildupSnow - Double(dt) * weatherRateScale / 900)
             default:
                 break
             }
@@ -955,6 +1275,18 @@ final class EditorSession: ObservableObject {
             let p = project.scene.camera.playPosition
             runtime.tick(dt: dt, playerPos: SIMD3<Float>(Float(p[0]), Float(p[1]), Float(p[2])))
         }
+        // v4.1 (F29): ONE coalesced static rebuild for everything
+        // promoted during that tick, performed here — after the
+        // runtime drain, before the camera basis/draw below, so a
+        // promoted object never double-draws or vanishes for a
+        // frame. collisionDidChange rides along (§6.6/F12): the
+        // promoted objects' static tris just left the collision
+        // set, so the runtime's grid must be rebuilt from it.
+        if promotionRebuildPending {
+            promotionRebuildPending = false
+            renderer.rebuild(scene: project.scene, meshes: meshes)
+            runtime.collisionDidChange()
+        }
         // v4.0: in edit mode the trigger areas draw as debug
         // boxes — a plain renderer write each tick, no published
         // churn. The selected area burns brighter.
@@ -973,8 +1305,48 @@ final class EditorSession: ObservableObject {
             || touchActive
             || (now - lastCameraActivity) < 0.35
             || isDraggingObject
-        let basis = mode == .play ? project.scene.camera.playBasis()
+        var basis = mode == .play ? project.scene.camera.playBasis()
                                   : project.scene.camera.orbitBasis()
+        // v4.1 (§3.5): camera shake perturbs the BASIS ONLY, in
+        // Play, while a shake is active — persisted playPosition /
+        // playYaw / playPitch are never written here. The offset
+        // and rotation decay linearly with remaining/duration.
+        if mode == .play {
+            if shakeEndsAt > now, shakeDuration > 0, shakeAmplitude > 0 {
+                let remaining = Float(shakeEndsAt - now)
+                let decay = max(0, min(1, remaining / shakeDuration))
+                let scale = shakeAmplitude * decay
+                let offset = SIMD3<Float>(Float.random(in: -1...1),
+                                          Float.random(in: -1...1),
+                                          Float.random(in: -1...1)) * scale * 0.05
+                basis.origin += offset
+                let tilt = scale * 0.02   // radians at amplitude 1
+                var fwd = basis.forward
+                    + basis.right * Float.random(in: -1...1) * tilt
+                    + basis.up * Float.random(in: -1...1) * tilt
+                fwd = simd_normalize(fwd)
+                var right = simd_cross(fwd, SIMD3<Float>(0, 1, 0))
+                if simd_length(right) < 1e-4 { right = basis.right }
+                else { right = simd_normalize(right) }
+                var up = simd_cross(right, fwd)
+                // Small roll around the perturbed forward axis.
+                let roll = Float.random(in: -1...1) * tilt
+                let cr = cos(roll), sr = sin(roll)
+                let rolledRight = right * cr + up * sr
+                let rolledUp = up * cr - right * sr
+                right = rolledRight
+                up = rolledUp
+                basis.forward = fwd
+                basis.right = right
+                basis.up = up
+            } else if shakeEndsAt != 0 {
+                // Expired (or cleared) shake: drop the state so
+                // wantsFrame stops chaining frames for it.
+                shakeAmplitude = 0
+                shakeEndsAt = 0
+                shakeDuration = 0
+            }
+        }
         renderer.draw(view: view, camera: basis,
                       moving: moving, play: mode == .play)
     }
@@ -994,7 +1366,7 @@ final class EditorSession: ObservableObject {
         let vertAmt = (pressedKeys.contains(.e) ? 1 : 0) - (pressedKeys.contains(.q) ? 1 : 0)
 
         if mode == .play {
-            let speed: Float = 2.4
+            let speed: Float = playSpeed   // v4.1 (§3.4): was a 2.4 literal
             let yaw = Float(cam.playYaw) * .pi / 180
             let f = SIMD2<Float>(-sin(yaw), -cos(yaw))     // XZ forward
             let r = SIMD2<Float>(cos(yaw), -sin(yaw))      // XZ right... (perp of f)

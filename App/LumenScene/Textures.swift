@@ -3,7 +3,8 @@
 //
 // Fully procedural, deterministic PBR texture generation.
 //
-// Every preset produces a square 512x512 texture set:
+// Material presets produce square 512x512 texture sets; the road
+// designs produce square 1024x1024 sets (TextureGen.roadSize):
 //   - albedo: RGBA8 base colour
 //   - normal: RGBA8 tangent-space normal map (rgb = n * 0.5 + 0.5, a = 255)
 //   - data:   RGBA8 packing (R = roughness, G = height, B = 0, A = 255)
@@ -40,10 +41,15 @@ enum TextureGen {
     static let presetNames = ["concrete", "cement", "brick"]
 
     /// Road designs. These are fit-mapped (MaterialProps.textureFit):
-    /// the whole 512x512 design spans one face, so unlike the material
+    /// the whole 1024x1024 design spans one face, so unlike the material
     /// presets they are not required to tile. Road direction runs
     /// along v — top to bottom of the texture.
     static let roadNames = ["road-highway", "road-normal", "road-intersection", "road-crosswalk", "road-roundabout"]
+
+    /// Resolution of every road texture set. Material presets stay at
+    /// 512; roads get 1024 so lane markings, cracks and paint wear
+    /// survive at glancing angles in the path tracer.
+    static let roadSize = 1024
 
     /// Every slice the renderer should build a texture array from:
     /// material presets first, then roads.
@@ -590,244 +596,716 @@ enum TextureGen {
 
     // MARK: - Roads
     //
-    // Roads share an asphalt field and a worn-paint marking pass.
-    // They are fit-mapped (one whole design per face), so they do not
-    // need to tile. Coordinate convention: u runs right, v runs DOWN
-    // the texture (v = 0 is the far side); the road direction runs
-    // along v, top to bottom.
+    // Roads share a parameterised asphalt base and a worn-paint pass.
+    // They are fit-mapped (one whole 1024x1024 design spans one face),
+    // so they do not need to tile. Coordinate convention: u runs right,
+    // v runs DOWN the texture (v = 0 is the far side); the road
+    // direction runs along v, top to bottom.
+    //
+    // Generation cost structure: every noise-derived quantity is
+    // precomputed ONCE per set into a flat [Double] field (large tone,
+    // mid tone, paint wear, oil, crack lines, tar-snake lines, two
+    // speckles, patch rectangles rasterised into tone/edge fields).
+    // Low-frequency fields are sampled on a small grid and bilinearly
+    // upsampled; only the crack field is evaluated at full resolution.
+    // Each road type then makes ONE compose pass over the pixels,
+    // reading those arrays and adding cheap analytic marking shapes
+    // (distance bands / intervals with ~1.5 px anti-aliasing). No
+    // per-pixel noise evaluation happens in the compose passes.
 
-    /// Per-pixel fields for a road, plus a `wear` noise field used to
-    /// erode painted markings so the paint looks worn, not printed.
+    /// Precomputed per-pixel fields shared by every road design.
     private struct RoadFields {
-        var albedo: [Double]
-        var height: [Double]
-        var roughness: [Double]
-        var wear: [Double]
+        let large: [Double]     // broad fbm tone: repairs, age, patchiness
+        let mid: [Double]       // medium fbm tone / aggregate shading
+        let wear: [Double]      // paint-wear field (markings)
+        let oil: [Double]       // low-frequency oil-stain field (raw)
+        let crack: [Double]     // thin ridge-noise crack lines, 0...1
+        let snake: [Double]     // wandering tar-snake lines, 0...1
+        let speckleA: [Double]  // per-pixel aggregate grain
+        let speckleB: [Double]  // second per-pixel grain / paint break-up
+        let patchTone: [Double] // per-pixel tone delta from patch rectangles
+        let patchEdge: [Double] // 0...1 near a patch rectangle's tar-sealed edge
     }
 
-    /// Asphalt: ~0.16–0.22 grey with fbm tone and speckle,
-    /// roughness 0.92–0.97, height ~0.5 ± speckle.
+    /// Samples `noise` on a `resolution`-square grid and bilinearly
+    /// upsamples it to `size`-square. The underlying value noise is
+    /// periodic, and the upsample wraps, so the field stays periodic.
+    private static func roadUpsampledField(_ noise: FBMNoise, resolution: Int, size: Int) -> [Double] {
+        var low = [Double](repeating: 0, count: resolution * resolution)
+        for yy in 0 ..< resolution {
+            for xx in 0 ..< resolution {
+                low[yy * resolution + xx] = noise.sample(u: (Double(xx) + 0.5) / Double(resolution),
+                                                         v: (Double(yy) + 0.5) / Double(resolution))
+            }
+        }
+        var out = [Double](repeating: 0, count: size * size)
+        let scale = Double(resolution) / Double(size)
+        for y in 0 ..< size {
+            let gy = (Double(y) + 0.5) * scale - 0.5
+            let y0f = gy.rounded(.down)
+            let fy = gy - y0f
+            let y0 = ((Int(y0f) % resolution) + resolution) % resolution
+            let y1 = (y0 + 1) % resolution
+            for x in 0 ..< size {
+                let gx = (Double(x) + 0.5) * scale - 0.5
+                let x0f = gx.rounded(.down)
+                let fx = gx - x0f
+                let x0 = ((Int(x0f) % resolution) + resolution) % resolution
+                let x1 = (x0 + 1) % resolution
+                let top = low[y0 * resolution + x0]
+                    + (low[y0 * resolution + x1] - low[y0 * resolution + x0]) * fx
+                let bottom = low[y1 * resolution + x0]
+                    + (low[y1 * resolution + x1] - low[y1 * resolution + x0]) * fx
+                out[y * size + x] = top + (bottom - top) * fy
+            }
+        }
+        return out
+    }
+
+    /// Samples `noise` at full texture resolution.
+    private static func roadFullField(_ noise: FBMNoise, size: Int) -> [Double] {
+        var out = [Double](repeating: 0, count: size * size)
+        for y in 0 ..< size {
+            for x in 0 ..< size {
+                out[y * size + x] = noise.sample(u: (Double(x) + 0.5) / Double(size),
+                                                 v: (Double(y) + 0.5) / Double(size))
+            }
+        }
+        return out
+    }
+
+    /// Builds every shared field for one road set, deterministically
+    /// from `seed` (fixed per road type, so output is byte-identical
+    /// on every launch).
     private static func makeRoadFields(seed: UInt64) -> RoadFields {
-        let size = 512
+        let size = roadSize
         let count = size * size
         var rng = SplitMix64(seed: seed)
-        let tone = FBMNoise(basePeriod: 4, octaves: 3, rng: &rng)
-        let wearNoise = FBMNoise(basePeriod: 8, octaves: 2, rng: &rng)
-        let speckle = makeSpeckle(count: count, rng: &rng)
 
-        var fields = RoadFields(albedo: [Double](repeating: 0, count: count * 3),
-                                height: [Double](repeating: 0, count: count),
-                                roughness: [Double](repeating: 0, count: count),
-                                wear: [Double](repeating: 0, count: count))
-        for y in 0 ..< size {
-            for x in 0 ..< size {
-                let index = y * size + x
-                let u = (Double(x) + 0.5) / Double(size)
-                let v = (Double(y) + 0.5) / Double(size)
-                let t = tone.sample(u: u, v: v)
-                let grain = speckle[index]
-                let grey = clamp(0.19 + (t - 0.5) * 0.05 + (grain - 0.5) * 0.04, 0.16, 0.22)
-                fields.albedo[index * 3] = grey
-                fields.albedo[index * 3 + 1] = grey
-                fields.albedo[index * 3 + 2] = grey * 0.99
-                fields.height[index] = clamp01(0.5 + (grain - 0.5) * 0.1)
-                fields.roughness[index] = clamp(0.945 + (t - 0.5) * 0.04, 0.92, 0.97)
-                fields.wear[index] = wearNoise.sample(u: u, v: v)
+        // Noise sources, consumed from the PRNG in a fixed order.
+        let largeNoise = FBMNoise(basePeriod: 4, octaves: 4, rng: &rng)   // 4, 8, 16, 32
+        let midNoise = FBMNoise(basePeriod: 16, octaves: 3, rng: &rng)    // 16, 32, 64
+        let wearNoise = FBMNoise(basePeriod: 8, octaves: 3, rng: &rng)    // 8, 16, 32
+        let oilNoise = FBMNoise(basePeriod: 5, octaves: 2, rng: &rng)     // 5, 10
+        let crackNoise = FBMNoise(basePeriod: 13, octaves: 2, rng: &rng)  // 13, 26
+        let snakeNoise = FBMNoise(basePeriod: 5, octaves: 2, rng: &rng)   // 5, 10
+
+        let large = roadUpsampledField(largeNoise, resolution: 256, size: size)
+        let mid = roadUpsampledField(midNoise, resolution: 512, size: size)
+        let wear = roadUpsampledField(wearNoise, resolution: 512, size: size)
+        let oil = roadUpsampledField(oilNoise, resolution: 256, size: size)
+        let snakeRaw = roadUpsampledField(snakeNoise, resolution: 512, size: size)
+        let crackRaw = roadFullField(crackNoise, size: size)
+        let speckleA = makeSpeckle(count: count, rng: &rng)
+        let speckleB = makeSpeckle(count: count, rng: &rng)
+
+        // Ridge transform: a noise contour becomes a thin soft line.
+        // Cracks hug the 0.50 contour of a fine field (thin, branching
+        // feel); tar snakes hug the 0.56 contour of a coarse field, so
+        // only a few long wandering repairs appear per face.
+        var crack = [Double](repeating: 0, count: count)
+        var snake = [Double](repeating: 0, count: count)
+        for i in 0 ..< count {
+            let cd = clamp01(1.0 - abs(crackRaw[i] - 0.50) / 0.030)
+            crack[i] = cd * cd * (3.0 - 2.0 * cd)
+            let sd = clamp01(1.0 - abs(snakeRaw[i] - 0.56) / 0.034)
+            snake[i] = sd * sd * (3.0 - 2.0 * sd)
+        }
+
+        // Patch rectangles: resurfaced areas with a slightly different
+        // tone, rasterised here so the compose pass is a plain lookup.
+        // The outer 4 px of each rectangle is its tar-sealed edge.
+        var patchTone = [Double](repeating: 0, count: count)
+        var patchEdge = [Double](repeating: 0, count: count)
+        for _ in 0 ..< 6 {
+            let pw = 110 + Int(rng.nextDouble() * 170.0)
+            let ph = 90 + Int(rng.nextDouble() * 190.0)
+            let px = 36 + Int(rng.nextDouble() * Double(size - pw - 72))
+            let py = 36 + Int(rng.nextDouble() * Double(size - ph - 72))
+            let delta = (rng.nextDouble() - 0.5) * 0.055
+            for yy in py ..< (py + ph) {
+                for xx in px ..< (px + pw) {
+                    let idx = yy * size + xx
+                    patchTone[idx] = delta
+                    let dEdge = min(xx - px, px + pw - 1 - xx, yy - py, py + ph - 1 - yy)
+                    if dEdge < 4 {
+                        patchEdge[idx] = Double(4 - dEdge) / 4.0
+                    }
+                }
             }
         }
-        return fields
+
+        return RoadFields(large: large, mid: mid, wear: wear, oil: oil,
+                          crack: crack, snake: snake,
+                          speckleA: speckleA, speckleB: speckleB,
+                          patchTone: patchTone, patchEdge: patchEdge)
     }
 
-    /// Paints one marking pixel, worn: the paint only survives where
-    /// the wear noise clears the threshold, so edges look eroded.
-    /// Paint is smoother (roughness 0.72) and slightly raised (+0.03).
-    private static func paintMarking(_ fields: inout RoadFields, index: Int,
-                                     red: Double, green: Double, blue: Double) {
-        guard fields.wear[index] > 0.25 else { return }
-        fields.albedo[index * 3] = red
-        fields.albedo[index * 3 + 1] = green
-        fields.albedo[index * 3 + 2] = blue
-        fields.roughness[index] = 0.72
-        fields.height[index] = clamp01(fields.height[index] + 0.03)
+    // MARK: Road shape helpers (all cheap, analytic, anti-aliased)
+
+    /// Coverage of a band centred at `centre` with half-width
+    /// `halfWidth`, at coordinate `coord`. Falls 1 -> 0 over ~1.5 px.
+    private static func roadBand(_ coord: Double, _ centre: Double, _ halfWidth: Double) -> Double {
+        clamp01((halfWidth - abs(coord - centre)) / 1.5 + 0.5)
     }
 
-    private static func paintWhite(_ fields: inout RoadFields, index: Int) {
-        paintMarking(&fields, index: index, red: 0.85, green: 0.84, blue: 0.8)
+    /// Coverage of the interval [lo, hi] at `coord`, ~1.5 px edges.
+    private static func roadInterval(_ coord: Double, _ lo: Double, _ hi: Double) -> Double {
+        clamp01(min(coord - lo, hi - coord) / 1.5 + 0.5)
     }
 
-    private static func paintYellow(_ fields: inout RoadFields, index: Int) {
-        paintMarking(&fields, index: index, red: 0.85, green: 0.65, blue: 0.15)
+    /// One centred dash per `period` (dash length `dash`), repeating
+    /// along `coord`. The lane-marking periods used here (64, 128)
+    /// divide 1024 exactly, so a gap — never a clipped dash —
+    /// straddles both texture borders. (The 24 px rumble grooves are
+    /// surface texture, not markings, and simply run off the edge.)
+    private static func roadDash(_ coord: Double, _ period: Double, _ dash: Double) -> Double {
+        let phase = coord - (coord / period).rounded(.down) * period
+        return roadInterval(phase, (period - dash) / 2.0, (period + dash) / 2.0)
     }
 
-    /// True when pixel coordinate `p` lies in a band of `width` px
-    /// centred at `centre` (in px).
-    private static func inBand(_ p: Int, _ centre: Double, _ width: Double) -> Bool {
-        abs(Double(p) - centre) < width / 2.0
-    }
-
-    private static func roadSet(_ fields: RoadFields) -> PBRTextureSet {
-        buildSet(size: 512, albedo: fields.albedo, height: fields.height,
-                 roughness: fields.roughness, normalStrength: 0.8)
-    }
-
-    /// Two lanes along v: dashed white centreline, solid white edges.
-    private static func makeRoadNormal() -> PBRTextureSet {
-        let size = 512
-        var fields = makeRoadFields(seed: 0x20AD_0000_0000_0004)
-        for y in 0 ..< size {
-            for x in 0 ..< size {
-                let index = y * size + x
-                let centreline = inBand(x, 256, 6) && (y % 44) < 24
-                let edge = inBand(x, 0.06 * 512, 6) || inBand(x, 0.94 * 512, 6)
-                if centreline || edge { paintWhite(&fields, index: index) }
+    /// Polished wheel-track profile along one axis: 1 at each track
+    /// centre, falling smoothly to 0 at `halfWidth`. One entry per
+    /// pixel coordinate, so the compose pass is an array lookup.
+    private static func roadWheelProfile(centres: [Double], halfWidth: Double, size: Int) -> [Double] {
+        var out = [Double](repeating: 0, count: size)
+        for i in 0 ..< size {
+            let coord = Double(i) + 0.5
+            var best = 0.0
+            for centre in centres {
+                let d = abs(coord - centre)
+                if d < halfWidth {
+                    let t = 1.0 - (d / halfWidth) * (d / halfWidth)
+                    let v = t * t
+                    if v > best { best = v }
+                }
             }
+            out[i] = best
         }
-        return roadSet(fields)
+        return out
     }
 
-    /// Highway: concrete median with yellow edge lines, two lanes
-    /// each side with dashed white dividers and solid shoulders.
+    /// The shared asphalt surface at one pixel.
+    /// - wheel: 0...1 polished wheel-track factor (darker, shinier).
+    /// - edge: 0...1 proximity to the texture border (deterioration).
+    private static func roadAsphalt(_ fields: RoadFields, index: Int,
+                                    wheel: Double, edge: Double)
+        -> (r: Double, g: Double, b: Double, h: Double, rough: Double) {
+        let large = fields.large[index]
+        let mid = fields.mid[index]
+        let speckA = fields.speckleA[index]
+        let speckB = fields.speckleB[index]
+        let oilF = smoothstep(0.66, 0.88, fields.oil[index])
+        let crack = fields.crack[index]
+        let snake = fields.snake[index]
+        let patchEdge = fields.patchEdge[index]
+
+        // Multi-scale tone: broad age/repair patches, medium shading,
+        // then per-pixel aggregate stone (both light and dark grains).
+        var grey = 0.190
+            + (large - 0.5) * 0.085
+            + (mid - 0.5) * 0.050
+            + (speckA - 0.5) * 0.055
+            + (speckB - 0.5) * 0.028
+        grey += smoothstep(0.93, 1.0, speckA) * 0.07  // pale stones
+        grey -= smoothstep(0.93, 1.0, speckB) * 0.06  // dark stones
+        grey += fields.patchTone[index]               // resurfaced patches
+        grey -= patchEdge * 0.045                     // tar-sealed patch edges
+        grey -= oilF * 0.055                          // oil stains
+        grey -= crack * 0.065                         // cracks read dark
+        grey -= snake * 0.050                         // tar snakes are near-black
+        grey -= wheel * 0.028                         // polished, tyre-darkened tracks
+        grey += edge * 0.018                          // faded, dusty deterioration at borders
+        grey = clamp(grey, 0.12, 0.28)
+
+        // Height: aggregate micro-relief dominates; cracks dip, tar
+        // snakes and sealed patch edges sit slightly proud, edges of
+        // the plot crumble down a touch.
+        var height = 0.50
+            + (mid - 0.5) * 0.07
+            + (speckA - 0.5) * 0.085
+            + (speckB - 0.5) * 0.045
+        height -= crack * 0.11
+        height += snake * 0.045
+        height += patchEdge * 0.018
+        height -= oilF * 0.012
+        height -= edge * 0.015
+
+        // Roughness: asphalt is rough, but wheel tracks, oil and tar
+        // are polished smooth — that contrast is what plays in the
+        // light. Paint (applied later) sits between the two.
+        var rough = 0.94
+            + (large - 0.5) * 0.035
+            + (speckA - 0.5) * 0.022
+        rough -= wheel * 0.17
+        rough -= oilF * 0.28
+        rough -= snake * 0.22
+        rough -= patchEdge * 0.18
+        if fields.patchTone[index] != 0 { rough -= 0.025 }
+        rough += crack * 0.015
+        rough += edge * 0.03
+
+        return (grey, grey, grey * 0.99,
+                clamp01(height), clamp(rough, 0.55, 0.985))
+    }
+
+    /// Blends one worn-paint colour over the surface at one pixel.
+    /// Coverage is multiplied by a wear mask built from the wear field
+    /// plus speckle break-up, and reduced further inside wheel tracks,
+    /// so paint looks scrubbed away where tyres run and fresher
+    /// between them. Surviving paint is slightly raised and smoother
+    /// than asphalt (roughness pulled toward 0.70), never glossy.
+    private static func roadPaint(_ red: inout Double, _ green: inout Double, _ blue: inout Double,
+                                  _ height: inout Double, _ roughness: inout Double,
+                                  coverage: Double, fields: RoadFields, index: Int, wheel: Double,
+                                  paintRed: Double, paintGreen: Double, paintBlue: Double) {
+        if coverage <= 0 { return }
+        let wearRaw = fields.wear[index] * 0.78 + fields.speckleB[index] * 0.22
+        let mask = smoothstep(0.30, 0.56, wearRaw - wheel * 0.24)
+        let eff = coverage * mask
+        if eff <= 0.003 { return }
+        // Grime variation across the surviving paint.
+        let tint = 0.90 + fields.speckleA[index] * 0.16
+        red += (paintRed * tint - red) * eff
+        green += (paintGreen * tint - green) * eff
+        blue += (paintBlue * tint - blue) * eff
+        height += 0.04 * eff
+        roughness += (0.70 - roughness) * eff
+    }
+
+    private static func roadWhitePaint(_ red: inout Double, _ green: inout Double, _ blue: inout Double,
+                                       _ height: inout Double, _ roughness: inout Double,
+                                       coverage: Double, fields: RoadFields, index: Int, wheel: Double) {
+        roadPaint(&red, &green, &blue, &height, &roughness, coverage: coverage,
+                  fields: fields, index: index, wheel: wheel,
+                  paintRed: 0.86, paintGreen: 0.85, paintBlue: 0.81)
+    }
+
+    private static func roadYellowPaint(_ red: inout Double, _ green: inout Double, _ blue: inout Double,
+                                        _ height: inout Double, _ roughness: inout Double,
+                                        coverage: Double, fields: RoadFields, index: Int, wheel: Double) {
+        roadPaint(&red, &green, &blue, &height, &roughness, coverage: coverage,
+                  fields: fields, index: index, wheel: wheel,
+                  paintRed: 0.83, paintGreen: 0.62, paintBlue: 0.14)
+    }
+
+    /// Border proximity 0...1: 1 at the texture edge, 0 from 48 px in.
+    private static func roadEdgeFactor(x: Int, y: Int, size: Int) -> Double {
+        let d = min(x, y, size - 1 - x, size - 1 - y)
+        return clamp01(1.0 - Double(d) / 48.0)
+    }
+
+    private static func roadSet(albedo: [Double], height: [Double], roughness: [Double]) -> PBRTextureSet {
+        buildSet(size: roadSize, albedo: albedo, height: height,
+                 roughness: roughness, normalStrength: 1.15)
+    }
+
+    /// Highway: three lanes, one way. Solid white edge lines at
+    /// x = 108 / 916, dashed white dividers at x = 377 / 647 (period
+    /// 128, dash 72 — gaps straddle the borders), rumble strips in
+    /// both shoulders, two polished wheel tracks per lane.
     private static func makeRoadHighway() -> PBRTextureSet {
-        let size = 512
-        var fields = makeRoadFields(seed: 0x20AD_0000_0000_0005)
+        let size = roadSize
+        let count = size * size
+        let fields = makeRoadFields(seed: 0x20AD_0000_0000_0005)
+        let wheelX = roadWheelProfile(centres: [180, 305, 450, 574, 719, 844],
+                                      halfWidth: 42, size: size)
+        var albedo = [Double](repeating: 0, count: count * 3)
+        var height = [Double](repeating: 0, count: count)
+        var roughness = [Double](repeating: 0, count: count)
         for y in 0 ..< size {
+            let yd = Double(y) + 0.5
+            // Rumble grooves run across the shoulders: a 24 px period
+            // along v, shared by both shoulders this row.
+            let groove = roadDash(yd, 24, 12)
             for x in 0 ..< size {
                 let index = y * size + x
-                let u = Double(x) / Double(size)
-                // Median strip: lighter concrete-ish grey.
-                if u >= 0.44 && u < 0.56 {
-                    fields.albedo[index * 3] = clamp01(fields.albedo[index * 3] + 0.12)
-                    fields.albedo[index * 3 + 1] = clamp01(fields.albedo[index * 3 + 1] + 0.12)
-                    fields.albedo[index * 3 + 2] = clamp01(fields.albedo[index * 3 + 2] + 0.12)
-                    fields.roughness[index] = 0.9
-                    fields.height[index] = clamp01(fields.height[index] + 0.02)
+                let xd = Double(x) + 0.5
+                let wheel = wheelX[x]
+                let pixel = roadAsphalt(fields, index: index, wheel: wheel,
+                                        edge: roadEdgeFactor(x: x, y: y, size: size))
+                var r = pixel.r, g = pixel.g, b = pixel.b
+                var h = pixel.h, rough = pixel.rough
+
+                // Rumble strips: outside the edge lines only.
+                let rumble = max(roadInterval(xd, 20, 92), roadInterval(xd, 932, 1004))
+                if rumble > 0 {
+                    h -= rumble * groove * 0.055
+                    rough += rumble * groove * 0.02
                 }
-                if inBand(x, 0.44 * 512, 5) || inBand(x, 0.56 * 512, 5) {
-                    paintYellow(&fields, index: index)
-                } else if (inBand(x, 0.22 * 512, 5) || inBand(x, 0.78 * 512, 5)) && (y % 54) < 30 {
-                    paintWhite(&fields, index: index)
-                } else if inBand(x, 0.03 * 512, 5) || inBand(x, 0.97 * 512, 5) {
-                    paintWhite(&fields, index: index)
-                }
+
+                let edgeCov = max(roadBand(xd, 108, 6), roadBand(xd, 916, 6))
+                roadWhitePaint(&r, &g, &b, &h, &rough, coverage: edgeCov,
+                               fields: fields, index: index, wheel: wheel)
+                let dividerCov = max(roadBand(xd, 377, 6), roadBand(xd, 647, 6)) * roadDash(yd, 128, 72)
+                roadWhitePaint(&r, &g, &b, &h, &rough, coverage: dividerCov,
+                               fields: fields, index: index, wheel: wheel)
+
+                albedo[index * 3] = clamp01(r)
+                albedo[index * 3 + 1] = clamp01(g)
+                albedo[index * 3 + 2] = clamp01(b)
+                height[index] = clamp01(h)
+                roughness[index] = clamp01(rough)
             }
         }
-        return roadSet(fields)
+        return roadSet(albedo: albedo, height: height, roughness: roughness)
     }
 
-    /// Crosswalk: zebra stripes across the full road width, plus the
-    /// usual solid edge lines.
-    private static func makeRoadCrosswalk() -> PBRTextureSet {
-        let size = 512
-        var fields = makeRoadFields(seed: 0x20AD_0000_0000_0006)
+    /// Two-lane road, one lane each way: solid white edge lines at
+    /// x = 92 / 932 and a dashed yellow centre line (period 128,
+    /// dash 72). Two wheel tracks per lane.
+    private static func makeRoadNormal() -> PBRTextureSet {
+        let size = roadSize
+        let count = size * size
+        let fields = makeRoadFields(seed: 0x20AD_0000_0000_0004)
+        let wheelX = roadWheelProfile(centres: [232, 372, 652, 792],
+                                      halfWidth: 44, size: size)
+        var albedo = [Double](repeating: 0, count: count * 3)
+        var height = [Double](repeating: 0, count: count)
+        var roughness = [Double](repeating: 0, count: count)
         for y in 0 ..< size {
+            let yd = Double(y) + 0.5
+            let centreDash = roadDash(yd, 128, 72)
             for x in 0 ..< size {
                 let index = y * size + x
-                let u = Double(x) / Double(size)
-                let stripe = (y % 52) < 26 && u >= 0.05 && u < 0.95
-                let edge = inBand(x, 0.04 * 512, 6) || inBand(x, 0.96 * 512, 6)
-                if stripe || edge { paintWhite(&fields, index: index) }
+                let xd = Double(x) + 0.5
+                let wheel = wheelX[x]
+                let pixel = roadAsphalt(fields, index: index, wheel: wheel,
+                                        edge: roadEdgeFactor(x: x, y: y, size: size))
+                var r = pixel.r, g = pixel.g, b = pixel.b
+                var h = pixel.h, rough = pixel.rough
+
+                let edgeCov = max(roadBand(xd, 92, 6), roadBand(xd, 932, 6))
+                roadWhitePaint(&r, &g, &b, &h, &rough, coverage: edgeCov,
+                               fields: fields, index: index, wheel: wheel)
+                let centreCov = roadBand(xd, 512, 7) * centreDash
+                roadYellowPaint(&r, &g, &b, &h, &rough, coverage: centreCov,
+                                fields: fields, index: index, wheel: wheel)
+
+                albedo[index * 3] = clamp01(r)
+                albedo[index * 3 + 1] = clamp01(g)
+                albedo[index * 3 + 2] = clamp01(b)
+                height[index] = clamp01(h)
+                roughness[index] = clamp01(rough)
             }
         }
-        return roadSet(fields)
+        return roadSet(albedo: albedo, height: height, roughness: roughness)
     }
 
-    /// Two roads crossing: vertical road u in [0.28, 0.72], horizontal
-    /// road v in [0.28, 0.72]; darker corner blocks outside the cross,
-    /// stop lines and crosswalks at the four entries, dashed
-    /// centrelines on the approaches.
+    /// Intersection: a vertical road (x in [256, 768]) crossing a
+    /// horizontal road (y in [256, 768]). The centre box carries NO
+    /// lane lines. On each approach, from the box outward: a
+    /// continental crosswalk (bars parallel to traffic, zones 96 px
+    /// deep, bars on a 64 px period over x/y in [288, 736]), then a
+    /// 16 px stop line, then a short dashed yellow centre line to the
+    /// texture edge. Corners are lighter concrete with expansion
+    /// joints and a worn circular patch at each inner corner.
     private static func makeRoadIntersection() -> PBRTextureSet {
-        let size = 512
-        var fields = makeRoadFields(seed: 0x20AD_0000_0000_0007)
-        let stripeBands = [56, 78, 100, 400, 422, 444] // 12 px stripes, 3 per entry
+        let size = roadSize
+        let count = size * size
+        let fields = makeRoadFields(seed: 0x20AD_0000_0000_0007)
+        // Wheel tracks for the vertical road (x) and horizontal road (y):
+        // two lanes each, centres 384 / 640, tracks offset +/-64.
+        let wheelTracks = roadWheelProfile(centres: [320, 448, 576, 704],
+                                           halfWidth: 42, size: size)
+        var albedo = [Double](repeating: 0, count: count * 3)
+        var height = [Double](repeating: 0, count: count)
+        var roughness = [Double](repeating: 0, count: count)
         for y in 0 ..< size {
+            let yd = Double(y) + 0.5
+            let inHorizontal = yd >= 256 && yd < 768
             for x in 0 ..< size {
                 let index = y * size + x
-                let u = Double(x) / Double(size)
-                let v = Double(y) / Double(size)
-                let inVertical = u >= 0.28 && u < 0.72
-                let inHorizontal = v >= 0.28 && v < 0.72
-                // Corner blocks: darker, rougher surround asphalt.
+                let xd = Double(x) + 0.5
+                let inVertical = xd >= 256 && xd < 768
+                var wheel = 0.0
+                if inVertical { wheel = max(wheel, wheelTracks[x]) }
+                if inHorizontal { wheel = max(wheel, wheelTracks[y]) }
+                let pixel = roadAsphalt(fields, index: index, wheel: wheel,
+                                        edge: roadEdgeFactor(x: x, y: y, size: size))
+                var r = pixel.r, g = pixel.g, b = pixel.b
+                var h = pixel.h, rough = pixel.rough
+
                 if !inVertical && !inHorizontal {
-                    fields.albedo[index * 3] *= 0.72
-                    fields.albedo[index * 3 + 1] *= 0.72
-                    fields.albedo[index * 3 + 2] *= 0.72
-                    fields.roughness[index] = clamp01(fields.roughness[index] + 0.03)
+                    // Corner block: light concrete sidewalk, slightly
+                    // raised and very rough, with expansion joints.
+                    let concrete = 0.44
+                        + (fields.large[index] - 0.5) * 0.06
+                        + (fields.speckleA[index] - 0.5) * 0.04
+                    r += (concrete - r) * 0.9
+                    g += (concrete - g) * 0.9
+                    b += (concrete * 0.99 - b) * 0.9
+                    h += 0.035
+                    rough = 0.96
+                    let joint = max(max(roadBand(xd, 128, 1.5), roadBand(xd, 896, 1.5)),
+                                    max(roadBand(yd, 128, 1.5), roadBand(yd, 896, 1.5)))
+                    r -= joint * 0.04
+                    g -= joint * 0.04
+                    b -= joint * 0.04
+                    h -= joint * 0.03
+                    // Worn patch around the inner corner point.
+                    let cdx = min(abs(xd - 256), abs(xd - 768))
+                    let cdy = min(abs(yd - 256), abs(yd - 768))
+                    let cornerDist = (cdx * cdx + cdy * cdy).squareRoot()
+                    let patch = clamp01(1.0 - cornerDist / 110.0)
+                    r -= patch * 0.05
+                    g -= patch * 0.05
+                    b -= patch * 0.05
+                    h -= patch * 0.01
+                } else {
+                    // Continental crosswalk bars on all four approaches.
+                    let barAcross = roadDash(xd - 288, 64, 32) * roadInterval(xd, 288, 736)
+                    let zebraBottom = barAcross * roadInterval(yd, 780, 876)
+                    let zebraTop = barAcross * roadInterval(yd, 148, 244)
+                    let barAlong = roadDash(yd - 288, 64, 32) * roadInterval(yd, 288, 736)
+                    let zebraRight = barAlong * roadInterval(xd, 780, 876)
+                    let zebraLeft = barAlong * roadInterval(xd, 148, 244)
+                    let zebra = max(max(zebraBottom, zebraTop), max(zebraRight, zebraLeft))
+                    roadWhitePaint(&r, &g, &b, &h, &rough, coverage: zebra,
+                                   fields: fields, index: index, wheel: wheel)
+
+                    // Stop lines, just outside the crosswalks.
+                    let stopBottom = roadInterval(yd, 892, 908) * roadInterval(xd, 288, 736)
+                    let stopTop = roadInterval(yd, 116, 132) * roadInterval(xd, 288, 736)
+                    let stopRight = roadInterval(xd, 892, 908) * roadInterval(yd, 288, 736)
+                    let stopLeft = roadInterval(xd, 116, 132) * roadInterval(yd, 288, 736)
+                    let stop = max(max(stopBottom, stopTop), max(stopRight, stopLeft))
+                    roadWhitePaint(&r, &g, &b, &h, &rough, coverage: stop,
+                                   fields: fields, index: index, wheel: 0)
+
+                    // Dashed yellow centrelines on the short approach
+                    // stubs beyond the stop lines (never in the box).
+                    let centreV = roadBand(xd, 512, 6)
+                        * max(roadInterval(yd, 908, 1024), roadInterval(yd, 0, 116))
+                        * roadDash(yd, 128, 72)
+                    let centreH = roadBand(yd, 512, 6)
+                        * max(roadInterval(xd, 908, 1024), roadInterval(xd, 0, 116))
+                        * roadDash(xd, 128, 72)
+                    roadYellowPaint(&r, &g, &b, &h, &rough, coverage: max(centreV, centreH),
+                                    fields: fields, index: index, wheel: wheel)
                 }
-                // Crosswalk stripes just outside each entry.
-                let zebraAcross = u >= 0.30 && u < 0.70
-                    && stripeBands.contains { y >= $0 && y < $0 + 12 }
-                let zebraAlong = v >= 0.30 && v < 0.70
-                    && stripeBands.contains { x >= $0 && x < $0 + 12 }
-                // Stop lines at the four entries.
-                let stopAcross = u >= 0.30 && u < 0.70
-                    && ((v >= 0.24 && v < 0.28) || (v >= 0.72 && v < 0.76))
-                let stopAlong = v >= 0.30 && v < 0.70
-                    && ((u >= 0.24 && u < 0.28) || (u >= 0.72 && u < 0.76))
-                // Dashed centrelines on the approaches only.
-                let centreV = inBand(x, 256, 5) && !inHorizontal && (y % 44) < 24
-                let centreH = inBand(y, 256, 5) && !inVertical && (x % 44) < 24
-                if zebraAcross || zebraAlong || stopAcross || stopAlong || centreV || centreH {
-                    paintWhite(&fields, index: index)
-                }
+
+                albedo[index * 3] = clamp01(r)
+                albedo[index * 3 + 1] = clamp01(g)
+                albedo[index * 3 + 2] = clamp01(b)
+                height[index] = clamp01(h)
+                roughness[index] = clamp01(rough)
             }
         }
-        return roadSet(fields)
+        return roadSet(albedo: albedo, height: height, roughness: roughness)
     }
 
-    /// Roundabout: raised island, brick-tint apron, circulating
-    /// roadway with a dashed circular lane line, four entry/exit
-    /// stubs, dark surround in the corners.
-    private static func makeRoadRoundabout() -> PBRTextureSet {
-        let size = 512
-        var fields = makeRoadFields(seed: 0x20AD_0000_0000_0008)
+    /// Crosswalk: a full zebra crossing. Wide white stripes (64 px,
+    /// on a 128 px period so gaps straddle the top/bottom borders)
+    /// run across the whole texture, perpendicular to travel, between
+    /// solid white edge lines at x = 56 / 968. Two wheel tracks
+    /// (x = 352 / 672) polish the asphalt and scrub the paint almost
+    /// away where tyres cross the stripes.
+    private static func makeRoadCrosswalk() -> PBRTextureSet {
+        let size = roadSize
+        let count = size * size
+        let fields = makeRoadFields(seed: 0x20AD_0000_0000_0006)
+        let wheelX = roadWheelProfile(centres: [352, 672], halfWidth: 70, size: size)
+        let gapX = roadWheelProfile(centres: [352, 672], halfWidth: 58, size: size)
+        var albedo = [Double](repeating: 0, count: count * 3)
+        var height = [Double](repeating: 0, count: count)
+        var roughness = [Double](repeating: 0, count: count)
         for y in 0 ..< size {
+            let yd = Double(y) + 0.5
+            let stripe = roadDash(yd, 128, 64)
             for x in 0 ..< size {
                 let index = y * size + x
-                let dx = Double(x) - 256
-                let dy = Double(y) - 256
-                let r = (dx * dx + dy * dy).squareRoot()
-                let angle = atan2(dy, dx)
-                let onStub = abs(dy) <= 55 || abs(dx) <= 55
-                if r < 78 {
-                    // Island: light concrete, raised.
-                    fields.albedo[index * 3] = 0.55
-                    fields.albedo[index * 3 + 1] = 0.55
-                    fields.albedo[index * 3 + 2] = 0.54
-                    fields.roughness[index] = 0.9
-                    fields.height[index] = 0.62
-                } else if r < 96 {
-                    // Apron ring: brick-ish tint.
-                    fields.albedo[index * 3] = 0.46
-                    fields.albedo[index * 3 + 1] = 0.29
-                    fields.albedo[index * 3 + 2] = 0.23
-                    fields.roughness[index] = 0.9
-                    fields.height[index] = 0.56
-                } else if r > 196 && !onStub {
-                    // Corners: dark asphalt/gravel surround.
-                    fields.albedo[index * 3] = 0.09
-                    fields.albedo[index * 3 + 1] = 0.11
-                    fields.albedo[index * 3 + 2] = 0.08
-                    fields.roughness[index] = 1.0
-                    fields.height[index] = 0.45
-                }
-                // Dashed circular lane line at r = 146 (24-segment dash).
-                let segment = Int(((angle + .pi) / (2.0 * .pi)) * 24.0)
-                if abs(r - 146) < 2.5 && segment % 2 == 0 {
-                    paintWhite(&fields, index: index)
-                }
-                // Outer edge: solid white circle at r = 196.
-                if abs(r - 196) < 2.5 {
-                    paintWhite(&fields, index: index)
-                }
-                // Dashed centrelines on the four stubs.
-                let stubH = abs(dy) < 2.5 && abs(dx) > 196 && (Int(abs(dx)) % 44) < 24
-                let stubV = abs(dx) < 2.5 && abs(dy) > 196 && (Int(abs(dy)) % 44) < 24
-                if stubH || stubV {
-                    paintWhite(&fields, index: index)
-                }
+                let xd = Double(x) + 0.5
+                let wheel = wheelX[x]
+                let pixel = roadAsphalt(fields, index: index, wheel: wheel,
+                                        edge: roadEdgeFactor(x: x, y: y, size: size))
+                var r = pixel.r, g = pixel.g, b = pixel.b
+                var h = pixel.h, rough = pixel.rough
+
+                // Stripes span between the edge lines; their paint
+                // wear is driven by the (narrower) wheel-gap profile,
+                // so the two tyre paths read as gaps in the zebra.
+                let stripeCov = stripe * roadInterval(xd, 72, 952)
+                roadWhitePaint(&r, &g, &b, &h, &rough, coverage: stripeCov,
+                               fields: fields, index: index, wheel: gapX[x])
+                let edgeCov = max(roadBand(xd, 56, 6), roadBand(xd, 968, 6))
+                roadWhitePaint(&r, &g, &b, &h, &rough, coverage: edgeCov,
+                               fields: fields, index: index, wheel: 0)
+
+                albedo[index * 3] = clamp01(r)
+                albedo[index * 3 + 1] = clamp01(g)
+                albedo[index * 3 + 2] = clamp01(b)
+                height[index] = clamp01(h)
+                roughness[index] = clamp01(rough)
             }
         }
-        return roadSet(fields)
+        return roadSet(albedo: albedo, height: height, roughness: roughness)
+    }
+
+    /// Roundabout: a raised concrete island (r < 180, with a proud
+    /// curb ring at its edge), a lighter warm-tinted apron ring
+    /// (180...235) with radial joints every 30 degrees and one
+    /// concentric joint, and an annular asphalt driving lane
+    /// (235...430) with a polished circulating wheel band at r = 330
+    /// and a dashed circular lane line on the same radius (24 arc
+    /// segments, suppressed at the four entries). The solid outer
+    /// edge circle at r = 430 breaks at the cardinal entry/exit
+    /// stubs, which run to the texture edges with their own edge
+    /// lines and dashed centrelines. Dashed yield arcs sit just
+    /// outside the circle at r = 452 across each entry. Corners
+    /// outside the circle and stubs are dark gravel surround.
+    private static func makeRoadRoundabout() -> PBRTextureSet {
+        let size = roadSize
+        let count = size * size
+        let fields = makeRoadFields(seed: 0x20AD_0000_0000_0008)
+        // Wheel tracks along the straight stubs (either axis).
+        let stubWheel = roadWheelProfile(centres: [457, 567], halfWidth: 40, size: size)
+        var albedo = [Double](repeating: 0, count: count * 3)
+        var height = [Double](repeating: 0, count: count)
+        var roughness = [Double](repeating: 0, count: count)
+        for y in 0 ..< size {
+            let yd = Double(y) + 0.5
+            let dy = yd - 512
+            let inStubH = abs(dy) <= 110
+            for x in 0 ..< size {
+                let index = y * size + x
+                let xd = Double(x) + 0.5
+                let dx = xd - 512
+                let inStubV = abs(dx) <= 110
+                let r = (dx * dx + dy * dy).squareRoot()
+
+                // Wheel polish: circulating band in the annulus,
+                // straight tracks on the stubs.
+                var wheel = 0.0
+                if r >= 235 && r <= 430 {
+                    let dr = abs(r - 330)
+                    if dr < 48 {
+                        let t = 1.0 - (dr / 48) * (dr / 48)
+                        wheel = t * t
+                    }
+                }
+                if r > 424 && inStubH { wheel = max(wheel, stubWheel[y]) }
+                if r > 424 && inStubV { wheel = max(wheel, stubWheel[x]) }
+
+                let pixel = roadAsphalt(fields, index: index, wheel: wheel,
+                                        edge: roadEdgeFactor(x: x, y: y, size: size))
+                var rr = pixel.r, g = pixel.g, b = pixel.b
+                var h = pixel.h, rough = pixel.rough
+
+                if r < 235 {
+                    // Island and apron: concrete surfaces, raised.
+                    // Angle is only needed in here (radial joints), so
+                    // atan2 runs on ~18% of pixels, not the full face.
+                    let variation = (fields.large[index] - 0.5) * 0.07
+                        + (fields.speckleA[index] - 0.5) * 0.05
+                    if r < 180 {
+                        let grey = 0.54 + variation
+                        rr = grey; g = grey; b = grey * 0.99
+                        h = 0.65
+                        rough = 0.90
+                    } else {
+                        let tint = 1.0 + variation * 1.6
+                        rr = 0.47 * tint; g = 0.405 * tint; b = 0.355 * tint
+                        h = 0.575
+                        rough = 0.92
+                    }
+                    // Proud curb ring where island meets apron.
+                    h += roadBand(r, 180, 4) * 0.03
+                    if r > 24 {
+                        let theta = atan2(dy, dx)
+                        let sectorPos = (theta + .pi) / (2.0 * .pi) * 12.0
+                        let frac = sectorPos - sectorPos.rounded(.down)
+                        let arcToJoint = min(frac, 1.0 - frac) * (2.0 * .pi * r / 12.0)
+                        let joint = clamp01((2.0 - arcToJoint) / 1.5 + 0.5)
+                        rr -= joint * 0.07
+                        g -= joint * 0.07
+                        b -= joint * 0.07
+                        h -= joint * 0.025
+                    }
+                    if r >= 180 {
+                        let ringJoint = roadBand(r, 207, 1.8)
+                        rr -= ringJoint * 0.06
+                        g -= ringJoint * 0.06
+                        b -= ringJoint * 0.06
+                        h -= ringJoint * 0.02
+                    }
+                } else if r > 430 && !inStubH && !inStubV {
+                    // Corner surround: dark gravel, low and very rough.
+                    let grey = 0.085
+                        + (fields.mid[index] - 0.5) * 0.03
+                        + (fields.speckleA[index] - 0.5) * 0.04
+                    rr = grey * 0.9; g = grey * 1.15; b = grey * 0.85
+                    h = 0.44
+                    rough = 1.0
+                } else {
+                    // Annulus and stubs: markings.
+                    // Dashed circular lane line at r = 330, breaking
+                    // where the stubs join (either coordinate small
+                    // relative to the radius puts the point in a stub
+                    // mouth, and the angular test keeps the break
+                    // centred on the cardinal directions).
+                    let laneBand = roadBand(r, 330, 6)
+                    if laneBand > 0 {
+                        let theta = atan2(dy, dx)
+                        let segPos = (theta + .pi) / (2.0 * .pi) * 24.0
+                        let seg = Int(segPos.rounded(.down))
+                        // Angular distance to the nearest cardinal.
+                        let quarter = (theta / (.pi / 2.0)).rounded()
+                        let toCardinal = abs(theta - quarter * (.pi / 2.0))
+                        if seg % 2 == 0 && toCardinal > 0.30 {
+                            roadWhitePaint(&rr, &g, &b, &h, &rough, coverage: laneBand,
+                                           fields: fields, index: index, wheel: wheel)
+                        }
+                    }
+                    // Yield arcs at r = 452, only across the entries
+                    // (points there lie inside a stub's width), dashed
+                    // into 40 arc segments.
+                    let yieldBand = roadBand(r, 452, 5)
+                    if yieldBand > 0 && (abs(dy) < 104 || abs(dx) < 104) {
+                        let theta = atan2(dy, dx)
+                        let segPos = (theta + .pi) / (2.0 * .pi) * 40.0
+                        let seg = Int(segPos.rounded(.down))
+                        if seg % 2 == 0 {
+                            roadWhitePaint(&rr, &g, &b, &h, &rough, coverage: yieldBand,
+                                           fields: fields, index: index, wheel: 0)
+                        }
+                    }
+                    // Solid outer edge circle, broken at the stubs.
+                    if !(inStubH || inStubV) {
+                        let edgeCov = roadBand(r, 430, 6)
+                        roadWhitePaint(&rr, &g, &b, &h, &rough, coverage: edgeCov,
+                                       fields: fields, index: index, wheel: 0)
+                    }
+                    // Stub markings, fading in just outside the circle.
+                    let stubFade = clamp01((r - 424) / 8.0)
+                    if stubFade > 0 {
+                        if inStubH {
+                            let stubEdge = max(roadBand(yd, 402, 5), roadBand(yd, 622, 5))
+                            roadWhitePaint(&rr, &g, &b, &h, &rough, coverage: stubEdge * stubFade,
+                                           fields: fields, index: index, wheel: 0)
+                            let stubCentre = roadBand(yd, 512, 5) * roadDash(xd, 128, 72)
+                            roadWhitePaint(&rr, &g, &b, &h, &rough, coverage: stubCentre * stubFade,
+                                           fields: fields, index: index, wheel: wheel)
+                        }
+                        if inStubV {
+                            let stubEdge = max(roadBand(xd, 402, 5), roadBand(xd, 622, 5))
+                            roadWhitePaint(&rr, &g, &b, &h, &rough, coverage: stubEdge * stubFade,
+                                           fields: fields, index: index, wheel: 0)
+                            let stubCentre = roadBand(xd, 512, 5) * roadDash(yd, 128, 72)
+                            roadWhitePaint(&rr, &g, &b, &h, &rough, coverage: stubCentre * stubFade,
+                                           fields: fields, index: index, wheel: wheel)
+                        }
+                    }
+                }
+
+                albedo[index * 3] = clamp01(rr)
+                albedo[index * 3 + 1] = clamp01(g)
+                albedo[index * 3 + 2] = clamp01(b)
+                height[index] = clamp01(h)
+                roughness[index] = clamp01(rough)
+            }
+        }
+        return roadSet(albedo: albedo, height: height, roughness: roughness)
     }
 }
 

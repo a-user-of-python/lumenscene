@@ -74,6 +74,19 @@ struct LogicNode: Codable, Equatable, Identifiable {
     }
 }
 
+/// Dynamic coding key for lossy per-key decoding of a node's
+/// `params` dictionary (F18): the keys are arbitrary param names,
+/// so they cannot be a CodingKeys enum.
+private struct AnyParamKey: CodingKey {
+    var stringValue: String
+    var intValue: Int?
+    init?(stringValue: String) { self.stringValue = stringValue }
+    init?(intValue: Int) {
+        self.stringValue = "\(intValue)"
+        self.intValue = intValue
+    }
+}
+
 extension LogicNode {
     private enum CodingKeys: String, CodingKey {
         case id, kind, params, x, y
@@ -84,14 +97,47 @@ extension LogicNode {
     // adds, and that must not fail the whole project load. Every
     // field falls back to exactly the property default above
     // (`kind` had no default, so a missing kind reads as "").
+    // F18: decoding is lossy per field AND per param key — a
+    // present-but-mistyped value (a number stored as a string by
+    // another build, say) falls back for that one field/entry
+    // instead of throwing out of the whole project load.
     // encode(to:) stays synthesised — see Models.swift.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
-        kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? ""
-        params = try c.decodeIfPresent([String: NodeParam].self, forKey: .params) ?? [:]
-        x = try c.decodeIfPresent(Double.self, forKey: .x) ?? 0
-        y = try c.decodeIfPresent(Double.self, forKey: .y) ?? 0
+        if let decoded = try? c.decodeIfPresent(UUID.self, forKey: .id),
+           let value = decoded {
+            id = value
+        } else {
+            id = UUID()
+        }
+        if let decoded = try? c.decodeIfPresent(String.self, forKey: .kind),
+           let value = decoded {
+            kind = value
+        } else {
+            kind = ""
+        }
+        var decodedParams: [String: NodeParam] = [:]
+        if let paramContainer = try? c.nestedContainer(keyedBy: AnyParamKey.self,
+                                                       forKey: .params) {
+            for key in paramContainer.allKeys {
+                if let value = try? paramContainer.decode(NodeParam.self, forKey: key) {
+                    decodedParams[key.stringValue] = value
+                }   // a single bad entry is dropped, not fatal
+            }
+        }
+        params = decodedParams
+        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .x),
+           let value = decoded {
+            x = value
+        } else {
+            x = 0
+        }
+        if let decoded = try? c.decodeIfPresent(Double.self, forKey: .y),
+           let value = decoded {
+            y = value
+        } else {
+            y = 0
+        }
     }
 }
 
@@ -114,15 +160,41 @@ extension NodeLink {
     // Defensive decodeIfPresent init, same reasoning as LogicNode.
     // `from`/`to` had no defaults; a missing endpoint falls back to
     // the all-zero UUID, which matches no node and is inert.
+    // F18: each field is decoded lossily, so a mistyped value falls
+    // back the same way a missing key does.
     init(from decoder: Decoder) throws {
+        let zero = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
-        from = try c.decodeIfPresent(UUID.self, forKey: .from)
-            ?? UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
-        fromPin = try c.decodeIfPresent(String.self, forKey: .fromPin) ?? "out"
-        to = try c.decodeIfPresent(UUID.self, forKey: .to)
-            ?? UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
-        toPin = try c.decodeIfPresent(String.self, forKey: .toPin) ?? "in"
+        if let decoded = try? c.decodeIfPresent(UUID.self, forKey: .id),
+           let value = decoded {
+            id = value
+        } else {
+            id = UUID()
+        }
+        if let decoded = try? c.decodeIfPresent(UUID.self, forKey: .from),
+           let value = decoded {
+            from = value
+        } else {
+            from = zero
+        }
+        if let decoded = try? c.decodeIfPresent(String.self, forKey: .fromPin),
+           let value = decoded {
+            fromPin = value
+        } else {
+            fromPin = "out"
+        }
+        if let decoded = try? c.decodeIfPresent(UUID.self, forKey: .to),
+           let value = decoded {
+            to = value
+        } else {
+            to = zero
+        }
+        if let decoded = try? c.decodeIfPresent(String.self, forKey: .toPin),
+           let value = decoded {
+            toPin = value
+        } else {
+            toPin = "in"
+        }
     }
 }
 
@@ -233,6 +305,23 @@ enum NodeCatalog {
             hasIn: false, outs: ["out"],
             params: [
                 NodeParamSpec(key: "name", label: "Variable Name", type: .text, def: .text("score")),
+            ]),
+
+        NodeKindSpec(
+            kind: "evProximity", title: "Player Near Object", category: "Events",
+            blurb: "Runs when the player steps within range of the chosen object, and again when they leave it.",
+            hasIn: false, outs: ["enter", "exit"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "radius", label: "Radius (m)", type: .number, def: .number(3), min: 0.5, max: 50),
+            ]),
+
+        NodeKindSpec(
+            kind: "evFallBelow", title: "Player Falls Below", category: "Events",
+            blurb: "Runs once when the player drops below the chosen height; it re-arms when they climb back above it.",
+            hasIn: false, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "height", label: "Height (m)", type: .number, def: .number(0), min: -100, max: 200),
             ]),
 
         // MARK: Actions — hasIn = true, "out" pin unless noted.
@@ -377,6 +466,268 @@ enum NodeCatalog {
                 NodeParamSpec(key: "value", label: "Value", type: .number, def: .number(1)),
             ]),
 
+        NodeKindSpec(
+            kind: "actSpawn", title: "Spawn Object", category: "Actions",
+            blurb: "Makes a copy of the chosen object appear. Spawned copies are decoration — particles and taps pass them by.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "source", label: "Source Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "at", label: "At Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "lifetime", label: "Lifetime (seconds, 0 = until despawned)", type: .number, def: .number(0), min: 0, max: 600),
+            ]),
+
+        NodeKindSpec(
+            kind: "actSpawnPattern", title: "Spawn Pattern", category: "Actions",
+            blurb: "Makes many copies of the chosen object appear in a pattern around it. Spawned copies are decoration — particles and taps pass them by.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "source", label: "Source Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "pattern", label: "Pattern", type: .choice, def: .text("Grid"), choices: ["Grid", "Ring", "Scatter", "Line"]),
+                NodeParamSpec(key: "count", label: "Count", type: .number, def: .number(8), min: 1, max: 64),
+                NodeParamSpec(key: "spacing", label: "Spacing (m)", type: .number, def: .number(1.5), min: 0.1, max: 50),
+                NodeParamSpec(key: "radius", label: "Radius (m)", type: .number, def: .number(4), min: 0.5, max: 100),
+                NodeParamSpec(key: "seed", label: "Seed", type: .number, def: .number(1), min: 0, max: 100000),
+                NodeParamSpec(key: "randomYaw", label: "Random Facing", type: .bool, def: .bool(true)),
+                NodeParamSpec(key: "lifetime", label: "Lifetime (seconds, 0 = until despawned)", type: .number, def: .number(0), min: 0, max: 600),
+            ]),
+
+        NodeKindSpec(
+            kind: "actDespawn", title: "Despawn Objects", category: "Actions",
+            blurb: "Removes every spawned copy of the chosen object.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "source", label: "Source Object", type: .objectRef, def: .ref(nil)),
+            ]),
+
+        NodeKindSpec(
+            kind: "actSetColor", title: "Set Object Colour", category: "Actions",
+            blurb: "Changes the chosen object's base colour.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "color", label: "Colour", type: .colorText, def: .text("#FFFFFF")),
+            ]),
+
+        NodeKindSpec(
+            kind: "actPulseLight", title: "Pulse Light", category: "Actions",
+            blurb: "Makes an object's light breathe between two brightnesses until stopped.",
+            hasIn: true, extraIns: ["stop"], outs: ["out"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "min", label: "Min Intensity", type: .number, def: .number(0), min: 0, max: 40),
+                NodeParamSpec(key: "max", label: "Max Intensity", type: .number, def: .number(6), min: 0, max: 40),
+                NodeParamSpec(key: "period", label: "Period (seconds)", type: .number, def: .number(2), min: 0.1, max: 60),
+            ]),
+
+        NodeKindSpec(
+            kind: "actColorCycle", title: "Cycle Light Colour", category: "Actions",
+            blurb: "Rotates an object's light colour through the rainbow until stopped.",
+            hasIn: true, extraIns: ["stop"], outs: ["out"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "speed", label: "Speed (°/s)", type: .number, def: .number(60), min: 1, max: 720),
+            ]),
+
+        NodeKindSpec(
+            kind: "actOscillate", title: "Oscillate Object", category: "Actions",
+            blurb: "Slides an object back and forth along one axis until it is stopped or replaced.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "axis", label: "Axis", type: .choice, def: .text("Y"), choices: ["X", "Y", "Z"]),
+                NodeParamSpec(key: "amplitude", label: "Amplitude (m)", type: .number, def: .number(1), min: 0, max: 50),
+                NodeParamSpec(key: "period", label: "Period (seconds)", type: .number, def: .number(3), min: 0.1, max: 120),
+            ]),
+
+        NodeKindSpec(
+            kind: "actFollowPath", title: "Follow Object", category: "Actions",
+            blurb: "Walks an object between where it started and another object, which it keeps tracking live.",
+            hasIn: true, outs: ["out", "arrived"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "target", label: "Target Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "speed", label: "Speed (m/s)", type: .number, def: .number(1.5), min: 0.1, max: 30),
+                NodeParamSpec(key: "mode", label: "Mode", type: .choice, def: .text("PingPong"), choices: ["Once", "PingPong", "Loop"]),
+            ]),
+
+        NodeKindSpec(
+            kind: "actChasePlayer", title: "Chase Player", category: "Actions",
+            blurb: "Walks an object toward the player until it gets close, then fires Caught.",
+            hasIn: true, outs: ["out", "caught"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "speed", label: "Speed (m/s)", type: .number, def: .number(2), min: 0.1, max: 30),
+                NodeParamSpec(key: "stopDistance", label: "Stop Distance (m)", type: .number, def: .number(1.2), min: 0, max: 50),
+                NodeParamSpec(key: "fly", label: "Fly (move in 3D)", type: .bool, def: .bool(false)),
+            ]),
+
+        NodeKindSpec(
+            kind: "actWander", title: "Wander", category: "Actions",
+            blurb: "Walks an object to random spots near where it started, pausing at each one.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "radius", label: "Radius (m)", type: .number, def: .number(5), min: 0.5, max: 100),
+                NodeParamSpec(key: "speed", label: "Speed (m/s)", type: .number, def: .number(1), min: 0.1, max: 30),
+                NodeParamSpec(key: "pause", label: "Pause (seconds)", type: .number, def: .number(1), min: 0, max: 30),
+            ]),
+
+        NodeKindSpec(
+            kind: "actLookAt", title: "Look At", category: "Actions",
+            blurb: "Turns an object smoothly to face the player or another object until it is stopped or replaced.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "target", label: "Target", type: .choice, def: .text("Player"), choices: ["Player", "Object"]),
+                NodeParamSpec(key: "targetObject", label: "Target Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "turnSpeed", label: "Turn Speed (°/s)", type: .number, def: .number(180), min: 1, max: 1080),
+            ]),
+
+        NodeKindSpec(
+            kind: "actStopBehaviour", title: "Stop Behaviour", category: "Actions",
+            blurb: "Stops the continuous behaviours running on an object: movement, facing, scaling, light effects, or all of them.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "scope", label: "Stop", type: .choice, def: .text("All"), choices: ["All", "Movement", "Facing", "Scale", "Light"]),
+            ]),
+
+        NodeKindSpec(
+            kind: "actScaleTo", title: "Scale Object", category: "Actions",
+            blurb: "Grows or shrinks an object evenly to a new size over a few seconds.",
+            hasIn: true, outs: ["out", "arrived"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "scale", label: "Scale", type: .number, def: .number(2), min: 0.05, max: 20),
+                NodeParamSpec(key: "duration", label: "Duration (seconds)", type: .number, def: .number(1), min: 0, max: 60),
+            ]),
+
+        NodeKindSpec(
+            kind: "actSetGravity", title: "Set Gravity", category: "Actions",
+            blurb: "Scales gravity for every particle in the scene (1 is normal, 0 is weightless).",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "scale", label: "Gravity Scale", type: .number, def: .number(1), min: 0, max: 4),
+            ]),
+
+        NodeKindSpec(
+            kind: "actImpulse", title: "Impulse Burst", category: "Actions",
+            blurb: "Blasts every particle near the chosen object outward; settled particles are knocked loose.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "radius", label: "Radius (m)", type: .number, def: .number(3), min: 0.5, max: 50),
+                NodeParamSpec(key: "strength", label: "Strength", type: .number, def: .number(6), min: 0, max: 40),
+            ]),
+
+        NodeKindSpec(
+            kind: "actStopAllParticles", title: "Stop All Particles", category: "Actions",
+            blurb: "Stops every emitter in the scene; optionally removes all live particles too.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "clear", label: "Remove Particles Too", type: .bool, def: .bool(false)),
+            ]),
+
+        NodeKindSpec(
+            kind: "actAreaVisibility", title: "Show/Hide Area", category: "Actions",
+            blurb: "Shows or hides every object that belongs to the chosen area.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "area", label: "Area", type: .areaRef, def: .ref(nil)),
+                NodeParamSpec(key: "visible", label: "Visible", type: .bool, def: .bool(true)),
+            ]),
+
+        NodeKindSpec(
+            kind: "actSetPlayerSpeed", title: "Set Player Speed", category: "Actions",
+            blurb: "Sets how fast the player walks in Play mode.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "speed", label: "Speed (m/s)", type: .number, def: .number(2.4), min: 0, max: 20),
+            ]),
+
+        NodeKindSpec(
+            kind: "actSetCheckpoint", title: "Set Checkpoint", category: "Actions",
+            blurb: "Remembers where the player is standing right now, so Respawn Player can bring them back here.",
+            hasIn: true, outs: ["out"]),
+
+        NodeKindSpec(
+            kind: "actRespawnPlayer", title: "Respawn Player", category: "Actions",
+            blurb: "Returns the player to the last checkpoint, or to where Play started if none was set.",
+            hasIn: true, outs: ["out"]),
+
+        NodeKindSpec(
+            kind: "actCameraShake", title: "Camera Shake", category: "Actions",
+            blurb: "Shakes the Play camera briefly; the player's saved position is untouched.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "strength", label: "Strength", type: .number, def: .number(0.3), min: 0, max: 2),
+                NodeParamSpec(key: "seconds", label: "Duration (seconds)", type: .number, def: .number(0.5), min: 0.1, max: 10),
+            ]),
+
+        NodeKindSpec(
+            kind: "actCutToView", title: "Cut To View", category: "Actions",
+            blurb: "Turns the Play camera to look at an object, or to fixed yaw/pitch angles, without moving the player.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "mode", label: "Mode", type: .choice, def: .text("Look At Object"), choices: ["Look At Object", "Angles"]),
+                NodeParamSpec(key: "target", label: "Target Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "yaw", label: "Yaw (degrees)", type: .number, def: .number(0)),
+                NodeParamSpec(key: "pitch", label: "Pitch (degrees)", type: .number, def: .number(0)),
+            ]),
+
+        NodeKindSpec(
+            kind: "actSetEnvironment", title: "Set Environment Light", category: "Actions",
+            blurb: "Sets how bright the ambient environment light is (1 is normal).",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "intensity", label: "Intensity", type: .number, def: .number(1), min: 0, max: 4),
+            ]),
+
+        NodeKindSpec(
+            kind: "actWeatherControl", title: "Weather Control", category: "Actions",
+            blurb: "Scales how fast weather builds up and how strong it looks, and can set the wetness/snow levels directly.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "rateScale", label: "Build-up Rate Scale", type: .number, def: .number(1), min: 0, max: 10),
+                NodeParamSpec(key: "intensityScale", label: "Intensity Scale", type: .number, def: .number(1), min: 0, max: 4),
+                NodeParamSpec(key: "setWet", label: "Set Wetness", type: .bool, def: .bool(false)),
+                NodeParamSpec(key: "wet", label: "Wetness", type: .number, def: .number(0.5), min: 0, max: 1),
+                NodeParamSpec(key: "setSnow", label: "Set Snow", type: .bool, def: .bool(false)),
+                NodeParamSpec(key: "snow", label: "Snow", type: .number, def: .number(0.5), min: 0, max: 1),
+            ]),
+
+        NodeKindSpec(
+            kind: "actShowValue", title: "Show Value", category: "Actions",
+            blurb: "Shows a message with variable values filled in — write {score} to show the score variable.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "message", label: "Message", type: .text, def: .text("Score: {score}")),
+                NodeParamSpec(key: "seconds", label: "Show For (seconds)", type: .number, def: .number(3), min: 0.5, max: 30),
+            ]),
+
+        NodeKindSpec(
+            kind: "actMath", title: "Variable Maths", category: "Actions",
+            blurb: "Combines a variable with a number (or another variable) and stores the result back in the variable.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "name", label: "Variable Name", type: .text, def: .text("score")),
+                NodeParamSpec(key: "op", label: "Operation", type: .choice, def: .text("Add"), choices: ["Add", "Subtract", "Multiply", "Divide", "Modulo", "Min", "Max"]),
+                NodeParamSpec(key: "bIsVariable", label: "Second Value Is a Variable", type: .bool, def: .bool(false)),
+                NodeParamSpec(key: "value", label: "Value", type: .number, def: .number(1)),
+                NodeParamSpec(key: "bName", label: "Second Variable Name", type: .text, def: .text("other")),
+            ]),
+
+        NodeKindSpec(
+            kind: "actRandomValue", title: "Random Value", category: "Actions",
+            blurb: "Sets a variable to a random number in a range.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "name", label: "Variable Name", type: .text, def: .text("score")),
+                NodeParamSpec(key: "min", label: "Min", type: .number, def: .number(0)),
+                NodeParamSpec(key: "max", label: "Max", type: .number, def: .number(10)),
+                NodeParamSpec(key: "integer", label: "Whole Numbers Only", type: .bool, def: .bool(false)),
+            ]),
+
         // MARK: Logic — hasIn = true, pins vary per kind.
 
         NodeKindSpec(
@@ -416,6 +767,20 @@ enum NodeCatalog {
             hasIn: true, outs: ["out", "reached"],
             params: [
                 NodeParamSpec(key: "target", label: "Count To", type: .number, def: .number(5), min: 1, max: 10000),
+            ]),
+
+        NodeKindSpec(
+            kind: "logOnce", title: "Fire Once", category: "Logic",
+            blurb: "Passes the first signal on and blocks the rest, until Reset lets it fire once more.",
+            hasIn: true, extraIns: ["reset"], outs: ["out"]),
+
+        NodeKindSpec(
+            kind: "logSequence", title: "Sequence", category: "Logic",
+            blurb: "Sends each signal to the next output in turn: Out 1, then Out 2, and so on.",
+            hasIn: true, extraIns: ["reset"], outs: ["out1", "out2", "out3", "out4"],
+            params: [
+                NodeParamSpec(key: "steps", label: "Steps", type: .number, def: .number(2), min: 2, max: 4),
+                NodeParamSpec(key: "wrap", label: "Wrap Around", type: .bool, def: .bool(true)),
             ]),
     ]
 

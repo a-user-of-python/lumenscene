@@ -30,10 +30,12 @@
 //     denoise pass (second guide texture: surface normals) cleans
 //     interactive and Play frames while the settled image is
 //     still displayed raw from the accumulation.
-//   * Texture slices now come from TextureGen.allSliceNames()
-//     (presets + roads) plus the user's custom texture library;
-//     `reloadTextureArraysIfNeeded()` rebuilds the arrays when
-//     that library changes. Material flag bit3 = texture FIT.
+//   * Texture slices: the MAIN arrays (512) come from
+//     TextureGen.presetNames plus the user's custom texture
+//     library; roads live in a SEPARATE 1024 array set (v4.1)
+//     encoded as texIndex >= 4096. `reloadTextureArraysIfNeeded()`
+//     rebuilds both array sets when the library changes.
+//     Material flag bit3 = texture FIT.
 //   * Weather: wet/snow levels ride the trace uniforms (up-facing
 //     surfaces darken / whiten and gain/lose gloss, with a sheen
 //     bounce); rain/snow precipitation is a blended overlay pass
@@ -84,7 +86,7 @@ struct ReprojUniforms {
 struct GPUMaterial {
     var baseColor = SIMD4<Float>(1, 1, 1, 0)
     var emissive = SIMD4<Float>(0, 0, 0, 0)      // rgb, a = intensity
-    var glassParams = SIMD4<Float>(0, 0, 1.5, 0) // transmission, roughness, ior
+    var glassParams = SIMD4<Float>(0, 0, 1.5, 0) // transmission, roughness, ior, w = mean texture roughness (v4.1 F3, guide gloss only)
     var tint = SIMD4<Float>(1, 1, 1, 1)          // rgb, a = textureScale
     var texIndex: UInt32 = 0
     var flags: UInt32 = 0
@@ -196,6 +198,11 @@ final class Renderer {
     private var dynIdxBuffer: MTLBuffer?
     private var dynTriMatBuffer: MTLBuffer?
     private var dynTriCount: Int = 0
+    /// v4.1 (F9): true only when the dynamic AS built AND every
+    /// dynamic buffer exists. When false, uniforms force
+    /// dynTriCount = 0 for both kernels (the dummy/static
+    /// bindings in bindDynamicBuffers are then safe).
+    private var dynUsable: Bool = false
     private var dynDummyBuffer: MTLBuffer?
     private var cpuDynPositions: [Float] = []
     private var cpuDynNormals: [Float] = []
@@ -217,6 +224,10 @@ final class Renderer {
         var vertexCount: Int = 0
         var triStart: Int = 0
         var triCount: Int = 0
+        /// v4.1 (F17): true when compose truncated this soup and
+        /// remapped its vertices — flushDynamic must not re-bake
+        /// it in world order (see composeDynamic).
+        var remapped: Bool = false
     }
     private var dynSlices: [UUID: DynSlice] = [:]
     /// Static object materials from the last rebuild/material
@@ -226,6 +237,19 @@ final class Renderer {
     /// Emissive tris contributed by the dynamic layer in the
     /// last full emissive build (drives the rescan skip).
     private var dynEmissiveTriCount: Int = 0
+    /// v4.1 (F4ii): cached STATIC portion of the emissive index
+    /// (tris/areas/centroids from the last full static scan).
+    /// composeDynamic / setDynamicMaterial reuse it when static
+    /// geometry+materials are untouched since that scan; full
+    /// rebuilds and material-only updates rescan and refill it.
+    private var cachedStaticEmisTris: [UInt32] = []
+    private var cachedStaticEmisAreas: [Float] = []
+    private var cachedStaticEmisCentroids: [SIMD3<Float>] = []
+    private var staticEmisCacheValid: Bool = false
+    /// v4.1 (F11): unified emissive id -> index in the full
+    /// emissive arrays, built by uploadEmissiveIndex so
+    /// flushDynamic centroid refresh is O(1) per tri.
+    private var fullEmisIndexByID: [UInt32: Int] = [:]
 
     // v4 light culling: full emissive set + culled set. The
     // active pair is what emisTriBuffer/emisCDFBuffer and
@@ -250,8 +274,10 @@ final class Renderer {
     /// v4 edit-mode area-box overlay (world-space AABBs).
     var debugBoxes: [(min: SIMD3<Float>, max: SIMD3<Float>, color: SIMD4<Float>)] = []
     private var _collisionTriangles: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = []
-    /// Static world-space triangles, refreshed by rebuild()
-    /// (post weather geometry — read from the CPU mirrors).
+    /// World-space triangles from BOTH layers (v4.1 F5: static
+    /// post-weather geometry plus the dynamic layer, world-space
+    /// as rendered), refreshed by rebuild(), composeDynamic()
+    /// and flushDynamic() from the CPU mirrors.
     var collisionTriangles: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] {
         _collisionTriangles
     }
@@ -263,13 +289,39 @@ final class Renderer {
     private var cpuTriMats: [UInt32] = []
     private var cachedObjectOrder: [UUID] = []
 
-    // Texture arrays: built-in presets + roads plus the custom
-    // texture library. `sliceNames` is kept in lockstep with the
-    // array slices (slice i holds sliceNames[i]).
+    // Texture arrays: the MAIN arrays (512) hold built-in
+    // presets plus the custom texture library. `sliceNames` is
+    // kept in lockstep with the main array slices (slice i holds
+    // sliceNames[i]). v4.1: roads live in a SEPARATE 1024 array
+    // set (roadAlbedo/roadNormal/roadData, slices in
+    // TextureGen.roadNames order), encoded in materials as
+    // texIndex = 4096 + roadSlice + 1 so main-array slice
+    // indices for existing content never move.
     private var texAlbedo: MTLTexture?
     private var texNormal: MTLTexture?
     private var texData: MTLTexture?
+    private var roadTexAlbedo: MTLTexture?
+    private var roadTexNormal: MTLTexture?
+    private var roadTexData: MTLTexture?
+    /// v4.1 (N1): true only when ALL three road arrays were
+    /// created non-nil in buildTextureArrays. When false, road
+    /// materials degrade to untextured colour (texIndexValue
+    /// returns 0 for road presets) instead of gating all tracing
+    /// on the road arrays' allocation.
+    private var roadsAvailable: Bool = false
+    /// v4.1 (N1): lazily created 1x1 dummy texture2d_array bound
+    /// at trace slots 5-7 when a road array is missing. Never
+    /// sampled once roadsAvailable == false (no material then
+    /// encodes >= 4096).
+    private var roadDummyTex: MTLTexture?
     private(set) var sliceNames: [String] = []
+    private var roadSliceNames: [String] = []
+    /// v4.1 (F3): per-slice MEAN data-channel roughness, keyed by
+    /// the material texIndex encoding (main: slice+1; road:
+    /// 4096+slice+1). Baked into GPUMaterial.glassParams.w so
+    /// the guide kernel can price textured gloss without
+    /// sampling the data texture.
+    private var texMeanRoughness: [UInt32: Float] = [:]
     /// Fingerprint (custom library ids+names) the arrays were
     /// built with; see reloadTextureArraysIfNeeded().
     private var builtTextureFingerprint: String = ""
@@ -312,6 +364,10 @@ final class Renderer {
     var weatherMode: Int = 0
     var weatherWet: Float = 0
     var weatherSnow: Float = 0
+    /// v4.1 (recon §5): environment (sky) light intensity,
+    /// set by the session funnel; uniforms() feeds it to the
+    /// trace kernel instead of a hardcoded 1.0.
+    var envIntensity: Float = 1.0
     /// v3.4: QUANTISED build-up levels (steps of 1/24) that the
     /// current geometry was baked for. rebuild() turns these into
     /// real snow displacement + puddle water sheets; the session
@@ -335,7 +391,15 @@ final class Renderer {
     private var dynCadenceEMA: Double = 0
     private var dynLastCompletion: CFTimeInterval = 0
     private var dynFramesSinceAdjust = 0
+    /// v4.1 (F22): when the camera last stopped moving, for the
+    /// governor's ~2 s stand-down timer (guarded by dynLock).
+    private var dynStillSince: CFTimeInterval = 0
     private let dynLock = NSLock()
+    /// v4.1 (F12): frames since motion last stopped (reset on
+    /// any moving draw, counted up otherwise). The denoise gate
+    /// stays open for ~45 frames after motion so newly exposed,
+    /// still-young pixels keep their denoise.
+    private var framesSinceMove: Int = 10_000
     /// Weather dynamics (v3.2), written by the session every
     /// tick alongside the levels: a slow surge clock, the live
     /// intensity it produces, the rain-only intensity the trace
@@ -516,52 +580,68 @@ final class Renderer {
 
     // MARK: Texture arrays
 
-    /// Fingerprint of the custom texture library (ids + names):
-    /// any library edit changes it, which is the rebuild signal.
+    /// Fingerprint of everything the texture arrays are built
+    /// from — the road set (v4.1: roads are their own array set,
+    /// so the road names are part of the rebuild signal) plus
+    /// the custom texture library (ids + names): any change is
+    /// the rebuild signal.
     private func textureLibraryFingerprint() -> String {
-        CustomTextureStore.list()
+        let roads = TextureGen.roadNames.joined(separator: ",")
+        let customs = CustomTextureStore.list()
             .map { "\($0.id.uuidString):\($0.name)" }
             .joined(separator: "|")
+        return "roads:\(roads)|\(customs)"
+    }
+
+    /// Nearest-neighbour RGBA8 resample (v4.1 F10): a set whose
+    /// size differs from its array's established size is
+    /// resampled into the array instead of being silently
+    /// dropped, so names and slices stay in lockstep and the
+    /// material still renders textured.
+    private func resampleRGBA8(_ data: Data, from srcSize: Int, to dstSize: Int) -> Data {
+        guard srcSize > 0, dstSize > 0, srcSize != dstSize,
+              data.count >= srcSize * srcSize * 4 else { return data }
+        var out = Data(count: dstSize * dstSize * 4)
+        data.withUnsafeBytes { srcRaw in
+            out.withUnsafeMutableBytes { dstRaw in
+                guard let s = srcRaw.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                      let d = dstRaw.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                else { return }
+                for y in 0..<dstSize {
+                    let sy = min(srcSize - 1, y * srcSize / dstSize)
+                    for x in 0..<dstSize {
+                        let sx = min(srcSize - 1, x * srcSize / dstSize)
+                        let si = (sy * srcSize + sx) * 4
+                        let di = (y * dstSize + x) * 4
+                        d[di] = s[si]; d[di + 1] = s[si + 1]
+                        d[di + 2] = s[si + 2]; d[di + 3] = s[si + 3]
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// Mean of the data channel's R (roughness) over a set, in
+    /// 0…1 (v4.1 F3: feeds GPUMaterial.glassParams.w via
+    /// texMeanRoughness).
+    private func meanDataRoughness(_ data: Data, size: Int) -> Float {
+        let pixels = min(size * size, data.count / 4)
+        guard pixels > 0 else { return 0.9 }
+        var sum: UInt64 = 0
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            else { return }
+            for i in 0..<pixels { sum += UInt64(base[i * 4]) }
+        }
+        return Float(sum) / (Float(pixels) * 255)
     }
 
     private func buildTextureArrays() {
         let customMetas = CustomTextureStore.list()
-        builtTextureFingerprint = customMetas
-            .map { "\($0.id.uuidString):\($0.name)" }
-            .joined(separator: "|")
-        let candidateNames = TextureGen.allSliceNames()
-            + customMetas.map { "custom:\($0.id.uuidString)" }
-        var builtNames: [String] = []
-        var albedos: [Data] = [], normals: [Data] = [], datas: [Data] = []
-        var size = 0
-        for name in candidateNames {
-            let set: PBRTextureSet?
-            if name.hasPrefix("custom:") {
-                let idString = String(name.dropFirst("custom:".count))
-                guard let id = UUID(uuidString: idString),
-                      let loaded = CustomTextureStore.loadSet(id: id) else { continue }
-                set = loaded
-            } else {
-                set = TextureGen.makeSet(preset: name)
-            }
-            guard let set else { continue }
-            // All slices of one array share a size; a set that
-            // doesn't match the established size is skipped (its
-            // name too — names and slices stay in lockstep).
-            if size == 0 {
-                size = set.size
-            } else if set.size != size {
-                continue
-            }
-            builtNames.append(name)
-            albedos.append(set.albedo); normals.append(set.normal); datas.append(set.data)
-        }
-        sliceNames = builtNames
-        guard !builtNames.isEmpty, size > 0 else {
-            texAlbedo = nil; texNormal = nil; texData = nil
-            return
-        }
-        func makeArray(_ slices: [Data]) -> MTLTexture? {
+        builtTextureFingerprint = textureLibraryFingerprint()
+        func makeArray(_ slices: [Data], size: Int) -> MTLTexture? {
+            guard !slices.isEmpty, size > 0 else { return nil }
             let desc = MTLTextureDescriptor()
             desc.textureType = .type2DArray
             desc.pixelFormat = .rgba8Unorm
@@ -583,15 +663,105 @@ final class Renderer {
             }
             return tex
         }
-        texAlbedo = makeArray(albedos)
-        texNormal = makeArray(normals)
-        texData = makeArray(datas)
+        var means: [UInt32: Float] = [:]
+        // MAIN arrays: presets + customs ONLY (v4.1 — roads are
+        // excluded, so main slice indices for existing content
+        // are unchanged from v4.0).
+        let candidateNames = TextureGen.presetNames
+            + customMetas.map { "custom:\($0.id.uuidString)" }
+        var builtNames: [String] = []
+        var albedos: [Data] = [], normals: [Data] = [], datas: [Data] = []
+        var size = 0
+        for name in candidateNames {
+            let set: PBRTextureSet?
+            if name.hasPrefix("custom:") {
+                let idString = String(name.dropFirst("custom:".count))
+                guard let id = UUID(uuidString: idString),
+                      let loaded = CustomTextureStore.loadSet(id: id) else { continue }
+                set = loaded
+            } else {
+                set = TextureGen.makeSet(preset: name)
+            }
+            guard let set else { continue }
+            // All slices of one array share a size; a set that
+            // doesn't match the established size is RESAMPLED
+            // into it (v4.1 F10) — name and slices stay in
+            // lockstep, nothing is silently dropped.
+            var albedoData = set.albedo, normalData = set.normal, dataData = set.data
+            if size == 0 {
+                size = set.size
+            } else if set.size != size {
+                albedoData = resampleRGBA8(set.albedo, from: set.size, to: size)
+                normalData = resampleRGBA8(set.normal, from: set.size, to: size)
+                dataData = resampleRGBA8(set.data, from: set.size, to: size)
+            }
+            means[UInt32(builtNames.count + 1)] = meanDataRoughness(dataData, size: size)
+            builtNames.append(name)
+            albedos.append(albedoData); normals.append(normalData); datas.append(dataData)
+        }
+        sliceNames = builtNames
+        if !builtNames.isEmpty, size > 0 {
+            texAlbedo = makeArray(albedos, size: size)
+            texNormal = makeArray(normals, size: size)
+            texData = makeArray(datas, size: size)
+        } else {
+            texAlbedo = nil; texNormal = nil; texData = nil
+        }
+        // ROAD arrays (v4.1): separate type2DArray set at
+        // TextureGen.roadSize, slices in roadNames order —
+        // materials encode them as 4096 + slice + 1.
+        let roadSize = TextureGen.roadSize
+        var rAlbedos: [Data] = [], rNormals: [Data] = [], rDatas: [Data] = []
+        for (i, name) in TextureGen.roadNames.enumerated() {
+            let set = TextureGen.makeSet(preset: name)
+            var albedoData = set.albedo, normalData = set.normal, dataData = set.data
+            if set.size != roadSize {
+                albedoData = resampleRGBA8(set.albedo, from: set.size, to: roadSize)
+                normalData = resampleRGBA8(set.normal, from: set.size, to: roadSize)
+                dataData = resampleRGBA8(set.data, from: set.size, to: roadSize)
+            }
+            means[UInt32(4096 + i + 1)] = meanDataRoughness(dataData, size: roadSize)
+            rAlbedos.append(albedoData); rNormals.append(normalData); rDatas.append(dataData)
+        }
+        roadSliceNames = TextureGen.roadNames
+        roadTexAlbedo = makeArray(rAlbedos, size: roadSize)
+        roadTexNormal = makeArray(rNormals, size: roadSize)
+        roadTexData = makeArray(rDatas, size: roadSize)
+        // v4.1 (N1): roads are usable only when every array
+        // allocated; a single failure degrades roads alone.
+        roadsAvailable = roadTexAlbedo != nil && roadTexNormal != nil
+            && roadTexData != nil
+        texMeanRoughness = means
+    }
+
+    /// v4.1 (N1): the dummy road array bound when a real road
+    /// array is missing (see roadDummyTex). Created lazily, once.
+    private func roadDummyTexture() -> MTLTexture? {
+        if let d = roadDummyTex { return d }
+        let desc = MTLTextureDescriptor()
+        desc.textureType = .type2DArray
+        desc.pixelFormat = .rgba8Unorm
+        desc.width = 1; desc.height = 1
+        desc.arrayLength = 1
+        desc.usage = [.shaderRead]
+        desc.storageMode = .shared
+        let t = device.makeTexture(descriptor: desc)
+        roadDummyTex = t
+        return t
     }
 
     /// Rebuilds the texture arrays when the custom texture
     /// library changed since they were built. Returns true when
     /// a rebuild happened (accumulation is reset — slice indices
     /// may have moved).
+    ///
+    /// CONTRACT (v4.1 F14): this must be called BEFORE the first
+    /// rebuild of a session, or the caller must recompute
+    /// materials afterwards — GPUMaterial texIndex values are
+    /// baked into the material buffer at rebuild/material-update
+    /// time, and a slice remap under live materials would make
+    /// them sample the wrong slice. (Today's only caller is the
+    /// session init, which runs before the first rebuild.)
     func reloadTextureArraysIfNeeded() -> Bool {
         guard textureLibraryFingerprint() != builtTextureFingerprint else { return false }
         buildTextureArrays()
@@ -599,10 +769,20 @@ final class Renderer {
         return true
     }
 
-    /// Texture array slice for a texture name (0 = none in
-    /// materials). Resolves built-in presets, roads, and
-    /// "custom:<uuid>" names against this renderer's slice list.
+    /// Texture encoding for a texture name (0 = none in
+    /// materials). Built-in presets and "custom:<uuid>" names
+    /// resolve against the MAIN slice list (slice+1); roads
+    /// resolve to the separate road arrays as
+    /// 4096 + roadSlice + 1 (v4.1).
     func texIndexValue(forPreset preset: String) -> UInt32 {
+        if TextureGen.isRoad(preset) {
+            // v4.1 (N1): no road arrays -> road materials fall
+            // back to untextured colour (index 0); everything
+            // else traces normally.
+            guard roadsAvailable,
+                  let i = TextureGen.roadNames.firstIndex(of: preset) else { return 0 }
+            return UInt32(4096 + i + 1)
+        }
         guard let i = sliceNames.firstIndex(of: preset) else { return 0 }
         return UInt32(i + 1)
     }
@@ -615,6 +795,25 @@ final class Renderer {
     }
 
     // MARK: Scene building
+
+    /// v4.1 (F16): THE inclusion predicate for scene objects —
+    /// shared verbatim by rebuild() and updateMaterialsOnly()
+    /// so their object lists can never diverge. Returns the
+    /// object's local mesh when the object is included (visible,
+    /// area loaded, mesh resolvable, non-empty), else nil.
+    private func includedLocalMesh(for obj: SceneObject,
+                                   meshes: [UUID: MeshData]) -> MeshData? {
+        guard obj.visible, !isUnloadedArea(obj) else { return nil }
+        let local: MeshData
+        if obj.source == "primitive" {
+            local = MeshGen.primitive(kind: obj.primitiveKind, params: obj.params)
+        } else if obj.meshFile != nil, let m = meshes[obj.id] {
+            local = m
+        } else {
+            return nil
+        }
+        return local.isEmpty ? nil : local
+    }
 
     func rebuild(scene: Scene, meshes: [UUID: MeshData]) {
         rebuild(scene: scene, meshes: meshes, geometry: true)
@@ -642,17 +841,8 @@ final class Renderer {
         // material — so updateMaterialsOnly can reproduce the
         // exact same material table without the geometry.
         var included: [(obj: SceneObject, world: MeshData)] = []
-        for obj in scene.objects where obj.visible && !isUnloadedArea(obj) {
-            let local: MeshData
-            if obj.source == "primitive" {
-                local = MeshGen.primitive(kind: obj.primitiveKind, params: obj.params)
-            } else if let meshFile = obj.meshFile, let m = meshes[obj.id] {
-                _ = meshFile
-                local = m
-            } else {
-                continue
-            }
-            if local.isEmpty { continue }
+        for obj in scene.objects {
+            guard let local = includedLocalMesh(for: obj, meshes: meshes) else { continue }
             included.append((obj, local.baked(by: obj.transform.matrix)))
         }
         let sheetMatIndex = UInt32(included.count)
@@ -721,12 +911,11 @@ final class Renderer {
     func updateMaterialsOnly(scene: Scene, meshes: [UUID: MeshData]) -> Bool {
         guard accel != nil, !cpuIndices.isEmpty else { return false }
         // The included-object list must match the cached geometry
-        // exactly (same inclusion rule as the full rebuild).
+        // exactly — via the ONE shared inclusion predicate
+        // (v4.1 F16: includedLocalMesh, also used by rebuild).
         var candidate: [UUID] = []
-        for obj in scene.objects where obj.visible && !isUnloadedArea(obj) {
-            if obj.source == "primitive" {
-                candidate.append(obj.id)
-            } else if let m = meshes[obj.id], !m.isEmpty {
+        for obj in scene.objects {
+            if includedLocalMesh(for: obj, meshes: meshes) != nil {
                 candidate.append(obj.id)
             }
         }
@@ -761,25 +950,48 @@ final class Renderer {
     /// uploads, when no dynamic/particle material is emissive
     /// and the dynamic layer contributed no emissive tris last
     /// time either, the dynamic tris are not rescanned at all.
-    private func uploadEmissiveIndex(materials: [GPUMaterial]) {
+    /// v4.1 (F4): culling state SURVIVES an upload — if culling
+    /// was active, the culled set is recomputed for the saved
+    /// camera against the new full set and re-activated (no
+    /// accumulation reset here; callers own reset logic), instead
+    /// of the old wipe that forced a re-cull + reset next draw.
+    /// v4.1 (F4ii): `rescanStatic` false reuses the cached
+    /// static portion of the index — for callers that changed
+    /// only dynamic content (composeDynamic, setDynamicMaterial)
+    /// while static geometry+materials are untouched since the
+    /// last full scan.
+    private func uploadEmissiveIndex(materials: [GPUMaterial], rescanStatic: Bool = true) {
+        let wasCulling = cullingActive
+        let savedCullCamera = lastCullCamera
+        let savedCullTime = lastCullTime
         var emisTris: [UInt32] = []
         var emisAreas: [Float] = []
         var emisCentroids: [SIMD3<Float>] = []
-        if triCount > 0 {
-            for t in 0..<triCount {
-                let m = materials[Int(cpuTriMats[t])]
-                guard (m.flags & 1) != 0 else { continue }
-                let a = cpuIndices[3 * t], b = cpuIndices[3 * t + 1], c = cpuIndices[3 * t + 2]
-                let p0 = SIMD3<Float>(cpuPositions[3 * Int(a)], cpuPositions[3 * Int(a) + 1], cpuPositions[3 * Int(a) + 2])
-                let p1 = SIMD3<Float>(cpuPositions[3 * Int(b)], cpuPositions[3 * Int(b) + 1], cpuPositions[3 * Int(b) + 2])
-                let p2 = SIMD3<Float>(cpuPositions[3 * Int(c)], cpuPositions[3 * Int(c) + 1], cpuPositions[3 * Int(c) + 2])
-                let area = 0.5 * simd_length(simd_cross(p1 - p0, p2 - p0))
-                if area > 1e-9 {
-                    emisTris.append(UInt32(t))
-                    emisAreas.append(area)
-                    emisCentroids.append((p0 + p1 + p2) / 3)
+        if rescanStatic || !staticEmisCacheValid {
+            if triCount > 0 {
+                for t in 0..<triCount {
+                    let m = materials[Int(cpuTriMats[t])]
+                    guard (m.flags & 1) != 0 else { continue }
+                    let a = cpuIndices[3 * t], b = cpuIndices[3 * t + 1], c = cpuIndices[3 * t + 2]
+                    let p0 = SIMD3<Float>(cpuPositions[3 * Int(a)], cpuPositions[3 * Int(a) + 1], cpuPositions[3 * Int(a) + 2])
+                    let p1 = SIMD3<Float>(cpuPositions[3 * Int(b)], cpuPositions[3 * Int(b) + 1], cpuPositions[3 * Int(b) + 2])
+                    let p2 = SIMD3<Float>(cpuPositions[3 * Int(c)], cpuPositions[3 * Int(c) + 1], cpuPositions[3 * Int(c) + 2])
+                    let area = 0.5 * simd_length(simd_cross(p1 - p0, p2 - p0))
+                    if area > 1e-9 {
+                        emisTris.append(UInt32(t))
+                        emisAreas.append(area)
+                        emisCentroids.append((p0 + p1 + p2) / 3)
+                    }
                 }
             }
+            cachedStaticEmisTris = emisTris
+            cachedStaticEmisAreas = emisAreas
+            cachedStaticEmisCentroids = emisCentroids
+            staticEmisCacheValid = true
+        } else {
+            emisTris = cachedStaticEmisTris
+            emisAreas = cachedStaticEmisAreas
+            emisCentroids = cachedStaticEmisCentroids
         }
         var dynEmis = 0
         if dynTriCount > 0 {
@@ -813,13 +1025,35 @@ final class Renderer {
         fullEmisAreas = emisAreas
         fullEmisCentroids = emisCentroids
         fullTotalEmissiveArea = acc
-        culledEmisTris = []
-        culledEmisCDF = []
-        culledTotalEmissiveArea = 0
-        cullingActive = false
-        lastCullCamera = nil
-        lastCullTime = 0
-        applyEmissiveSet(tris: emisTris, cdf: cdf, total: acc)
+        // v4.1 (F11): unified-id -> full-set index map for
+        // flushDynamic's centroid refresh.
+        var indexByID: [UInt32: Int] = [:]
+        indexByID.reserveCapacity(emisTris.count)
+        for (i, t) in emisTris.enumerated() { indexByID[t] = i }
+        fullEmisIndexByID = indexByID
+        // v4.1 (F4i): preserve culling across the upload. If
+        // culling was active, recompute the culled set for the
+        // saved camera against the NEW full set and re-activate
+        // it WITHOUT resetting accumulation (a genuinely changed
+        // set is a legitimate content change — the caller's own
+        // reset logic covers it; an unchanged set is invisible).
+        if wasCulling, let cam = savedCullCamera {
+            let culled = computeCulledSet(camera: cam)
+            culledEmisTris = culled.tris
+            culledEmisCDF = culled.cdf
+            culledTotalEmissiveArea = culled.total
+            lastCullCamera = cam
+            lastCullTime = savedCullTime
+            activateCulledEmissive()
+        } else {
+            culledEmisTris = []
+            culledEmisCDF = []
+            culledTotalEmissiveArea = 0
+            cullingActive = false
+            lastCullCamera = nil
+            lastCullTime = 0
+            applyEmissiveSet(tris: emisTris, cdf: cdf, total: acc)
+        }
     }
 
     /// Point the active emissive buffers/counts at one set.
@@ -876,7 +1110,10 @@ final class Renderer {
     private func makeBuffer<T>(_ array: [T]) -> MTLBuffer? {
         if array.isEmpty { return device.makeBuffer(length: 4, options: .storageModeShared) }
         return array.withUnsafeBytes { raw in
-            device.makeBuffer(bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared)
+            // v4.1 (F24): no force-unwrap — a nil base address
+            // degrades to no buffer instead of a crash.
+            guard let base = raw.baseAddress else { return nil }
+            return device.makeBuffer(bytes: base, length: raw.count, options: .storageModeShared)
         }
     }
 
@@ -911,9 +1148,15 @@ final class Renderer {
         if m.textureFit { flags |= 8 }
         g.baseColor = SIMD4<Float>(base, 0)
         g.emissive = SIMD4<Float>(m.emissiveColor.simd, Float(m.emissiveIntensity))
-        g.glassParams = SIMD4<Float>(Float(m.transmission), Float(m.roughness), Float(m.ior), 0)
+        let texIdx = texIndexValue(forPreset: m.texturePreset)
+        // v4.1 (F3): glassParams.w carries the material's slice
+        // MEAN texture roughness (0 when untextured) for the
+        // guide kernel's gloss estimate. Verified unused by
+        // every kernel before this (only .x/.y/.z are read).
+        g.glassParams = SIMD4<Float>(Float(m.transmission), Float(m.roughness),
+                                     Float(m.ior), texMeanRoughness[texIdx] ?? 0)
         g.tint = SIMD4<Float>(m.tint.simd, Float(m.textureScale))
-        g.texIndex = texIndexValue(forPreset: m.texturePreset)
+        g.texIndex = texIdx
         g.flags = flags
         return g
     }
@@ -1246,6 +1489,12 @@ final class Renderer {
             // 2.5 mm below it, so the edge is a tiny sloped
             // wall — a real rim, not a painted outline.
             func emitSheet(_ a: Int, _ b: Int, _ c: Int) {
+                // v4.1 (F6): sheets are charged against the
+                // same 220k weather budget as the subdivision
+                // that spawned them; when it is exhausted no
+                // further sheets are emitted.
+                guard budget > 0 else { return }
+                budget -= 1
                 var order = [a, b, c]
                 if simd_cross(gPos[b] - gPos[a], gPos[c] - gPos[a]).y < 0 {
                     order = [a, c, b]
@@ -1371,19 +1620,36 @@ final class Renderer {
         let base = dynMatBase
         cpuDynTriMats = cpuDynMatOffsets.map { UInt32(base + $0) }
         dynTriMatBuffer = makeBuffer(cpuDynTriMats)
+        // v4.1 (N2): this reassigns dynTriMatBuffer outside the
+        // AS build — a nil buffer here (makeBuffer failure) must
+        // not leave dynUsable stale-true. Recompute it with the
+        // same predicate the AS build uses (refreshDynUsable).
+        refreshDynUsable()
     }
 
     private func computeCollisionTriangles()
         -> [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] {
         var out: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = []
-        out.reserveCapacity(max(triCount, 0))
-        guard triCount > 0 else { return out }
-        for t in 0..<triCount {
-            let ia = Int(cpuIndices[3 * t]), ib = Int(cpuIndices[3 * t + 1]), ic = Int(cpuIndices[3 * t + 2])
-            out.append((
-                SIMD3<Float>(cpuPositions[3 * ia], cpuPositions[3 * ia + 1], cpuPositions[3 * ia + 2]),
-                SIMD3<Float>(cpuPositions[3 * ib], cpuPositions[3 * ib + 1], cpuPositions[3 * ib + 2]),
-                SIMD3<Float>(cpuPositions[3 * ic], cpuPositions[3 * ic + 1], cpuPositions[3 * ic + 2])))
+        out.reserveCapacity(max(triCount, 0) + max(dynTriCount, 0))
+        if triCount > 0 {
+            for t in 0..<triCount {
+                let ia = Int(cpuIndices[3 * t]), ib = Int(cpuIndices[3 * t + 1]), ic = Int(cpuIndices[3 * t + 2])
+                out.append((
+                    SIMD3<Float>(cpuPositions[3 * ia], cpuPositions[3 * ia + 1], cpuPositions[3 * ia + 2]),
+                    SIMD3<Float>(cpuPositions[3 * ib], cpuPositions[3 * ib + 1], cpuPositions[3 * ib + 2]),
+                    SIMD3<Float>(cpuPositions[3 * ic], cpuPositions[3 * ic + 1], cpuPositions[3 * ic + 2])))
+            }
+        }
+        // v4.1 (F5): the dynamic layer collides too — its CPU
+        // mirrors are already world-space as rendered.
+        if dynTriCount > 0 {
+            for t in 0..<dynTriCount {
+                let ia = Int(cpuDynIndices[3 * t]), ib = Int(cpuDynIndices[3 * t + 1]), ic = Int(cpuDynIndices[3 * t + 2])
+                out.append((
+                    SIMD3<Float>(cpuDynPositions[3 * ia], cpuDynPositions[3 * ia + 1], cpuDynPositions[3 * ia + 2]),
+                    SIMD3<Float>(cpuDynPositions[3 * ib], cpuDynPositions[3 * ib + 1], cpuDynPositions[3 * ib + 2]),
+                    SIMD3<Float>(cpuDynPositions[3 * ic], cpuDynPositions[3 * ic + 1], cpuDynPositions[3 * ic + 2])))
+            }
         }
         return out
     }
@@ -1411,7 +1677,9 @@ final class Renderer {
         dynEntries[idx].material = material
         let fullMats = fullMaterialTable()
         matBuffer = makeBuffer(fullMats)
-        uploadEmissiveIndex(materials: fullMats)
+        // v4.1 (F4ii): only a dynamic material changed — reuse
+        // the cached static emissive scan.
+        uploadEmissiveIndex(materials: fullMats, rescanStatic: false)
         resetAccumulation()
     }
 
@@ -1429,7 +1697,27 @@ final class Renderer {
     /// reset accumulation.
     func setParticleSoups(_ soups: [(mesh: MeshData, material: GPUMaterial)]) {
         let capped = Array(soups.prefix(8))
-        let structureChanged = capped.count != particleSoupsStored.count
+        var structureChanged = capped.count != particleSoupsStored.count
+        // v4.1 (N4): count alone misses a material-only change —
+        // a soup at the same index whose emissive signature
+        // (flags bit0 + the full emissive SIMD4, compared
+        // component-wise; GPUMaterial is not Equatable) changed
+        // must also reset accumulation, or settled frames keep
+        // converging against the old emissive set.
+        if !structureChanged {
+            for i in capped.indices {
+                let oldM = particleSoupsStored[i].material
+                let newM = capped[i].material
+                if (oldM.flags & 1) != (newM.flags & 1)
+                    || oldM.emissive.x != newM.emissive.x
+                    || oldM.emissive.y != newM.emissive.y
+                    || oldM.emissive.z != newM.emissive.z
+                    || oldM.emissive.w != newM.emissive.w {
+                    structureChanged = true
+                    break
+                }
+            }
+        }
         particleSoupsStored = capped
         composeDynamic(structureChanged: structureChanged)
     }
@@ -1455,26 +1743,58 @@ final class Renderer {
         var capped = false
 
         func appendSoup(world: MeshData, matOffset: Int, objectID: UUID?) -> DynSlice {
-            let vBase = UInt32(positions.count / 3)
-            let slice = DynSlice(vertexStart: Int(vBase), vertexCount: world.vertexCount,
-                                 triStart: totalTris, triCount: 0)
-            positions += world.positions
-            normals += world.normals
-            uvArr += world.uvs
-            colArr += world.colors
             let available = max(budget - totalTris, 0)
             let included = min(world.triangleCount, available)
-            for t in 0..<included {
-                let a = world.indices[3 * t], b = world.indices[3 * t + 1], c = world.indices[3 * t + 2]
-                indices += [vBase + a, vBase + b, vBase + c]
-                matOffsets.append(matOffset)
-                triObjects.append(objectID ?? dynNilObjectSentinel)
+            var slice = DynSlice(vertexStart: positions.count / 3, vertexCount: 0,
+                                 triStart: totalTris, triCount: included)
+            if included < world.triangleCount {
+                // v4.1 (F17): truncated soup — append ONLY the
+                // vertices the included triangles reference
+                // (remapped), instead of the full vertex payload.
+                // (flushDynamic's vertexCount check then skips
+                // matrix re-bakes for this slice: acceptable for
+                // an over-budget soup, which is the pathological
+                // case only.)
+                var remap: [UInt32: UInt32] = [:]
+                remap.reserveCapacity(included * 3)
+                func mapVertex(_ vi: UInt32) -> UInt32 {
+                    if let r = remap[vi] { return r }
+                    let r = UInt32(positions.count / 3)
+                    let i3 = Int(vi) * 3, i2 = Int(vi) * 2
+                    positions.append(contentsOf: [world.positions[i3], world.positions[i3 + 1], world.positions[i3 + 2]])
+                    normals.append(contentsOf: [world.normals[i3], world.normals[i3 + 1], world.normals[i3 + 2]])
+                    uvArr.append(contentsOf: [world.uvs[i2], world.uvs[i2 + 1]])
+                    colArr.append(contentsOf: [world.colors[i3], world.colors[i3 + 1], world.colors[i3 + 2]])
+                    remap[vi] = r
+                    return r
+                }
+                for t in 0..<included {
+                    let a = mapVertex(world.indices[3 * t])
+                    let b = mapVertex(world.indices[3 * t + 1])
+                    let c = mapVertex(world.indices[3 * t + 2])
+                    indices += [a, b, c]
+                    matOffsets.append(matOffset)
+                    triObjects.append(objectID ?? dynNilObjectSentinel)
+                }
+                slice.vertexCount = positions.count / 3 - slice.vertexStart
+                slice.remapped = true
+            } else {
+                let vBase = UInt32(positions.count / 3)
+                positions += world.positions
+                normals += world.normals
+                uvArr += world.uvs
+                colArr += world.colors
+                slice.vertexCount = world.vertexCount
+                for t in 0..<included {
+                    let a = world.indices[3 * t], b = world.indices[3 * t + 1], c = world.indices[3 * t + 2]
+                    indices += [vBase + a, vBase + b, vBase + c]
+                    matOffsets.append(matOffset)
+                    triObjects.append(objectID ?? dynNilObjectSentinel)
+                }
             }
             totalTris += included
             if included < world.triangleCount { capped = true }
-            var out = slice
-            out.triCount = included
-            return out
+            return slice
         }
 
         for (i, pair) in dynEntries.enumerated() {
@@ -1498,6 +1818,9 @@ final class Renderer {
         cpuDynTriObject = triObjects
         dynSlices = slices
         dynTriCount = totalTris
+        // v4.1 (F5): the collision export tracks the dynamic
+        // layer's composition too.
+        _collisionTriangles = computeCollisionTriangles()
 
         dynPosBuffer = makeBuffer(positions)
         dynNrmBuffer = makeBuffer(normals)
@@ -1508,7 +1831,9 @@ final class Renderer {
         buildDynamicAccelerationStructure()
         let fullMats = fullMaterialTable()
         matBuffer = makeBuffer(fullMats)
-        uploadEmissiveIndex(materials: fullMats)
+        // v4.1 (F4ii): compose changes only dynamic content —
+        // reuse the cached static emissive scan.
+        uploadEmissiveIndex(materials: fullMats, rescanStatic: false)
         if structureChanged || totalTris != oldDynTriCount {
             resetAccumulation()
         }
@@ -1527,7 +1852,7 @@ final class Renderer {
             guard let pair = dynEntries.first(where: { $0.key == key }),
                   let slice = dynSlices[key], slice.vertexCount > 0 else { continue }
             let world = pair.local.baked(by: pair.matrix)
-            guard world.vertexCount == slice.vertexCount else { continue }
+            guard world.vertexCount == slice.vertexCount, !slice.remapped else { continue }
             let start = slice.vertexStart * 3
             let count = slice.vertexCount * 3
             if start + count <= cpuDynPositions.count {
@@ -1542,7 +1867,10 @@ final class Renderer {
             if (pair.material.flags & 1) != 0, slice.triCount > 0 {
                 for dt in slice.triStart..<(slice.triStart + slice.triCount) {
                     let unified = UInt32(triCount + dt)
-                    guard let fi = fullEmisTris.firstIndex(of: unified) else { continue }
+                    // v4.1 (F11): O(1) map lookup, not a linear
+                    // scan of the full emissive list per tri.
+                    guard let fi = fullEmisIndexByID[unified],
+                          fi < fullEmisCentroids.count else { continue }
                     let a = cpuDynIndices[3 * dt], b = cpuDynIndices[3 * dt + 1], c = cpuDynIndices[3 * dt + 2]
                     let p0 = SIMD3<Float>(cpuDynPositions[3 * Int(a)], cpuDynPositions[3 * Int(a) + 1], cpuDynPositions[3 * Int(a) + 2])
                     let p1 = SIMD3<Float>(cpuDynPositions[3 * Int(b)], cpuDynPositions[3 * Int(b) + 1], cpuDynPositions[3 * Int(b) + 2])
@@ -1555,19 +1883,38 @@ final class Renderer {
         dynPosBuffer = makeBuffer(cpuDynPositions)
         dynNrmBuffer = makeBuffer(cpuDynNormals)
         buildDynamicAccelerationStructure()
+        // v4.1 (F5): moved dynamic geometry moves its collision
+        // triangles with it.
+        _collisionTriangles = computeCollisionTriangles()
         // Keep an active culled set honest about moved lights —
-        // silently (no accumulation reset for matrix updates).
+        // silently (no accumulation reset for matrix updates,
+        // and no buffer swap when the culled set is unchanged).
         if cullingActive, let lc = lastCullCamera {
             let culled = computeCulledSet(camera: lc)
-            culledEmisTris = culled.tris
-            culledEmisCDF = culled.cdf
-            culledTotalEmissiveArea = culled.total
-            activateCulledEmissive()
+            if culled.tris != culledEmisTris {
+                culledEmisTris = culled.tris
+                culledEmisCDF = culled.cdf
+                culledTotalEmissiveArea = culled.total
+                activateCulledEmissive()
+            }
         }
+    }
+
+    /// v4.1 (F9): dynUsable = dynamic AS built AND all dynamic
+    /// buffers present. Recomputed at the end of every dynamic
+    /// AS build (the only place dynAccel changes) and at the end
+    /// of refreshDynTriMats (v4.1 N2: that path reassigns
+    /// dynTriMatBuffer outside the AS build).
+    private func refreshDynUsable() {
+        dynUsable = dynTriCount > 0 && dynAccel != nil
+            && dynPosBuffer != nil && dynNrmBuffer != nil
+            && dynUVBuffer != nil && dynColBuffer != nil
+            && dynIdxBuffer != nil && dynTriMatBuffer != nil
     }
 
     private func buildDynamicAccelerationStructure() {
         dynAccel = nil
+        dynUsable = false
         guard rayTracingSupported, dynTriCount > 0,
               let dynPosBuffer, let dynIdxBuffer else { return }
         let geom = MTLAccelerationStructureTriangleGeometryDescriptor()
@@ -1591,11 +1938,14 @@ final class Renderer {
         cmd.commit()
         cmd.waitUntilCompleted()
         dynAccel = structure
+        refreshDynUsable()
     }
 
-    private func dynamicDummyBuffer() -> MTLBuffer {
+    private func dynamicDummyBuffer() -> MTLBuffer? {
         if let d = dynDummyBuffer { return d }
-        let b = device.makeBuffer(length: 4, options: .storageModeShared)!
+        // v4.1 (F24): tolerate a nil allocation — bindings take
+        // optionals, and F9's dynUsable keeps the kernels safe.
+        let b = device.makeBuffer(length: 4, options: .storageModeShared)
         dynDummyBuffer = b
         return b
     }
@@ -1607,7 +1957,10 @@ final class Renderer {
     /// still be bound).
     private func bindDynamicBuffers(_ enc: MTLComputeCommandEncoder) {
         let dummy = dynamicDummyBuffer()
-        if dynTriCount > 0 {
+        // v4.1 (F9): only bind the real dynamic set when it is
+        // usable; otherwise the dummy/static bindings pair with
+        // the forced dynTriCount = 0 in the uniforms.
+        if dynUsable {
             enc.setBuffer(dynPosBuffer ?? dummy, offset: 0, index: 11)
             enc.setBuffer(dynNrmBuffer ?? dummy, offset: 0, index: 12)
             enc.setBuffer(dynUVBuffer ?? dummy, offset: 0, index: 13)
@@ -1770,14 +2123,17 @@ final class Renderer {
         u.triCount = UInt32(triCount)
         u.emissiveCount = UInt32(emissiveCount)
         u.totalEmissiveArea = totalEmissiveArea
-        u.envIntensity = 1.0
+        u.envIntensity = envIntensity
         u.historyCap = cap
         u.glassRefractBudget = glassBudget
         u.wetLevel = weatherWet
         u.snowLevel = weatherSnow
         u.dynTime = weatherDynTime
         u.rainFrac = weatherDynRain
-        u.dynTriCount = UInt32(dynTriCount)
+        // v4.1 (F9): an unusable dynamic layer reports 0 tris
+        // to BOTH kernels, so a failed AS/buffer can never be
+        // traversed against the dynamic attribute arrays.
+        u.dynTriCount = UInt32(dynUsable ? dynTriCount : 0)
         return u
     }
 
@@ -1795,10 +2151,14 @@ final class Renderer {
                              cmd: MTLCommandBuffer) -> Bool {
         guard let guidePipeline, let accel,
               let posBuffer, let nrmBuffer, let idxBuffer, let triMatBuffer, let matBuffer,
+              let weatherFieldTex,
               let enc = cmd.makeComputeCommandEncoder() else { return false }
         enc.setComputePipelineState(guidePipeline)
         enc.setTexture(guide, index: 0)
         enc.setTexture(guideNormal, index: 1)
+        // v4.1 (F7): the guide samples the baked weather field
+        // (same slot as the trace kernel) for its gloss model.
+        enc.setTexture(weatherFieldTex, index: 4)
         enc.setBuffer(posBuffer, offset: 0, index: 1)
         enc.setBuffer(nrmBuffer, offset: 0, index: 2)
         enc.setBuffer(idxBuffer, offset: 0, index: 5)
@@ -1844,11 +2204,21 @@ final class Renderer {
                              count: Int, seedStart: UInt32,
                              bounces: UInt32, cap: Float, glassBudget: UInt32,
                              cmd: MTLCommandBuffer) -> Bool {
+        // v4.1 (N1): the road arrays are NOT a gate on tracing —
+        // a missing road array binds the dummy array instead.
+        // The dummy is never sampled: roadsAvailable is
+        // all-or-nothing, so any road-array failure makes
+        // texIndexValue return 0 for every road preset, and no
+        // material encodes >= 4096.
+        let roadAlbedoBind = roadTexAlbedo ?? roadDummyTexture()
+        let roadNormalBind = roadTexNormal ?? roadDummyTexture()
+        let roadDataBind = roadTexData ?? roadDummyTexture()
         guard let tracePipeline, let accel,
               let posBuffer, let nrmBuffer, let uvBuffer, let colBuffer,
               let idxBuffer, let triMatBuffer, let matBuffer,
               let emisTriBuffer, let emisCDFBuffer,
               let texAlbedo, let texNormal, let texData,
+              let roadAlbedoBind, let roadNormalBind, let roadDataBind,
               let weatherFieldTex,
               let enc = cmd.makeComputeCommandEncoder() else { return false }
         enc.setComputePipelineState(tracePipeline)
@@ -1857,6 +2227,11 @@ final class Renderer {
         enc.setTexture(texNormal, index: 2)
         enc.setTexture(texData, index: 3)
         enc.setTexture(weatherFieldTex, index: 4)
+        // v4.1: road arrays (1024) at texture indices 5-7
+        // (dummy array when a road array failed to allocate).
+        enc.setTexture(roadAlbedoBind, index: 5)
+        enc.setTexture(roadNormalBind, index: 6)
+        enc.setTexture(roadDataBind, index: 7)
         enc.setBuffer(posBuffer, offset: 0, index: 1)
         enc.setBuffer(nrmBuffer, offset: 0, index: 2)
         enc.setBuffer(uvBuffer, offset: 0, index: 3)
@@ -2018,6 +2393,12 @@ final class Renderer {
     @discardableResult
     func draw(view: MTKView, camera: CameraBasis, moving: Bool, play: Bool) -> Bool {
         flushDynamic()
+        // v4.1 (F12): denoise "recently moved" bookkeeping.
+        if moving {
+            framesSinceMove = 0
+        } else if framesSinceMove < 10_000 {
+            framesSinceMove += 1
+        }
         presentationDirty = false
         guard let drawable = view.currentDrawable,
               let passDesc = view.currentRenderPassDescriptor,
@@ -2025,12 +2406,18 @@ final class Renderer {
               view.drawableSize.width > 0, view.drawableSize.height > 0
         else { return false }
 
-        // v4 light culling: while moving or playing, NEE samples
-        // only the emissive tris near/ahead of the camera. This
-        // changes only WHICH lights are sampled during
-        // interaction — when motion stops the full set is
-        // restored and settled frames converge with every light.
-        let wantCull = lightCullingEnabled && (moving || play)
+        // v4 light culling: while MOVING, NEE samples only the
+        // emissive tris near/ahead of the camera. This changes
+        // only WHICH lights are sampled during interaction —
+        // when motion stops the full set is restored and settled
+        // frames converge with every light. v4.1 (F2): Play is
+        // NOT a culling condition of its own — a still Play
+        // camera restores the full set like any other settle.
+        // v4.1 (F1): a re-cull resets accumulation ONLY when the
+        // culled tri set actually changes, and there is no
+        // pure-time re-cull trigger anymore (the camera-move
+        // triggers below are the only re-cull sources).
+        let wantCull = lightCullingEnabled && moving
         if wantCull {
             let now = CACurrentMediaTime()
             var needCull = !cullingActive
@@ -2042,17 +2429,18 @@ final class Renderer {
             } else {
                 needCull = true
             }
-            if lastCullTime > 0, now - lastCullTime > 0.25 { needCull = true }
             if needCull {
                 lastCullCamera = camera
                 lastCullTime = now
                 if !fullEmisTris.isEmpty {
                     let culled = computeCulledSet(camera: camera)
+                    let activeTris = cullingActive ? culledEmisTris : fullEmisTris
+                    let changed = culled.tris != activeTris
                     culledEmisTris = culled.tris
                     culledEmisCDF = culled.cdf
                     culledTotalEmissiveArea = culled.total
                     activateCulledEmissive()
-                    resetAccumulation()
+                    if changed { resetAccumulation() }
                 }
             }
         } else if cullingActive {
@@ -2134,7 +2522,7 @@ final class Renderer {
             // motion starts from the tier's full motion scale.
             dynLock.lock()
             dynScale = 1.0; dynCadenceEMA = 0; dynLastCompletion = 0
-            dynFramesSinceAdjust = 0
+            dynFramesSinceAdjust = 0; dynStillSince = 0
             dynLock.unlock()
             cmd.present(drawable)
             cmd.commit()
@@ -2196,7 +2584,13 @@ final class Renderer {
                     sampleCount += UInt32(t.spp)
                     frameSeedCounter &+= UInt32(t.spp)
                 } else {
-                    sampleCount = t.maxSettle
+                    // v4.1 (F8): a failed encode is NOT
+                    // convergence — leave sampleCount untouched,
+                    // keep the frame wanted so the failure is
+                    // retried instead of sleeping on a black
+                    // image, and log it.
+                    print("LumenScene: encodeTrace failed — frame kept wanted for retry")
+                    presentationDirty = true
                 }
             }
             prevCamera = camera
@@ -2214,7 +2608,12 @@ final class Renderer {
         // frames go through the spatial denoise pass; the settled
         // frame (sampleCount >= maxSettle) is shown raw.
         var displaySource = curAccum
-        if accel != nil, moving || play || sampleCount < 160,
+        // v4.1 (F12): the gate also stays open for ~45 frames
+        // after motion stops — per-pixel alpha (the shader's
+        // own fade) is the real signal, and newly exposed young
+        // pixels need the pass even when the GLOBAL sampleCount
+        // is already high.
+        if accel != nil, moving || play || sampleCount < 160 || framesSinceMove < 45,
            denoisePipeline != nil, let displayTex, let curGuideNormal {
             let strength: Float = (play || moving) ? 1.0 : 0.65
             if encodeDenoise(accum: curAccum, guide: curGuide,
@@ -2261,9 +2660,13 @@ final class Renderer {
                 let now = ProcessInfo.processInfo.systemUptime
                 self.dynLock.lock()
                 if frameMoving {
+                    self.dynStillSince = 0
                     if self.dynLastCompletion > 0 {
                         let dt = now - self.dynLastCompletion
-                        if dt > 0.004, dt < 0.25 {
+                        // v4.1 (F22): hitch frames (completion
+                        // delta > 40 ms) do NOT feed the EMA —
+                        // they are stalls, not cadence.
+                        if dt > 0.004, dt <= 0.040 {
                             self.dynCadenceEMA = self.dynCadenceEMA == 0
                                 ? dt
                                 : self.dynCadenceEMA * 0.9 + dt * 0.1
@@ -2282,6 +2685,17 @@ final class Renderer {
                     }
                 } else {
                     self.dynLastCompletion = 0
+                    // v4.1 (F22): stand-down timer — ~2 s of
+                    // not-moving returns dynScale to 1.0 even
+                    // when the settled fast path was never
+                    // reached (stop-and-go motion).
+                    if self.dynStillSince == 0 {
+                        self.dynStillSince = now
+                    } else if now - self.dynStillSince >= 2.0, self.dynScale != 1.0 {
+                        self.dynScale = 1.0
+                        self.dynCadenceEMA = 0
+                        self.dynFramesSinceAdjust = 0
+                    }
                 }
                 self.dynLock.unlock()
             }
@@ -2305,17 +2719,21 @@ final class Renderer {
         // Stills always use the FULL emissive set: force-restore
         // it around the trace, then put the culled set back (the
         // command buffer is waited on below before any swap-back
-        // could race the GPU reads).
+        // could race the GPU reads). v4.1 (F13): the restore is
+        // a defer, so EVERY exit path — target failure, encoder
+        // failure, traced == false, success — leaves the culling
+        // state consistent. On the success path the defer runs
+        // at return, i.e. after waitUntilCompleted, as before;
+        // on failure paths the command buffer was never
+        // committed, so no GPU work can observe the swap.
         let wasCulling = cullingActive
         if wasCulling { restoreFullEmissive() }
+        defer { if wasCulling { activateCulledEmissive() } }
         clearAccum(accum, cmd: cmd)
         let traced = encodeTrace(accum: accum, camera: camera, count: samples,
                                  seedStart: 0, bounces: 6, cap: 1_000_000,
                                  glassBudget: 6, cmd: cmd)
-        guard traced else {
-            if wasCulling { activateCulledEmissive() }
-            return nil
-        }
+        guard traced else { return nil }
         // Tonemap into a readable BGRA texture.
         let targetDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
@@ -2344,10 +2762,15 @@ final class Renderer {
         cmd.commit()
         cmd.waitUntilCompleted()
         var bytes = [UInt8](repeating: 0, count: width * height * 4)
-        bytes.withUnsafeMutableBytes { raw in
-            target.getBytes(raw.baseAddress!, bytesPerRow: width * 4,
+        // v4.1 (N5): no force-unwrap — a nil base address (zero-
+        // size request) returns nil, in the F24 style.
+        let gotBytes: Bool = bytes.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return false }
+            target.getBytes(base, bytesPerRow: width * 4,
                             from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+            return true
         }
+        guard gotBytes else { return nil }
         guard let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
         let cs = CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
@@ -2363,7 +2786,6 @@ final class Renderer {
             out, UTType.png.identifier as CFString, 1, nil) else { return nil }
         CGImageDestinationAddImage(dest, image, nil)
         guard CGImageDestinationFinalize(dest) else { return nil }
-        if wasCulling { activateCulledEmissive() }
         return out as Data
     }
 

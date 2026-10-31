@@ -87,9 +87,10 @@ struct Uniforms {
 struct Material {
     float4 baseColor;    // rgb; a unused
     float4 emissive;     // rgb colour; a = intensity
-    float4 glassParams;  // x: transmission, y: roughness, z: ior, w unused
+    float4 glassParams;  // x: transmission, y: roughness, z: ior, w: mean texture roughness (v4.1 F3, guide gloss only)
     float4 tint;         // rgb; a = textureScale
-    uint texIndex;       // 0 none, else texture array slice+1 (slice = texIndex-1)
+    uint texIndex;       // 0 none; 1..4095 main array slice+1 (slice = texIndex-1);
+                         // >= 4096 road array (road slice = texIndex-4096-1) (v4.1)
     uint flags;          // bit0 emissive, bit1 glass, bit2 triplanar, bit3 fit
     uint2 pad;
 };
@@ -246,12 +247,29 @@ kernel void weatherFieldKernel(
 
 // MARK: - Path trace kernel
 
+// v4.1: roads live in a SEPARATE 1024 texture2d_array set
+// (trace bindings 5-7); materials encode them as
+// texIndex >= 4096 (road slice = texIndex - 4096 - 1), while
+// main-array materials use texIndex in 1..4095
+// (slice = texIndex - 1). This one helper keeps every PBR
+// fetch site in the trace kernel on the same branch.
+static float4 samplePBR(texture2d_array<float> mainTex,
+                        texture2d_array<float> roadTex,
+                        bool isRoad, sampler smp,
+                        float2 uv, uint slice, uint roadSlice) {
+    return isRoad ? roadTex.sample(smp, uv, roadSlice, level(0.0f))
+                  : mainTex.sample(smp, uv, slice, level(0.0f));
+}
+
 kernel void pathTraceKernel(
     texture2d<float, access::read_write> accum [[texture(0)]],
     texture2d_array<float> texAlbedo [[texture(1)]],
     texture2d_array<float> texNormal [[texture(2)]],
     texture2d_array<float> texData [[texture(3)]],
     texture2d<float> weatherField [[texture(4)]],
+    texture2d_array<float> roadAlbedo [[texture(5)]],
+    texture2d_array<float> roadNormal [[texture(6)]],
+    texture2d_array<float> roadData [[texture(7)]],
     constant Uniforms& u [[buffer(0)]],
     device const float* positions [[buffer(1)]],
     device const float* normals [[buffer(2)]],
@@ -392,18 +410,22 @@ kernel void pathTraceKernel(
         float texRough = 0.9f;
         float3 shadingN = ns;
         if (mat.texIndex > 0) {
-            uint slice = mat.texIndex - 1;
+            // v4.1: decode the array + slice from the encoding
+            // (roads: texIndex >= 4096 -> road arrays).
+            bool isRoad = mat.texIndex >= 4096u;
+            uint slice = isRoad ? 0u : (mat.texIndex - 1);
+            uint roadSlice = isRoad ? (mat.texIndex - 4096u - 1u) : 0u;
             float scale = mat.tint.a;
             if (mat.flags & FLAG_TRIPLANAR) {
                 float3 wp = hitPos * scale;
                 float3 w = pow(abs(nInterp), float3(4));
                 w /= max(w.x + w.y + w.z, 1e-5f);
-                float3 a = texAlbedo.sample(texSampler, wp.zy, slice, level(0.0f)).rgb * w.x
-                         + texAlbedo.sample(texSampler, wp.xz, slice, level(0.0f)).rgb * w.y
-                         + texAlbedo.sample(texSampler, wp.xy, slice, level(0.0f)).rgb * w.z;
-                float rgh = texData.sample(texSampler, wp.zy, slice, level(0.0f)).r * w.x
-                          + texData.sample(texSampler, wp.xz, slice, level(0.0f)).r * w.y
-                          + texData.sample(texSampler, wp.xy, slice, level(0.0f)).r * w.z;
+                float3 a = samplePBR(texAlbedo, roadAlbedo, isRoad, texSampler, wp.zy, slice, roadSlice).rgb * w.x
+                         + samplePBR(texAlbedo, roadAlbedo, isRoad, texSampler, wp.xz, slice, roadSlice).rgb * w.y
+                         + samplePBR(texAlbedo, roadAlbedo, isRoad, texSampler, wp.xy, slice, roadSlice).rgb * w.z;
+                float rgh = samplePBR(texData, roadData, isRoad, texSampler, wp.zy, slice, roadSlice).r * w.x
+                          + samplePBR(texData, roadData, isRoad, texSampler, wp.xz, slice, roadSlice).r * w.y
+                          + samplePBR(texData, roadData, isRoad, texSampler, wp.xy, slice, roadSlice).r * w.z;
                 albedo *= a;
                 texRough = rgh;
                 // Triplanar normal mapping: sample the tangent-space
@@ -411,9 +433,9 @@ kernel void pathTraceKernel(
                 // space (sign from the geometric normal), blend with
                 // the same weights — the texture's relief now rakes
                 // under light on imported models too.
-                float3 tnx = texNormal.sample(texSampler, wp.zy, slice, level(0.0f)).rgb * 2.0f - 1.0f;
-                float3 tny = texNormal.sample(texSampler, wp.xz, slice, level(0.0f)).rgb * 2.0f - 1.0f;
-                float3 tnz = texNormal.sample(texSampler, wp.xy, slice, level(0.0f)).rgb * 2.0f - 1.0f;
+                float3 tnx = samplePBR(texNormal, roadNormal, isRoad, texSampler, wp.zy, slice, roadSlice).rgb * 2.0f - 1.0f;
+                float3 tny = samplePBR(texNormal, roadNormal, isRoad, texSampler, wp.xz, slice, roadSlice).rgb * 2.0f - 1.0f;
+                float3 tnz = samplePBR(texNormal, roadNormal, isRoad, texSampler, wp.xy, slice, roadSlice).rgb * 2.0f - 1.0f;
                 float3 wnx = float3(tnx.z * (nInterp.x >= 0 ? 1.0f : -1.0f), tnx.y, tnx.x);
                 float3 wny = float3(tny.x, tny.z * (nInterp.y >= 0 ? 1.0f : -1.0f), tny.y);
                 float3 wnz = float3(tnz.x, tnz.y, tnz.z * (nInterp.z >= 0 ? 1.0f : -1.0f));
@@ -434,13 +456,13 @@ kernel void pathTraceKernel(
                     ? normalize((e1 * duv2.y - e2 * duv1.y) / det)
                     : normalize(abs(ns.y) < 0.99f ? cross(ns, float3(0, 1, 0)) : cross(ns, float3(1, 0, 0)));
                 float3 B = cross(ns, T);
-                float hgt = texData.sample(texSampler, tuv, slice, level(0.0f)).g;
+                float hgt = samplePBR(texData, roadData, isRoad, texSampler, tuv, slice, roadSlice).g;
                 float3 viewDir = -ray.direction;
                 float3 vt = float3(dot(viewDir, T), dot(viewDir, B), dot(viewDir, ns));
                 float2 puv = tuv + (vt.xy / max(vt.z, 0.25f)) * (hgt - 0.5f) * 0.05f;
-                albedo *= texAlbedo.sample(texSampler, puv, slice, level(0.0f)).rgb;
-                texRough = texData.sample(texSampler, puv, slice, level(0.0f)).r;
-                float3 nm = texNormal.sample(texSampler, puv, slice, level(0.0f)).rgb * 2.0f - 1.0f;
+                albedo *= samplePBR(texAlbedo, roadAlbedo, isRoad, texSampler, puv, slice, roadSlice).rgb;
+                texRough = samplePBR(texData, roadData, isRoad, texSampler, puv, slice, roadSlice).r;
+                float3 nm = samplePBR(texNormal, roadNormal, isRoad, texSampler, puv, slice, roadSlice).rgb * 2.0f - 1.0f;
                 shadingN = normalize(T * nm.x + B * nm.y + ns * nm.z);
                 if (dot(shadingN, geoN) < 0) shadingN = ns;
             }
@@ -791,6 +813,7 @@ kernel void pathTraceKernel(
 kernel void guideKernel(
     texture2d<float, access::write> guide [[texture(0)]],
     texture2d<float, access::write> guideNormal [[texture(1)]],
+    texture2d<float> weatherField [[texture(4)]],
     constant Uniforms& u [[buffer(0)]],
     device const float* positions [[buffer(1)]],
     device const float* normals [[buffer(2)]],
@@ -823,6 +846,7 @@ kernel void guideKernel(
     intersector<triangle_data> isect;
     isect.assume_geometry_type(geometry_type::triangle);
     isect.accept_any_intersection(false);
+    constexpr sampler fieldSampler(address::clamp_to_edge, filter::linear);
     // v4: merged static + dynamic primary hit (nearer wins),
     // same material resolution as the trace kernel — a dynamic
     // FLAG_SHEET / glass / reflection-dominant hit therefore
@@ -888,15 +912,76 @@ kernel void guideKernel(
         // angle makes the reflection carry the pixel. Diffuse and
         // matte surfaces keep full reuse — the motion clarity
         // the reprojection exists for is untouched there.
+        // v4.1 (F3): textured gloss comes from the material's
+        // MEAN texture roughness (glassParams.w, baked CPU-side
+        // from the slice's data channel) — NOT glassParams.y,
+        // which is the glass frost roughness (default 0.05) and
+        // made every textured surface read as near-mirror here,
+        // silently disabling reprojection for all of them.
         float glossEff = (mat.texIndex > 0)
-            ? clamp(1.0f - mat.glassParams.y, 0.0f, 1.0f) : 0.0f;
-        float upFace = smoothstep(0.5f, 0.85f, nInterp.y);
-        // Wet ground turns glossy in the trace kernel (wetF x
-        // 0.85, puddles mirror-flat); mirror that from the levels.
-        glossEff = max(glossEff,
-                       clamp(u.wetLevel * upFace, 0.0f, 1.0f) * 0.85f);
+            ? clamp(1.0f - mat.glassParams.w, 0.0f, 1.0f) : 0.0f;
+        // v4.1 (F7): the weather gloss model now MIRRORS the
+        // trace kernel, from the baked field sampled at the
+        // hit's world position (the guide has world positions):
+        // wetF gloss, the thresholded puddle MASK (a mirror
+        // puddle reaches gloss 1 and restarts, as in the trace),
+        // and snowCover from the DRIFTED depth with upFace
+        // multiplied OUTSIDE the smoothstep — the trace kernel's
+        // exact structure and constants. (The old code used the
+        // raw global wet level and smoothed snowLevel * upFace
+        // INSIDE the smoothstep with no drift.)
+        float3 geoN = normalize(cross(p1 - p0, p2 - p0));
+        if (dot(geoN, nInterp) < 0.0f) geoN = -geoN;
+        float upFace = smoothstep(0.5f, 0.85f, geoN.y);
+        float puddle = 0.0f;
+        float snowCover = u.snowLevel * upFace; // trace default (no field)
+        if (u.wetLevel > 0.001f || u.snowLevel > 0.001f) {
+            float2 fuv = hitPos.xz * (1.0f / 64.0f) + 0.5f;
+            float fieldFade = (1.0f - smoothstep(29.0f, 32.0f, abs(hitPos.x)))
+                            * (1.0f - smoothstep(29.0f, 32.0f, abs(hitPos.z)));
+            float4 wfield = mix(float4(0.0f, 0.5f, 0.5f, 0.489f),
+                                weatherField.sample(fieldSampler, fuv),
+                                fieldFade);
+            // Wet: darkened, glossier (trace step 1, field-shaped).
+            float wetF = clamp(u.wetLevel * upFace * (0.7f + 0.6f * wfield.g),
+                               0.0f, 1.0f);
+            // Trickle runnels (v4.1 N3): the trace kernel's
+            // slanted-face streak term, ported exactly — slope
+            // amount and downhill frame from the GEOMETRIC
+            // normal (geoN, from the hit triangle p0/p1/p2
+            // above, as in trace), one wnoise2 evaluation,
+            // added to wetF after the base field-shaped wetF
+            // and before the gloss terms below consume it.
+            float slopeAmt = clamp((0.98f - geoN.y) / 0.28f, 0.0f, 1.0f);
+            if (slopeAmt > 0.01f && length(geoN.xz) > 1e-4f) {
+                float2 down = geoN.xz / length(geoN.xz);
+                float2 along = float2(dot(hitPos.xz, down),
+                                      dot(hitPos.xz, float2(-down.y, down.x)));
+                float streak = wnoise2(float2(along.y * 5.0f, along.x * 0.7f));
+                wetF = clamp(wetF + slopeAmt
+                             * smoothstep(0.52f, 0.85f, streak)
+                             * u.wetLevel * 0.55f, 0.0f, 1.0f);
+            }
+            glossEff = max(glossEff, wetF * 0.85f);
+            // Puddle mask (trace step 2): threshold sweep of
+            // the baked metaball potential.
+            float elevBias = clamp(0.10f - hitPos.y * 0.55f, -0.22f, 0.38f);
+            float slopeShed = clamp((geoN.y - 0.70f) / 0.30f, 0.0f, 1.0f);
+            float wetN = clamp(u.wetLevel, 0.0f, 1.0f);
+            float thr = mix(1.15f, 0.08f, pow(wetN, 1.15f)) - elevBias * 0.45f;
+            float mask = smoothstep(thr - 0.14f, thr + 0.14f, wfield.r);
+            float broad = 0.78f + 0.45f * wfield.a;
+            puddle = clamp(mask * broad, 0.0f, 1.0f) * slopeShed * upFace
+                   * fieldFade * smoothstep(0.03f, 0.15f, u.wetLevel);
+            glossEff = max(glossEff, puddle); // mirror puddle => restart
+            // Snow (trace step 3): drifted depth -> cover.
+            float drift = wfield.b;
+            float depth = u.snowLevel * mix(0.3f, 1.7f, drift);
+            snowCover = smoothstep(0.45f, 0.75f, depth) * upFace;
+            snowCover *= (1.0f - puddle); // no snow inside puddles
+        }
         // Snow cover kills the gloss again in the trace kernel.
-        glossEff *= 1.0f - smoothstep(0.45f, 0.75f, u.snowLevel * upFace);
+        glossEff *= 1.0f - snowCover;
         float cosV = clamp(dot(-ray.direction, nInterp), 0.15f, 1.0f);
         float fres = 0.04f + 0.96f * pow(1.0f - cosV, 5.0f);
         if (glossEff >= 0.92f

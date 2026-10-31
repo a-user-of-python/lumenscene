@@ -51,13 +51,34 @@ struct NodeEditorView: View {
     static let canvasH: Double = 1420
 
     static func inputs(for node: LogicNode) -> [String] {
-        guard let spec = NodeCatalog.spec(node.kind) else { return ["in"] }
+        // v4.1 (F23): unknown kinds render NO tappable pins — the
+        // editor used to fabricate an in→out pair for them, which
+        // invited wiring that the runtime delivers to nothing.
+        // The card still displays / moves / deletes normally.
+        guard let spec = NodeCatalog.spec(node.kind) else { return [] }
         return (spec.hasIn ? ["in"] : []) + spec.extraIns
     }
 
     static func outputs(for node: LogicNode) -> [String] {
-        guard let spec = NodeCatalog.spec(node.kind) else { return ["out"] }
+        guard let spec = NodeCatalog.spec(node.kind) else { return [] }
         return spec.outs
+    }
+
+    /// v4.1 (F1): safe number formatting for card summaries and
+    /// inspector readouts. `String(Int(v))` TRAPS on NaN, ±inf and
+    /// |v| ≥ 2^63 — values that can arrive from a hand-edited or
+    /// future-build project file. Integral values inside the
+    /// exact range format as integers; everything else goes
+    /// through a g-format (or the historic 2-dp format for
+    /// ordinary fractional values), never through Int(v).
+    static func formatParamNumber(_ v: Double) -> String {
+        if v.isFinite, v == v.rounded(), abs(v) < 9e15 {
+            return String(Int(v))
+        }
+        if v.isFinite, abs(v) < 1e15 {
+            return String(format: "%.2f", v)
+        }
+        return String(format: "%.6g", v)
     }
 
     /// Height reserved for the one-line param summary (0-ish when
@@ -91,14 +112,21 @@ struct NodeEditorView: View {
     // MARK: Body
 
     var body: some View {
-        VStack(spacing: 0) {
+        // v4.1 (F30): the id → node dictionary is built ONCE per
+        // body evaluation and passed to every consumer (wire
+        // Canvas, linking banner, inspector chain) instead of
+        // each of them linear-scanning graph.nodes per lookup.
+        let nodeIndex: [UUID: LogicNode] = Dictionary(
+            graph.nodes.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first })
+        return VStack(spacing: 0) {
             header
             if let lf = linkingFrom {
-                linkingBanner(lf)
+                linkingBanner(lf, nodeIndex: nodeIndex)
             }
-            canvas
+            canvas(nodeIndex: nodeIndex)
             Divider()
-            inspector
+            inspector(nodeIndex: nodeIndex)
             Text("Node changes save with the project. They aren't covered by Undo.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -135,10 +163,10 @@ struct NodeEditorView: View {
         .background(Color(white: 0.13))
     }
 
-    private func linkingBanner(_ lf: LinkingSource) -> some View {
+    private func linkingBanner(_ lf: LinkingSource, nodeIndex: [UUID: LogicNode]) -> some View {
         HStack {
             Image(systemName: "link")
-            Text("Connecting from \(title(of: lf.nodeID)) · \(lf.pin) — tap an input pin on another node.")
+            Text("Connecting from \(title(of: lf.nodeID, in: nodeIndex)) · \(lf.pin) — tap an input pin on another node.")
                 .font(.callout)
             Spacer()
             Button("Cancel") { linkingFrom = nil }
@@ -150,15 +178,23 @@ struct NodeEditorView: View {
 
     // MARK: Canvas + wires
 
-    private var canvas: some View {
+    private func canvas(nodeIndex: [UUID: LogicNode]) -> some View {
         ScrollView([.horizontal, .vertical]) {
             ZStack(alignment: .topLeading) {
                 Color(white: 0.10)
                     .onTapGesture { linkingFrom = nil }
                 Canvas { context, _ in
                     for link in graph.links {
-                        guard let from = nodeByID(link.from),
-                              let to = nodeByID(link.to) else { continue }
+                        guard let from = nodeIndex[link.from],
+                              let to = nodeIndex[link.to] else { continue }
+                        // v4.1 (F34): skip wires whose pin names
+                        // aren't in the endpoint nodes' CURRENT
+                        // pin lists (stale/renamed pins from a
+                        // newer build) — pinPoint's ?? 0 fallback
+                        // used to draw them as if valid from pin 0.
+                        guard Self.outputs(for: from).contains(link.fromPin),
+                              Self.inputs(for: to).contains(link.toPin)
+                        else { continue }
                         let p1 = Self.pinPoint(from, pin: link.fromPin, isInput: false)
                         let p2 = Self.pinPoint(to, pin: link.toPin, isInput: true)
                         var path = Path()
@@ -184,7 +220,14 @@ struct NodeEditorView: View {
 
     private func card(_ node: LogicNode) -> some View {
         let spec = NodeCatalog.spec(node.kind)
-        let height = Self.cardHeight(for: node)
+        // v4.1 (F30): derive the pin arrays ONCE per card body and
+        // reuse them for the height and both pin loops, instead of
+        // re-deriving from the spec per pin.
+        let nodeInputs = Self.inputs(for: node)
+        let nodeOutputs = Self.outputs(for: node)
+        let height = Self.headerH + Self.summaryH(for: node) + Self.pinsTopPad
+            + Double(max(nodeInputs.count, nodeOutputs.count, 1)) * Self.rowH
+            + Self.cardBottomPad
         let selected = selectedNodeID == node.id
         return ZStack(alignment: .topLeading) {
             RoundedRectangle(cornerRadius: 10)
@@ -225,12 +268,12 @@ struct NodeEditorView: View {
                     .offset(x: 10, y: Self.headerH + 3)
             }
 
-            ForEach(0..<Self.inputs(for: node).count, id: \.self) { idx in
-                pinView(node: node, pin: Self.inputs(for: node)[idx], isInput: true,
+            ForEach(0..<nodeInputs.count, id: \.self) { idx in
+                pinView(node: node, pin: nodeInputs[idx], isInput: true,
                         centreY: Self.pinCentreY(for: node, index: idx))
             }
-            ForEach(0..<Self.outputs(for: node).count, id: \.self) { idx in
-                pinView(node: node, pin: Self.outputs(for: node)[idx], isInput: false,
+            ForEach(0..<nodeOutputs.count, id: \.self) { idx in
+                pinView(node: node, pin: nodeOutputs[idx], isInput: false,
                         centreY: Self.pinCentreY(for: node, index: idx))
             }
         }
@@ -278,12 +321,8 @@ struct NodeEditorView: View {
         session.updateGraph(graph)
     }
 
-    private func nodeByID(_ id: UUID) -> LogicNode? {
-        graph.nodes.first { $0.id == id }
-    }
-
-    private func title(of nodeID: UUID) -> String {
-        guard let node = nodeByID(nodeID) else { return "Missing node" }
+    private func title(of nodeID: UUID, in nodeIndex: [UUID: LogicNode]) -> String {
+        guard let node = nodeIndex[nodeID] else { return "Missing node" }
         return NodeCatalog.spec(node.kind)?.title ?? "Unknown node"
     }
 
@@ -305,10 +344,16 @@ struct NodeEditorView: View {
 
     private func addNode(_ spec: NodeKindSpec) {
         let n = graph.nodes.count
+        // v4.1 (F33): grid placement — x cycles across 6 columns,
+        // y advances a row every 6 nodes (wrapping after 6 rows),
+        // with steps LARGER than the card (200 wide, ~≤150 tall)
+        // so fresh nodes never stack exactly on earlier ones.
+        // Maxima: x = 80 + 5×230 = 1230, y = 80 + 5×170 = 930,
+        // both inside the 1840×1420 canvas.
         let node = LogicNode(id: UUID(), kind: spec.kind,
                              params: NodeCatalog.defaultParams(for: spec.kind),
-                             x: min(1500, 80 + Double(n % 6) * 46),
-                             y: min(1100, 80 + Double(n % 6) * 46))
+                             x: 80 + Double(n % 6) * 230,
+                             y: 80 + Double((n / 6) % 6) * 170)
         mutateGraph { $0.nodes.append(node) }
         selectedNodeID = node.id
     }
@@ -373,7 +418,7 @@ struct NodeEditorView: View {
     private func valueSummary(_ node: LogicNode, _ pspec: NodeParamSpec) -> String {
         switch node.params[pspec.key] ?? pspec.def {
         case .number(let v):
-            return v == v.rounded() ? String(Int(v)) : String(format: "%.2f", v)
+            return Self.formatParamNumber(v)
         case .bool(let b):
             return b ? "On" : "Off"
         case .text(let s):
@@ -393,10 +438,10 @@ struct NodeEditorView: View {
     // MARK: Inspector
 
     @ViewBuilder
-    private var inspector: some View {
+    private func inspector(nodeIndex: [UUID: LogicNode]) -> some View {
         Group {
-            if let id = selectedNodeID, let node = nodeByID(id) {
-                nodeInspector(node)
+            if let id = selectedNodeID, let node = nodeIndex[id] {
+                nodeInspector(node, nodeIndex: nodeIndex)
             } else {
                 VStack(spacing: 6) {
                     Text("\(graph.nodes.count) node\(graph.nodes.count == 1 ? "" : "s") · \(graph.links.count) connection\(graph.links.count == 1 ? "" : "s")")
@@ -413,7 +458,7 @@ struct NodeEditorView: View {
         .background(Color(white: 0.12))
     }
 
-    private func nodeInspector(_ node: LogicNode) -> some View {
+    private func nodeInspector(_ node: LogicNode, nodeIndex: [UUID: LogicNode]) -> some View {
         let spec = NodeCatalog.spec(node.kind)
         return ScrollView {
             VStack(alignment: .leading, spacing: 12) {
@@ -431,10 +476,10 @@ struct NodeEditorView: View {
                 }
                 if let spec {
                     ForEach(spec.params, id: \.key) { pspec in
-                        paramEditor(node: node, pspec: pspec)
+                        paramEditor(node: node, pspec: pspec, nodeIndex: nodeIndex)
                     }
                 }
-                linksSection(node)
+                linksSection(node, nodeIndex: nodeIndex)
             }
             .padding(14)
         }
@@ -443,7 +488,7 @@ struct NodeEditorView: View {
     // MARK: Param editors
 
     @ViewBuilder
-    private func paramEditor(node: LogicNode, pspec: NodeParamSpec) -> some View {
+    private func paramEditor(node: LogicNode, pspec: NodeParamSpec, nodeIndex: [UUID: LogicNode]) -> some View {
         // SPECIAL CASE: the Set Material node's texture param is a
         // texture-slice picker, not free text.
         if node.kind == "actSetMaterial", pspec.key == "texture" {
@@ -459,7 +504,7 @@ struct NodeEditorView: View {
                     }
                 } label: {
                     HStack {
-                        Text(textureDisplayName(node, pspec))
+                        Text(textureDisplayName(node, pspec, nodeIndex: nodeIndex))
                         Image(systemName: "chevron.up.chevron.down").font(.caption)
                     }
                 }
@@ -473,7 +518,7 @@ struct NodeEditorView: View {
                     HStack {
                         Text(pspec.label)
                         Spacer()
-                        TextField("0", value: numberBinding(node.id, pspec), format: .number)
+                        TextField("0", value: numberBinding(node.id, pspec, nodeIndex: nodeIndex), format: .number)
                             .textFieldStyle(.roundedBorder)
                             .multilineTextAlignment(.trailing)
                             .frame(width: 110)
@@ -482,30 +527,30 @@ struct NodeEditorView: View {
                 } else {
                     HStack(spacing: 8) {
                         Text(pspec.label).frame(width: 130, alignment: .leading)
-                        Slider(value: numberBinding(node.id, pspec), in: pspec.min...pspec.max)
-                        Text(numberText(node, pspec))
+                        Slider(value: numberBinding(node.id, pspec, nodeIndex: nodeIndex), in: pspec.min...pspec.max)
+                        Text(numberText(node, pspec, nodeIndex: nodeIndex))
                             .frame(width: 54, alignment: .trailing)
                             .monospacedDigit()
                     }
                     .font(.callout)
                 }
             case .bool:
-                Toggle(pspec.label, isOn: boolBinding(node.id, pspec))
+                Toggle(pspec.label, isOn: boolBinding(node.id, pspec, nodeIndex: nodeIndex))
                     .font(.callout)
             case .text, .colorText:
                 if pspec.type == .colorText {
-                    ColorPicker(pspec.label, selection: colorBinding(node.id, pspec))
+                    ColorPicker(pspec.label, selection: colorBinding(node.id, pspec, nodeIndex: nodeIndex))
                         .font(.callout)
                 } else {
                     HStack {
                         Text(pspec.label)
-                        TextField(pspec.label, text: textBinding(node.id, pspec))
+                        TextField(pspec.label, text: textBinding(node.id, pspec, nodeIndex: nodeIndex))
                             .textFieldStyle(.roundedBorder)
                     }
                     .font(.callout)
                 }
             case .choice:
-                Picker(pspec.label, selection: textBinding(node.id, pspec)) {
+                Picker(pspec.label, selection: textBinding(node.id, pspec, nodeIndex: nodeIndex)) {
                     ForEach(pspec.choices, id: \.self) { choice in
                         Text(choice).tag(choice)
                     }
@@ -513,14 +558,14 @@ struct NodeEditorView: View {
                 .pickerStyle(.menu)
                 .font(.callout)
             case .objectRef:
-                refPickerRow(node: node, pspec: pspec, isArea: false)
+                refPickerRow(node: node, pspec: pspec, isArea: false, nodeIndex: nodeIndex)
             case .areaRef:
-                refPickerRow(node: node, pspec: pspec, isArea: true)
+                refPickerRow(node: node, pspec: pspec, isArea: true, nodeIndex: nodeIndex)
             }
         }
     }
 
-    private func refPickerRow(node: LogicNode, pspec: NodeParamSpec, isArea: Bool) -> some View {
+    private func refPickerRow(node: LogicNode, pspec: NodeParamSpec, isArea: Bool, nodeIndex: [UUID: LogicNode]) -> some View {
         HStack {
             Text(pspec.label)
             Spacer()
@@ -537,7 +582,7 @@ struct NodeEditorView: View {
                 }
             } label: {
                 HStack {
-                    Text(refDisplayName(node, pspec, isArea: isArea))
+                    Text(refDisplayName(node, pspec, isArea: isArea, nodeIndex: nodeIndex))
                     Image(systemName: "chevron.up.chevron.down").font(.caption)
                 }
             }
@@ -545,7 +590,7 @@ struct NodeEditorView: View {
         .font(.callout)
     }
 
-    private func linksSection(_ node: LogicNode) -> some View {
+    private func linksSection(_ node: LogicNode, nodeIndex: [UUID: LogicNode]) -> some View {
         let ins = graph.links.filter { $0.to == node.id }
         let outs = graph.links.filter { $0.from == node.id }
         return VStack(alignment: .leading, spacing: 6) {
@@ -553,14 +598,14 @@ struct NodeEditorView: View {
                 Text("Connections in".uppercased())
                     .font(.caption.bold()).foregroundStyle(.secondary)
                 ForEach(ins, id: \.id) { link in
-                    linkRow(text: "\(title(of: link.from)) · \(link.fromPin) → \(link.toPin)", link: link)
+                    linkRow(text: "\(title(of: link.from, in: nodeIndex)) · \(link.fromPin) → \(link.toPin)", link: link)
                 }
             }
             if !outs.isEmpty {
                 Text("Connections out".uppercased())
                     .font(.caption.bold()).foregroundStyle(.secondary)
                 ForEach(outs, id: \.id) { link in
-                    linkRow(text: "\(link.fromPin) → \(title(of: link.to)) · \(link.toPin)", link: link)
+                    linkRow(text: "\(link.fromPin) → \(title(of: link.to, in: nodeIndex)) · \(link.toPin)", link: link)
                 }
             }
             if ins.isEmpty, outs.isEmpty {
@@ -595,59 +640,79 @@ struct NodeEditorView: View {
         }
     }
 
-    private func rawParam(_ nodeID: UUID, _ pspec: NodeParamSpec) -> NodeParam {
-        nodeByID(nodeID)?.params[pspec.key] ?? pspec.def
+    private func rawParam(_ nodeID: UUID, _ pspec: NodeParamSpec,
+                          nodeIndex: [UUID: LogicNode]) -> NodeParam {
+        nodeIndex[nodeID]?.params[pspec.key] ?? pspec.def
     }
 
-    private func numberBinding(_ nodeID: UUID, _ pspec: NodeParamSpec) -> Binding<Double> {
+    // v4.1 (F24): when the stored param is present but MISTYPED,
+    // the bindings below fall back to the value inside pspec.def
+    // (matching case) — not to a hard-coded 0/false/"" — so the
+    // inspector shows the same spec default the runtime accessors
+    // conceptually use, instead of a third, wrong value.
+    private func numberBinding(_ nodeID: UUID, _ pspec: NodeParamSpec,
+                               nodeIndex: [UUID: LogicNode]) -> Binding<Double> {
         Binding(
             get: {
-                if case .number(let v) = rawParam(nodeID, pspec) { return v }
+                if case .number(let v) = rawParam(nodeID, pspec, nodeIndex: nodeIndex) { return v }
+                if case .number(let d) = pspec.def { return d }
                 return 0
             },
             set: { setParam(nodeID, pspec.key, .number($0)) })
     }
 
-    private func numberText(_ node: LogicNode, _ pspec: NodeParamSpec) -> String {
-        if case .number(let v) = rawParam(node.id, pspec) {
-            return v == v.rounded() ? String(Int(v)) : String(format: "%.2f", v)
+    private func numberText(_ node: LogicNode, _ pspec: NodeParamSpec,
+                            nodeIndex: [UUID: LogicNode]) -> String {
+        // v4.1 (F1): format through the safe helper (no Int trap).
+        if case .number(let v) = rawParam(node.id, pspec, nodeIndex: nodeIndex) {
+            return Self.formatParamNumber(v)
+        }
+        if case .number(let d) = pspec.def {
+            return Self.formatParamNumber(d)
         }
         return "0"
     }
 
-    private func boolBinding(_ nodeID: UUID, _ pspec: NodeParamSpec) -> Binding<Bool> {
+    private func boolBinding(_ nodeID: UUID, _ pspec: NodeParamSpec,
+                             nodeIndex: [UUID: LogicNode]) -> Binding<Bool> {
         Binding(
             get: {
-                if case .bool(let b) = rawParam(nodeID, pspec) { return b }
+                if case .bool(let b) = rawParam(nodeID, pspec, nodeIndex: nodeIndex) { return b }
+                if case .bool(let d) = pspec.def { return d }
                 return false
             },
             set: { setParam(nodeID, pspec.key, .bool($0)) })
     }
 
-    private func textBinding(_ nodeID: UUID, _ pspec: NodeParamSpec) -> Binding<String> {
+    private func textBinding(_ nodeID: UUID, _ pspec: NodeParamSpec,
+                             nodeIndex: [UUID: LogicNode]) -> Binding<String> {
         Binding(
             get: {
-                if case .text(let s) = rawParam(nodeID, pspec) { return s }
+                if case .text(let s) = rawParam(nodeID, pspec, nodeIndex: nodeIndex) { return s }
+                if case .text(let d) = pspec.def { return d }
                 return ""
             },
             set: { setParam(nodeID, pspec.key, .text($0)) })
     }
 
-    private func colorBinding(_ nodeID: UUID, _ pspec: NodeParamSpec) -> Binding<Color> {
+    private func colorBinding(_ nodeID: UUID, _ pspec: NodeParamSpec,
+                              nodeIndex: [UUID: LogicNode]) -> Binding<Color> {
         Binding(
-            get: { Self.color(fromHex: textBinding(nodeID, pspec).wrappedValue) },
+            get: { Self.color(fromHex: textBinding(nodeID, pspec, nodeIndex: nodeIndex).wrappedValue) },
             set: { setParam(nodeID, pspec.key, .text(Self.hex(from: $0))) })
     }
 
-    private func textureDisplayName(_ node: LogicNode, _ pspec: NodeParamSpec) -> String {
-        if case .text(let s) = rawParam(node.id, pspec), !s.isEmpty, s != "none" {
+    private func textureDisplayName(_ node: LogicNode, _ pspec: NodeParamSpec,
+                                    nodeIndex: [UUID: LogicNode]) -> String {
+        if case .text(let s) = rawParam(node.id, pspec, nodeIndex: nodeIndex), !s.isEmpty, s != "none" {
             return TextureGen.displayName(s)
         }
         return "None"
     }
 
-    private func refDisplayName(_ node: LogicNode, _ pspec: NodeParamSpec, isArea: Bool) -> String {
-        guard case .ref(let id) = rawParam(node.id, pspec), let id else { return "None" }
+    private func refDisplayName(_ node: LogicNode, _ pspec: NodeParamSpec, isArea: Bool,
+                                nodeIndex: [UUID: LogicNode]) -> String {
+        guard case .ref(let id) = rawParam(node.id, pspec, nodeIndex: nodeIndex), let id else { return "None" }
         if isArea {
             return session.project.scene.areas.first { $0.id == id }?.name ?? "Missing"
         }
