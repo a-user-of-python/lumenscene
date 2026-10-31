@@ -491,8 +491,12 @@ kernel void pathTraceKernel(
             float thr = mix(1.15f, 0.08f, pow(wetN, 1.15f)) - elevBias * 0.45f;
             float mask = smoothstep(thr - 0.14f, thr + 0.14f, wfield.r);
             float broad = 0.78f + 0.45f * wfield.a;
+            // fieldFade multiplies the mask as well as the
+            // sample: at the lowest (full-wetness) threshold the
+            // neutral potential 0 would otherwise read as a
+            // faint uniform puddle outside the field window.
             puddle = clamp(mask * broad, 0.0f, 1.0f) * slopeShed * upFace
-                   * smoothstep(0.03f, 0.15f, u.wetLevel);
+                   * fieldFade * smoothstep(0.03f, 0.15f, u.wetLevel);
             // Snow piles in drifts: depth varies with the
             // baked drift field, cover turns on where the
             // drifted depth is enough.
@@ -529,13 +533,17 @@ kernel void pathTraceKernel(
             if (bounce <= 1u && geoN.y > 0.7f) {
                 // Drift gradient from the baked field (v3.3):
                 // two extra fetches replace two fbm evaluations.
-                float gx = weatherField.sample(fieldSampler,
-                        (hitPos.xz + float2(0.35f, 0.0f)) * (1.0f / 64.0f) + 0.5f).b
-                        - drift;
-                float gz = weatherField.sample(fieldSampler,
-                        (hitPos.xz + float2(0.0f, 0.35f)) * (1.0f / 64.0f) + 0.5f).b
-                        - drift;
-                gx *= fieldFade; gz *= fieldFade;
+                // Offset samples are faded toward neutral BEFORE
+                // the subtraction so the baseline matches the
+                // faded centre sample at the window fringe.
+                float gbx = mix(0.5f, weatherField.sample(fieldSampler,
+                        (hitPos.xz + float2(0.35f, 0.0f)) * (1.0f / 64.0f) + 0.5f).b,
+                        fieldFade);
+                float gbz = mix(0.5f, weatherField.sample(fieldSampler,
+                        (hitPos.xz + float2(0.0f, 0.35f)) * (1.0f / 64.0f) + 0.5f).b,
+                        fieldFade);
+                float gx = gbx - drift;
+                float gz = gbz - drift;
                 float3 mound = normalize(float3(-gx * depth * 1.4f, 1.0f,
                                                 -gz * depth * 1.4f));
                 shadingN = normalize(mix(shadingN, mound, snowCover * 0.6f));
@@ -981,11 +989,11 @@ fragment float4 tonemapFragment(VSOut in [[stage_in]],
             float elevBias = clamp(0.10f - wp.y * 0.55f, -0.22f, 0.38f);
             float thr = mix(1.15f, 0.08f, pow(wetN, 1.15f)) - elevBias * 0.45f;
             float mask = smoothstep(thr - 0.14f, thr + 0.14f, pot);
-            float broad = 0.78f + 0.45f * fs.a;
+            float broad = 0.78f + 0.45f * mix(0.489f, fs.a, fade);
             float slopeShed = clamp((gn.y - 0.70f) / 0.30f, 0.0f, 1.0f);
             float upFace = smoothstep(0.5f, 0.85f, gn.y);
             float puddleM = clamp(mask * broad, 0.0f, 1.0f) * slopeShed * upFace
-                          * smoothstep(0.03f, 0.15f, p.wetLevel);
+                          * fade * smoothstep(0.03f, 0.15f, p.wetLevel);
             if (puddleM > 0.01f) {
                 // Two layers of expanding rings, as in the old
                 // in-tracer version — but only their brightness
