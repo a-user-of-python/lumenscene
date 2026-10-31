@@ -83,6 +83,9 @@ struct Uniforms {
     uint dynTriCount;          // v4: dynamic-layer triangle count (unified ids start at triCount)
     uint hidePlayerHead;       // v4.5: 1 while the camera is the Play first-person eye — the player figure's head/hair (FLAG_PLAYER_HEAD) are excluded from PRIMARY hits only (was padDyn; layout unchanged)
     float freezeFrac;          // v4.7: puddle freeze fraction 0...1 (tail field; mirrors Renderer.swift GPUUniforms)
+    float waterReflScale;      // v4.8: water reflection resolution 1.0 / 0.5 / 0.25 (tail; mirrors GPUUniforms)
+    uint frameCounter;         // v4.8: per-presented-frame counter for the rotating reflection pattern (tail; mirrors GPUUniforms)
+    uint reflPad;
 };
 
 struct Material {
@@ -560,6 +563,28 @@ kernel void pathTraceKernel(
         // its albedo is the material's snow colour times the
         // per-vertex drift shade baked CPU-side.
         bool isSnow = (mat.flags & FLAG_SNOW) != 0u;
+        // v4.8 (steering 1): water reflection resolution. At the
+        // default scale 1.0 nothing below ever triggers and water
+        // shades exactly as v4.7. Below 1.0, a rotating per-pixel
+        // pattern (pixel hash XOR frame counter, so coverage
+        // cycles across frames) selects which water-hit pixels
+        // trace the full scene reflection; the rest take the
+        // cheaper environment fill at the bounce below. Only
+        // sheet (standing-water) hits pay or save this cost --
+        // an audit of the v4.7 kernel showed reflection work for
+        // water lives entirely in the glossy specular roll for
+        // isSheet / mirror-puddle hits, and no other pixel class
+        // enters that roll with water gloss, so nothing is
+        // removed from non-water pixels (there was nothing to
+        // remove) and no reflection is faked at the default.
+        bool waterCheap = false;
+        if (isSheet && u.waterReflScale < 0.999f) {
+            uint rh = hash32(pixel.x * 1973u ^ pixel.y * 9277u
+                             ^ (u.frameCounter * 2654435761u)
+                             ^ (bounce * 40503u));
+            float rf = float(rh >> 8) * (1.0f / 16777216.0f);
+            waterCheap = rf >= u.waterReflScale;
+        }
         // Shaped weather field: defaults are exactly the
         // v3 global behaviour (wetF = wet, snowCover = snowGlobal,
         // no puddle, drift 0.5, depth = snowGlobal). The shaped
@@ -663,6 +688,15 @@ kernel void pathTraceKernel(
             albedo *= (1.0f - 0.5f * puddle);
             gloss = max(gloss, puddle);
             shadingN = normalize(mix(shadingN, geoN, puddle));
+            // v4.8: a dominant mask puddle is water too -- the
+            // same rotating selection applies to its reflection.
+            if (puddle > 0.5f && u.waterReflScale < 0.999f) {
+                uint rh = hash32(pixel.x * 1973u ^ pixel.y * 9277u
+                                 ^ (u.frameCounter * 2654435761u)
+                                 ^ (bounce * 40503u));
+                float rf = float(rh >> 8) * (1.0f / 16777216.0f);
+                waterCheap = rf >= u.waterReflScale;
+            }
             // v4.7: mask puddles freeze coherently with sheets.
             if (u.freezeFrac > 0.001f) {
                 float3 iceCol = float3(0.55f, 0.65f, 0.75f);
@@ -830,6 +864,24 @@ kernel void pathTraceKernel(
         // specular instead — a jittered reflection, tinted only
         // partway toward the albedo, and allowed to count
         // emissive hits directly on the next segment.
+        // v4.8: unselected water pixels take the environment
+        // fill for their reflection and end the path here --
+        // the structural saving is the reflection ray itself
+        // (and everything it would have hit downstream), which
+        // is why reflection rays per frame on water pixels
+        // scale by ~waterReflScale. The fill is the same
+        // envColor gradient a miss returns, tinted like the
+        // specular roll tints its bounce, so the puddle still
+        // reads as water -- flatter and dimmer than a true
+        // reflection, which is the honest cost of the setting.
+        if (waterCheap) {
+            float3 rdir = reflect(ray.direction, shadingN);
+            float3 fillTint = mix(float3(1.0f), albedo, 0.45f)
+                            * (0.35f + 0.65f * gloss);
+            radiance += throughput * fillTint
+                      * envColor(rdir, u.envIntensity);
+            break;
+        }
         float3 newDir = cosineDirection(shadingN, rng);
         float3 bounceTint = albedo;
         bool bounceSpecular = false;
@@ -1569,15 +1621,31 @@ vertex PrecipOut precipVertex(uint vid [[vertex_id]],
 }
 
 fragment float4 precipFragment(PrecipOut in [[stage_in]]) {
+    // v4.8 (steering 5): alpha is computed PROCEDURALLY from the
+    // quad UV with signed-distance shapes, and is exactly 0 in a
+    // border band on every side of the quad for BOTH kinds -- so
+    // no square card silhouette can ever show, whatever the
+    // blend mode or texture state. Rain is a capsule around the
+    // streak axis; snow is a radial disc reaching exactly 0 by
+    // r = 0.85 of the half-extent.
+    float2 p = in.uv - float2(0.5f); // -0.5..0.5, quad borders at |p| = 0.5
     if (in.kind < 1.5f) {
-        // Rain: faint blue-grey streak, fading along its length.
-        float lengthFade = sin(3.14159265f * clamp(in.uv.y, 0.0f, 1.0f));
-        float alpha = 0.50f * lengthFade * in.fade;
+        // Rain capsule: distance to the vertical segment
+        // y in [-0.33, 0.33] on the streak axis (x = 0).
+        float segY = clamp(p.y, -0.33f, 0.33f);
+        float dist = length(float2(p.x, p.y - segY));
+        // Soft edge: full inside 0.05, zero at 0.16 (quad units);
+        // the quad half-width is 0.5, so alpha is 0 for the
+        // outer 68% of the half-width on each side.
+        float body = 1.0f - smoothstep(0.05f, 0.16f, dist);
+        // Tip fade along the length so the ends round off.
+        float tip = 1.0f - smoothstep(0.34f, 0.50f, abs(p.y));
+        float alpha = 0.50f * body * tip * in.fade;
         return float4(float3(0.72f, 0.80f, 0.95f), alpha);
     }
-    // Snow: soft radial disc.
-    float d = length(in.uv - float2(0.5f)) * 2.0f;
-    float disc = 1.0f - smoothstep(0.35f, 1.0f, d);
+    // Snow: radial falloff, exactly 0 at r >= 0.85 half-extents.
+    float r = length(p) * 2.0f; // 0 centre, 1 at edge midpoints
+    float disc = 1.0f - smoothstep(0.45f, 0.85f, r);
     float alpha = 0.9f * disc * in.fade;
     return float4(float3(0.93f, 0.96f, 1.0f), alpha);
 }
@@ -1627,4 +1695,242 @@ vertex LineOut lineVertex(uint vid [[vertex_id]],
 
 fragment float4 lineFragment(LineOut in [[stage_in]]) {
     return in.color;
+}
+
+// MARK: - Weather simulation (v4.8: persistent GPU state)
+//
+// The snow and water surfaces are no longer re-derived from a
+// closed-form height function at rebuild time. Their depths
+// live HERE, in persistent per-lattice-vertex buffers owned by
+// Renderer.swift (snowDepth / waterDepth, one Float per vertex
+// of the SAME 0.20 m world-XZ lattice the v4.4 sheet used, with
+// the same support sampling). These kernels STEP that state:
+//
+//   * simSourceSinkKernel -- deposition toward the per-vertex
+//     ceiling, temperature / legacy melt sinks, compaction
+//     toward a lowered ceiling, rain fill toward the per-vertex
+//     water ceiling, drying, and edge drainage (a vertex with a
+//     missing neighbour is a support edge: its water bleeds off
+//     at the drain rate, so water never stands past an edge).
+//   * simFlowKernel -- pairwise neighbour transfers in
+//     RED-BLACK checkerboard order. Within one pass only
+//     opposite-colour neighbours are read, so every transfer is
+//     pairwise antisymmetric (what leaves a is added to b in
+//     the same visit) and mass-conserving by construction. The
+//     naive Jacobi form of the repose step DIVERGED in the
+//     v4.5 audit; red-black Gauss-Seidel does not, and the
+//     host audit (v48-sim-audit.py) mirrors this exact scheme.
+//     Snow: repose transfer drives inter-cell slope toward
+//     tan(37 deg) PLUS a small always-on diffusion (0.8% of the
+//     snow-depth difference per visit) that relaxes piles into
+//     soft rounded mounds with no faceted steps. Water:
+//     levelling transfers equalise supportY + waterDepth
+//     between neighbours (near-flat pool surfaces), scaled by
+//     (1 - freezeFrac) -- frozen water does not flow.
+//   * simApplyEditsKernel -- intruder / plow / footprint edit
+//     transfers: (vertex index, delta) pairs written by the
+//     CPU recorder, applied to snowDepth verbatim (clamped at
+//     0 -- an edit cannot dig below the support).
+//
+// The closed-form v4.3-v4.7 height function survives ONLY as
+// (a) the per-vertex deposition CEILING + drift-rate field
+// baked into the ceiling/rate buffers at lattice build time,
+// and (b) the load-time initial condition for the depth
+// buffers. The rendered sheets are skins over this state (see
+// Renderer.appendSnowSheet): topology fixed per lattice build,
+// heights read back from these buffers at the quantised
+// rebuild cadence.
+
+struct SimParams {
+    uint vx;          // lattice vertices per row
+    uint vz;          // lattice rows
+    uint parity;      // red-black pass parity (flow kernel)
+    uint kind;        // flow kernel: 0 = snow, 1 = water
+    float dt;         // seconds this substep
+    float cell;       // lattice cell size (m)
+    float snowSink;   // uniform snow sink rate (m/s): temp melt or legacy shrink
+    float compactRate;// m/s toward ceiling when snow exceeds it
+    float waterDry;   // water drying rate (m/s)
+    float waterDrain; // extra water loss at support edges (m/s)
+    float freezeFrac; // 0..1; water flow scales by (1 - freezeFrac)
+    float snowBase;   // v4.8: live snow base rate (m/s at drift factor 1)
+    float waterBase;  // v4.8: live water fill scale (surge x rate scale)
+    float pad;
+};
+
+kernel void simSourceSinkKernel(
+    device float* snowDepth [[buffer(0)]],
+    device float* waterDepth [[buffer(1)]],
+    device const float* supportY [[buffer(2)]],
+    device const float* snowCeil [[buffer(3)]],
+    device const float* snowRate [[buffer(4)]],
+    device const float* waterCeil [[buffer(5)]],
+    device const float* waterRate [[buffer(6)]],
+    device const uint* hasSupport [[buffer(7)]],
+    constant SimParams& sp [[buffer(8)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint count = sp.vx * sp.vz;
+    if (idx >= count) return;
+    if (hasSupport[idx] == 0u) { snowDepth[idx] = 0.0f; waterDepth[idx] = 0.0f; return; }
+    // Snow: deposit toward the ceiling at the drift rate;
+    // above the ceiling (target lowered) compact toward it.
+    float sn = snowDepth[idx];
+    float ceil = snowCeil[idx];
+    if (sn < ceil) {
+        sn = min(ceil, sn + snowRate[idx] * sp.snowBase * sp.dt);
+    } else if (sn > ceil) {
+        sn = max(ceil, sn - sp.compactRate * sp.dt);
+    }
+    // Uniform sinks (temperature melt / legacy rain-melt /
+    // legacy thaw -- the session picks the v4.7 rate).
+    if (sp.snowSink > 0.0f) sn = max(0.0f, sn - sp.snowSink * sp.dt);
+    snowDepth[idx] = sn;
+    // Water: rain fills toward the pooling ceiling (the baked
+    // puddle profile for this vertex -- zero where the field
+    // never pools, so rain alone cannot flood a flat plane
+    // edge-to-edge); drying removes at the ~10 min rate.
+    float wa = waterDepth[idx];
+    if (wa < waterCeil[idx]) {
+        wa = min(waterCeil[idx], wa + waterRate[idx] * sp.waterBase * sp.dt);
+    }
+    if (sp.waterDry > 0.0f) wa = max(0.0f, wa - sp.waterDry * sp.dt);
+    // Edge drainage: any missing 4-neighbour means this vertex
+    // sits on a support boundary -- water there drains off the
+    // edge instead of standing in a ledge against thin air.
+    uint x = idx % sp.vx;
+    uint z = idx / sp.vx;
+    bool edge = false;
+    if (x == 0u || z == 0u || x + 1u >= sp.vx || z + 1u >= sp.vz) {
+        edge = true;
+    } else {
+        if (hasSupport[idx - 1u] == 0u || hasSupport[idx + 1u] == 0u
+            || hasSupport[idx - sp.vx] == 0u || hasSupport[idx + sp.vx] == 0u) {
+            edge = true;
+        }
+    }
+    if (edge && sp.waterDrain > 0.0f) {
+        wa = max(0.0f, wa - sp.waterDrain * sp.dt);
+    }
+    waterDepth[idx] = wa;
+}
+
+kernel void simFlowKernel(
+    device float* snowDepth [[buffer(0)]],
+    device float* waterDepth [[buffer(1)]],
+    device const float* supportY [[buffer(2)]],
+    device const float* waterCeil [[buffer(5)]],
+    device const uint* hasSupport [[buffer(7)]],
+    device const uint* pinned [[buffer(9)]],
+    constant SimParams& sp [[buffer(8)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint count = sp.vx * sp.vz;
+    if (idx >= count) return;
+    if (hasSupport[idx] == 0u) return;
+    uint x = idx % sp.vx;
+    uint z = idx / sp.vx;
+    if (((x + z) & 1u) != sp.parity) return;
+    const float maxStep = 0.753554f * sp.cell; // tan(37 deg) * cell
+    // Four neighbours; opposite colour by construction, so a
+    // neighbour is never written by another thread this pass.
+    const int dxs[4] = {1, -1, 0, 0};
+    const int dzs[4] = {0, 0, 1, -1};
+    for (uint k = 0u; k < 4u; ++k) {
+        int nx = int(x) + dxs[k];
+        int nz = int(z) + dzs[k];
+        if (nx < 0 || nz < 0 || nx >= int(sp.vx) || nz >= int(sp.vz)) continue;
+        uint n = uint(nz) * sp.vx + uint(nx);
+        // v4.8 (steering 3): water at a support boundary
+        // DRAINS in the flow pass itself -- a missing neighbour
+        // (support edge) or a lower support across a step takes
+        // half of the cell's water per visit and removes
+        // it. A source-sink drain rate alone loses to the
+        // levelling refill from the pool behind it (host audit
+        // v4.8: edge ring held 9.4 mm against the rate drain);
+        // draining in the flow is what guarantees water never
+        // stands past an edge or piles against a step.
+        if (sp.kind == 1u
+            && (hasSupport[n] == 0u
+                || (abs(supportY[idx] - supportY[n]) > 0.05f
+                    && supportY[n] < supportY[idx]))) {
+            float fs = 1.0f - clamp(sp.freezeFrac, 0.0f, 1.0f);
+            if (fs > 0.001f) {
+                waterDepth[idx] -= waterDepth[idx] * 0.5f * fs;
+            }
+            continue;
+        }
+        if (hasSupport[n] == 0u) continue;
+        // Same-support edges only: a genuine support step is
+        // the object's silhouette, not snow/water holding a
+        // cliff (the v4.5 rule, kept verbatim).
+        if (abs(supportY[idx] - supportY[n]) > 0.05f) continue;
+        if (sp.kind == 0u) {
+            // Snow. Pinned columns (resting intruder, carved
+            // trail floor) neither give nor receive.
+            if (pinned[idx] != 0u || pinned[n] != 0u) continue;
+            float ha = supportY[idx] + snowDepth[idx];
+            float hb = supportY[n] + snowDepth[n];
+            float diff = ha - hb;
+            float move = 0.0f;
+            if (abs(diff) > maxStep) {
+                float excess = abs(diff) - maxStep;
+                move = excess * 0.5f;
+            }
+            // Rounding diffusion: 4% of the depth difference
+            // per visit, always on -- piles relax into soft
+            // mounds instead of holding faceted steps. Small
+            // enough that drift variety survives (the audit
+            // measures drift contrast before/after).
+            move += (snowDepth[idx] - snowDepth[n]) * 0.008f;
+            // Clamp: a cell never gives more snow than it holds.
+            if (move > 0.0f) move = min(move, snowDepth[idx]);
+            if (move < 0.0f) move = -min(-move, snowDepth[n]);
+            if (move != 0.0f) {
+                snowDepth[idx] -= move;
+                snowDepth[n] += move;
+            }
+        } else {
+            // Confinement: water never flows INTO a dry cell
+            // outside the pooling field (waterCeil == 0). On a
+            // dead-flat plane, unconfined levelling bleeds a
+            // pool into a plane-wide film (host audit v4.8) --
+            // the pooling field is what makes puddles puddles.
+            if (waterCeil[n] <= 0.0f && waterDepth[n] <= 0.0f
+                && (supportY[idx] + waterDepth[idx])
+                   > (supportY[n] + waterDepth[n])) continue;
+            if (waterCeil[idx] <= 0.0f && waterDepth[idx] <= 0.0f
+                && (supportY[n] + waterDepth[n])
+                   > (supportY[idx] + waterDepth[idx])) continue;
+            // Water levelling: move toward equal free surface.
+            float flowScale = 1.0f - clamp(sp.freezeFrac, 0.0f, 1.0f);
+            if (flowScale <= 0.001f) continue; // frozen: rigid
+            float la = supportY[idx] + waterDepth[idx];
+            float lb = supportY[n] + waterDepth[n];
+            float move = (la - lb) * 0.25f * flowScale;
+            if (move > 0.0f) move = min(move, waterDepth[idx]);
+            if (move < 0.0f) move = -min(-move, waterDepth[n]);
+            // Rounding diffusion on depth itself (surface
+            // tension): blurs the perimeter into blobs.
+            move += (waterDepth[idx] - waterDepth[n]) * 0.03f * flowScale;
+            if (move > 0.0f) move = min(move, waterDepth[idx]);
+            if (move < 0.0f) move = -min(-move, waterDepth[n]);
+            if (move != 0.0f) {
+                waterDepth[idx] -= move;
+                waterDepth[n] += move;
+            }
+        }
+    }
+}
+
+kernel void simApplyEditsKernel(
+    device float* snowDepth [[buffer(0)]],
+    device const uint* editIndex [[buffer(10)]],
+    device const float* editDelta [[buffer(11)]],
+    constant uint& editCount [[buffer(12)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= editCount) return;
+    uint v = editIndex[idx];
+    snowDepth[v] = max(0.0f, snowDepth[v] + editDelta[idx]);
 }

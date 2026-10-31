@@ -78,13 +78,13 @@ struct EditorView: View {
             Divider()
             HStack(spacing: 0) {
                 treePanel
-                    .frame(width: 238)
+                    .frame(width: 264)
                 Divider()
                 viewportPanel
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 Divider()
                 propertiesPanel
-                    .frame(width: 302)
+                    .frame(width: 320)
             }
         }
     }
@@ -142,6 +142,23 @@ struct EditorView: View {
                 session.renderer.qualityPreference = newValue
                 session.renderer.resetAccumulation()
                 session.kickRender()
+            })
+    }
+
+    /// v4.8 (steering 1): water reflection resolution —
+    /// Full (1.0, v4.7 quality) / Half / Quarter, mapped to
+    /// the session's stepped waterReflectionScale.
+    private var waterReflectionBinding: Binding<Int> {
+        Binding(
+            get: {
+                switch session.waterReflectionScale {
+                case 0.5: return 1
+                case 0.25: return 2
+                default: return 0
+                }
+            },
+            set: { newValue in
+                session.setWaterReflectionScale([1.0, 0.5, 0.25][newValue])
             })
     }
 
@@ -258,6 +275,11 @@ struct EditorView: View {
                     Text("High detail").tag(1)
                     Text("Battery saver").tag(2)
                 }
+                Picker("Water reflections", selection: waterReflectionBinding) {
+                    Text("Full").tag(0)
+                    Text("Half").tag(1)
+                    Text("Quarter").tag(2)
+                }
                 Divider()
                 Button("Export project package (.zip)") {
                     if let url = session.exportPackageURL() { shareItem = ShareItem(url: url) }
@@ -333,51 +355,69 @@ struct EditorView: View {
                         Text("Not set — rain and snow behave as they always have.")
                             .foregroundStyle(.secondary)
                         Button("Set temperature") { session.setTemperature(10.0) }
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                     } else {
                         HStack {
                             Text("Temperature")
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
                             Spacer()
                             Text(session.liveTemperatureText)
                                 .foregroundStyle(.secondary)
                                 .monospacedDigit()
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                         Slider(value: temperatureBinding, in: -20...30, step: 0.5)
                         Text("At or below freezing, rain falls as snow and puddles freeze into ice. Above freezing, snow falls as rain and the snowpack melts, faster the warmer it is.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         Button("Clear temperature") { session.setTemperature(nil) }
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                 } header: {
-                    Text("Temperature")
+                    Text("Temperature").lineLimit(1).fixedSize(horizontal: true, vertical: false)
                 }
                 Section {
                     HStack {
                         Text("Max Snow Depth")
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                         Spacer()
                         Text(String(format: "%.2f m", session.project.scene.weather.maxDepth))
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                     Slider(value: maxSnowDepthBinding, in: 0.05...2.0, step: 0.05)
                     Text("Snow keeps falling until it reaches this depth. Lowering it lets deep snow settle down gradually — it isn't removed instantly.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } header: {
-                    Text("Depth")
+                    Text("Depth").lineLimit(1).fixedSize(horizontal: true, vertical: false)
                 }
                 Section {
                     HStack {
                         Text("Pattern")
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                         Spacer()
                         Text(session.project.scene.weather.seed == 0
                              ? "Pattern #0 (Classic)"
                              : "Pattern #\(session.project.scene.weather.seed)")
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                     Button("Re-roll pattern") { session.rerollSnowSeed() }
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 } header: {
-                    Text("Snow Pattern")
+                    Text("Snow Pattern").lineLimit(1).fixedSize(horizontal: true, vertical: false)
                 }
                 Section {
                     Text(String(format: "Snow now: %.2f m of %.2f m max (%d%%)",
@@ -385,14 +425,18 @@ struct EditorView: View {
                                 session.project.scene.weather.maxDepth,
                                 Int((session.liveSnowProgress * 100).rounded())))
                         .monospacedDigit()
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 } header: {
-                    Text("Right Now")
+                    Text("Right Now").lineLimit(1).fixedSize(horizontal: true, vertical: false)
                 }
             }
             .navigationTitle("Snow Settings")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { showSnowSettings = false }
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
             }
         }
@@ -418,7 +462,7 @@ struct EditorView: View {
     private var treePanel: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("Objects").font(.headline)
+                Text("Objects").font(.headline).lineLimit(1).fixedSize(horizontal: true, vertical: false)
                 Spacer()
                 // v4.6: Multi Select tool toggle. On: taps (tree
                 // or viewport) add/remove objects from the set;
@@ -429,7 +473,9 @@ struct EditorView: View {
                     Label("Multi", systemImage: session.multiSelectMode
                           ? "checklist.checked" : "checklist")
                         .labelStyle(.titleAndIcon)
+                        .lineLimit(1)
                 }
+                .fixedSize(horizontal: true, vertical: false)
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .tint(session.multiSelectMode ? .accentColor : .secondary)
@@ -445,7 +491,9 @@ struct EditorView: View {
                     Button("Import Model…") { showImport = true }
                 } label: {
                     Label("Add", systemImage: "plus")
+                        .lineLimit(1)
                 }
+                .fixedSize(horizontal: true, vertical: false)
             }
             .padding(10)
             List(selection: treeSelectionBinding) {
@@ -458,9 +506,11 @@ struct EditorView: View {
                             && session.multiSelection.contains(obj.id) {
                             Image(systemName: "checkmark.circle.fill")
                                 .foregroundStyle(Color.accentColor)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                         Image(systemName: obj.source == "model" ? "cube" : icon(for: obj.primitiveKind))
                             .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: true, vertical: false)
                         Text(obj.name).lineLimit(1)
                         Spacer()
                         Button {
@@ -468,8 +518,10 @@ struct EditorView: View {
                         } label: {
                             Image(systemName: obj.visible ? "eye" : "eye.slash")
                                 .foregroundStyle(obj.visible ? .primary : .secondary)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                         .buttonStyle(.plain)
+                        .fixedSize(horizontal: true, vertical: false)
                     }
                     .tag(obj.id)
                 }
@@ -477,11 +529,13 @@ struct EditorView: View {
             .listStyle(.plain)
             Divider()
             HStack {
-                Text("Areas").font(.headline)
+                Text("Areas").font(.headline).lineLimit(1).fixedSize(horizontal: true, vertical: false)
                 Spacer()
                 Button { session.addArea() } label: {
                     Image(systemName: "plus")
+                        .fixedSize(horizontal: true, vertical: false)
                 }
+                .fixedSize(horizontal: true, vertical: false)
                 .help("Add a trigger area")
             }
             .padding(.horizontal, 10)
@@ -500,11 +554,14 @@ struct EditorView: View {
                             HStack(spacing: 8) {
                                 Image(systemName: "cube.transparent")
                                     .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: true, vertical: false)
                                 Text(area.name).lineLimit(1)
                                 Spacer()
                                 Text("\(session.project.scene.objects.filter { $0.areaID == area.id }.count)")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
                             }
                             .padding(.horizontal, 10)
                             .padding(.vertical, 6)
@@ -534,6 +591,7 @@ struct EditorView: View {
                 Text(weatherCaption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
                     .padding(.horizontal, 8)
                     .padding(.bottom, session.liveSnowAmount > 0.005 ? 2 : 8)
             }
@@ -545,6 +603,7 @@ struct EditorView: View {
                             session.project.scene.weather.maxDepth))
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
                     .padding(.horizontal, 8)
                     .padding(.bottom, session.temperatureStatusText == nil ? 8 : 2)
             }
@@ -554,6 +613,7 @@ struct EditorView: View {
                 Text(tempStatus)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
                     .padding(.horizontal, 8)
                     .padding(.bottom, 8)
             }
@@ -824,11 +884,13 @@ struct ObjectPropertiesView: View {
                 } else {
                     section("Imported") {
                         if let asset = obj.wrappedValue.assetFile {
-                            Text(asset).font(.caption).foregroundStyle(.secondary)
+                            Text(asset).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }
                         if let mesh = session.meshes[objectID] {
                             Text("\(mesh.triangleCount) triangles")
                                 .font(.caption).foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                     }
                 }
@@ -836,6 +898,7 @@ struct ObjectPropertiesView: View {
                 section("Surface") {
                     ColorPicker("Colour", selection: colorOf(
                         { $0.material.baseColor }, { $0.material.baseColor = $1 }))
+                        .lineLimit(1)
                     Picker("Texture", selection: presetBinding) {
                         Text("Plain").tag("none")
                         Section("Surfaces") {
@@ -856,6 +919,7 @@ struct ObjectPropertiesView: View {
                             }
                         }
                     }
+                    .lineLimit(1)
                     if obj.wrappedValue.material.texturePreset != "none"
                         && !obj.wrappedValue.material.textureFit {
                         sliderRow("Tiling", dbl({ $0.material.textureScale },
@@ -873,9 +937,11 @@ struct ObjectPropertiesView: View {
                 section("Light Emission") {
                     Toggle("Emit light", isOn: boolOf(
                         { $0.material.emissiveOn }, { $0.material.emissiveOn = $1 }))
+                        .lineLimit(1)
                     if obj.wrappedValue.material.emissiveOn {
                         ColorPicker("Light colour", selection: colorOf(
                             { $0.material.emissiveColor }, { $0.material.emissiveColor = $1 }))
+                            .lineLimit(1)
                         sliderRow("Intensity", dbl({ $0.material.emissiveIntensity },
                                                    { $0.material.emissiveIntensity = $1 }),
                                   0...20, "%.1f")
@@ -887,6 +953,7 @@ struct ObjectPropertiesView: View {
                 section("Glass") {
                     Toggle("Make glass", isOn: boolOf(
                         { $0.material.glassOn }, { $0.material.glassOn = $1 }))
+                        .lineLimit(1)
                     if obj.wrappedValue.material.glassOn {
                         sliderRow("Transmission", dbl({ $0.material.transmission },
                                                       { $0.material.transmission = $1 }), 0...1)
@@ -896,12 +963,14 @@ struct ObjectPropertiesView: View {
                                              { $0.material.ior = $1 }), 1.0...2.0, "%.2f")
                         ColorPicker("Tint", selection: colorOf(
                             { $0.material.tint }, { $0.material.tint = $1 }))
+                            .lineLimit(1)
                         Text("Matte frosts the glass: reflections blur and less light gets through cleanly.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
 
                 Toggle("Visible", isOn: boolOf({ $0.visible }, { $0.visible = $1 }))
+                    .lineLimit(1)
 
                 section("Area") {
                     Menu {
@@ -913,10 +982,12 @@ struct ObjectPropertiesView: View {
                         HStack {
                             Text(currentAreaName)
                                 .foregroundStyle(.primary)
+                                .lineLimit(1)
                             Spacer()
                             Image(systemName: "chevron.up.chevron.down")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: true, vertical: false)
                         }
                         .font(.callout)
                         .padding(.vertical, 4)
@@ -930,7 +1001,9 @@ struct ObjectPropertiesView: View {
                     session.deleteSelected()
                 } label: {
                     Label("Delete Object", systemImage: "trash")
+                        .lineLimit(1)
                 }
+                .fixedSize(horizontal: true, vertical: false)
             }
             .padding(14)
         }
@@ -950,6 +1023,8 @@ struct ObjectPropertiesView: View {
             Text(title.uppercased())
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
             content()
         }
     }
@@ -957,7 +1032,10 @@ struct ObjectPropertiesView: View {
     private func axisRow(_ label: String, _ value: Binding<Double>,
                          _ range: ClosedRange<Double>, _ format: String = "%.2f") -> some View {
         HStack(spacing: 8) {
-            Text(label).frame(width: 26, alignment: .leading)
+            Text(label)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: 26, alignment: .leading)
             Slider(value: value, in: range) { editing in
                 // Transform drags run the manipulation preview:
                 // a moved light/glass object renders cheap until
@@ -965,7 +1043,9 @@ struct ObjectPropertiesView: View {
                 session.transformDragChanged(editing, objectID: objectID)
             }
             Text(String(format: format, value.wrappedValue))
-                .frame(width: 46, alignment: .trailing)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: 54, alignment: .trailing)
                 .monospacedDigit()
         }
         .font(.callout)
@@ -977,8 +1057,13 @@ struct ObjectPropertiesView: View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text(label)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                 Spacer()
-                Text(String(format: format, value.wrappedValue)).monospacedDigit()
+                Text(String(format: format, value.wrappedValue))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
             }
             .font(.callout)
             Slider(value: value, in: range) { editing in
@@ -1111,6 +1196,8 @@ struct MultiSelectionPropertiesView: View {
             VStack(alignment: .leading, spacing: 14) {
                 Label("\(count) objects selected", systemImage: "checklist.checked")
                     .font(.headline)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                 Text(members.map(\.name).joined(separator: ", "))
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1124,17 +1211,23 @@ struct MultiSelectionPropertiesView: View {
                 } label: {
                     Label(anyVisible ? "Hide All" : "Show All",
                           systemImage: anyVisible ? "eye.slash" : "eye")
+                        .lineLimit(1)
                 }
+                .fixedSize(horizontal: true, vertical: false)
                 Button(role: .destructive) {
                     session.deleteMultiSelection()
                 } label: {
                     Label("Delete All \(count) Objects", systemImage: "trash")
+                        .lineLimit(1)
                 }
+                .fixedSize(horizontal: true, vertical: false)
                 Button {
                     session.clearMultiSelection()
                 } label: {
                     Label("Clear Selection", systemImage: "xmark.circle")
+                        .lineLimit(1)
                 }
+                .fixedSize(horizontal: true, vertical: false)
                 Divider()
                 Text("Name, position, rotation and material editing work on one object at a time. Turn Multi off (or tap a single object with Multi off) to edit those.")
                     .font(.callout)
@@ -1192,7 +1285,9 @@ struct AreaPropertiesView: View {
                         session.deleteArea(areaID)
                     } label: {
                         Label("Delete Area", systemImage: "trash")
+                            .lineLimit(1)
                     }
+                    .fixedSize(horizontal: true, vertical: false)
                 } else {
                     Text("This area no longer exists.")
                         .foregroundStyle(.secondary)
@@ -1209,6 +1304,8 @@ struct AreaPropertiesView: View {
             Text(title.uppercased())
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
             content()
         }
     }
@@ -1219,10 +1316,15 @@ struct AreaPropertiesView: View {
     private func axisRow(_ label: String, _ value: Binding<Double>,
                          _ range: ClosedRange<Double>) -> some View {
         HStack(spacing: 8) {
-            Text(label).frame(width: 26, alignment: .leading)
+            Text(label)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: 26, alignment: .leading)
             Slider(value: value, in: range)
             Text(String(format: "%.2f", value.wrappedValue))
-                .frame(width: 46, alignment: .trailing)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: 54, alignment: .trailing)
                 .monospacedDigit()
         }
         .font(.callout)

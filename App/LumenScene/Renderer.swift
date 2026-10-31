@@ -72,6 +72,28 @@ struct GPUUniforms {
     var dynTriCount: UInt32 = 0  // v4: dynamic-layer triangles (unified ids start at triCount)
     var hidePlayerHead: UInt32 = 0  // v4.5: Play-eye primary-ray head exclusion (was padDyn; layout unchanged)
     var freezeFrac: Float = 0  // v4.7: puddle freeze fraction 0...1 (tail field; mirrors Shaders.metal Uniforms)
+    var waterReflScale: Float = 1  // v4.8: water reflection resolution (tail; mirrors Uniforms)
+    var frameCounter: UInt32 = 0   // v4.8: rotating reflection pattern (tail; mirrors Uniforms)
+    var reflPad: UInt32 = 0
+}
+
+/// v4.8: parameters for the weather simulation kernels (mirrors
+/// SimParams in Shaders.metal byte-for-byte).
+struct SimParams {
+    var vx: UInt32 = 0
+    var vz: UInt32 = 0
+    var parity: UInt32 = 0
+    var kind: UInt32 = 0
+    var dt: Float = 0
+    var cell: Float = 0.2
+    var snowSink: Float = 0
+    var compactRate: Float = 0
+    var waterDry: Float = 0
+    var waterDrain: Float = 0
+    var freezeFrac: Float = 0
+    var snowBase: Float = 0
+    var waterBase: Float = 0
+    var pad: Float = 0
 }
 
 struct ReprojUniforms {
@@ -510,6 +532,66 @@ final class Renderer {
     /// v4.7: puddle freeze fraction 0...1, written every tick.
     var weatherFreeze: Float = 0
 
+    // MARK: - v4.8 weather simulation state
+    //
+    // Snow and water depths are PERSISTENT SIMULATION STATE in
+    // GPU buffers (one Float per lattice vertex), stepped by
+    // the sim kernels in Shaders.metal -- they are no longer
+    // re-derived from the closed-form height function at
+    // rebuilds. The closed form survives ONLY as (a) the
+    // per-vertex deposition ceiling + drift-rate field baked
+    // into simSnowCeil / simSnowRate at lattice build, and
+    // (b) the load-time initial condition of the depth buffers.
+    // The buffers are .storageModeShared, so the CPU skin in
+    // appendSnowSheet reads the same memory the GPU steps --
+    // and the plow recorder's edit transfers are applied by
+    // direct writes into that shared memory (see
+    // applySnowEdits), which is the legitimate shared-buffer
+    // mechanism; simApplyEditsKernel exists for the same
+    // operation when a caller already has a command buffer.
+    /// Reflection resolution for water (steering 1): 1.0 =
+    /// Full (v4.7 quality, the default), 0.5 = Half, 0.25 =
+    /// Quarter. Mirrors how qualityPreference is held (a
+    /// renderer-side setting chosen in the UI, not project
+    /// data); the session setter is setWaterReflectionScale.
+    var waterReflectionScale: Float = 1.0
+    /// Incremented once per presented frame; feeds the
+    /// rotating reflection-selection pattern in the trace
+    /// kernel so sub-full scales cycle coverage across frames.
+    private var reflFrameCounter: UInt32 = 0
+    private var simSourcePipeline: MTLComputePipelineState?
+    private var simFlowPipeline: MTLComputePipelineState?
+    private var simEditPipeline: MTLComputePipelineState?
+    private var simSnowBuf: MTLBuffer?
+    private var simWaterBuf: MTLBuffer?
+    private var simSupportBuf: MTLBuffer?
+    private var simSnowCeilBuf: MTLBuffer?
+    private var simSnowRateBuf: MTLBuffer?
+    private var simWaterCeilBuf: MTLBuffer?
+    private var simWaterRateBuf: MTLBuffer?
+    private var simHasBuf: MTLBuffer?
+    private var simPinnedBuf: MTLBuffer?
+    /// Lattice identity the sim buffers currently describe.
+    private var simOX: Float = 0, simOZ: Float = 0, simCS: Float = 0.2
+    private var simVX: Int = 0, simVZ: Int = 0
+    private var simSupportHash: Int = 0
+    private var simInitialised = false
+    /// Previous lattice snapshot for the object-move remap:
+    /// per-host support centroids let a moved object's patch
+    /// be sampled in its own frame (snow travels with it).
+    private var simPrevCentroids: [UUID: SIMD2<Float>] = [:]
+    /// Session-fed sim rates (written every frameTick).
+    var simSnowBaseRate: Float = 0   // m/s at drift factor 1 (effMode snow)
+    var simSnowSinkRate: Float = 0   // m/s uniform sink (temp melt / legacy)
+    var simCompactRate: Float = 0    // m/s toward a lowered ceiling
+    var simRaining: Bool = false     // effective rain this tick
+    var simWaterBase: Float = 0      // surge x rate scale for water fill
+    var simLastTick: CFTimeInterval = 0
+    var simStepsLastFrame: Int = 0
+    private var simLastSettleScan: CFTimeInterval = 0
+    /// True while depths are still changing enough to matter.
+    private(set) var simSettled = true
+
     /// Pack a displacement-layer cell coordinate into its
     /// dictionary key (mirrors supportKey's packing).
     static func snowPlowKey(_ gx: Int, _ gz: Int) -> Int64 {
@@ -622,6 +704,15 @@ final class Renderer {
         }
         if let fn = library.makeFunction(name: "weatherFieldKernel") {
             fieldPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "simSourceSinkKernel") {
+            simSourcePipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "simFlowKernel") {
+            simFlowPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "simApplyEditsKernel") {
+            simEditPipeline = try? device.makeComputePipelineState(function: fn)
         }
         if let vfn = library.makeFunction(name: "tonemapVertex"),
            let ffn = library.makeFunction(name: "tonemapFragment") {
@@ -2705,6 +2796,262 @@ final class Renderer {
     /// union, snow sheet + puddle water sheets, charged
     /// against the shared weather budget like the v3.4/v4.3
     /// subdivision was.
+
+    // MARK: - v4.8 simulation buffers
+
+    private func makeSimBuffer(_ values: [Float]) -> MTLBuffer? {
+        values.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress, raw.count > 0 else { return nil }
+            return device.makeBuffer(bytes: base, length: raw.count,
+                                     options: .storageModeShared)
+        }
+    }
+    private func makeSimBufferU32(_ values: [UInt32]) -> MTLBuffer? {
+        values.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress, raw.count > 0 else { return nil }
+            return device.makeBuffer(bytes: base, length: raw.count,
+                                     options: .storageModeShared)
+        }
+    }
+    private func simRead(_ buf: MTLBuffer?, count: Int) -> [Float] {
+        guard let buf, count > 0 else { return [] }
+        let ptr = buf.contents().bindMemory(to: Float.self, capacity: count)
+        return Array(UnsafeBufferPointer(start: ptr, count: count))
+    }
+    private func simWrite(_ buf: MTLBuffer?, _ values: [Float]) {
+        guard let buf else { return }
+        let ptr = buf.contents().bindMemory(to: Float.self, capacity: values.count)
+        for i in values.indices { ptr[i] = values[i] }
+    }
+
+    /// Bilinear sample of a previous lattice field at world XZ
+    /// (0 outside). Used by the object-move remap.
+    private func simSampleBilinear(_ field: [Float], ox: Float, oz: Float,
+                                   cs: Float, vx: Int, vz: Int,
+                                   x: Float, z: Float) -> Float? {
+        guard vx > 1, vz > 1, field.count == vx * vz else { return nil }
+        let fx = (x - ox) / cs, fz = (z - oz) / cs
+        guard fx >= 0, fz >= 0, fx <= Float(vx - 1), fz <= Float(vz - 1) else { return nil }
+        let ix = min(Int(fx), vx - 2), iz = min(Int(fz), vz - 2)
+        let tx = fx - Float(ix), tz = fz - Float(iz)
+        let a = field[iz * vx + ix], b = field[iz * vx + ix + 1]
+        let c = field[(iz + 1) * vx + ix], d = field[(iz + 1) * vx + ix + 1]
+        return (a * (1 - tx) + b * tx) * (1 - tz) + (c * (1 - tx) + d * tx) * tz
+    }
+
+    /// (Re)initialise the sim buffers for a lattice build.
+    /// `targetSnow` is the v4.7 surface (closed form + imprints
+    /// + plow layer) for this build -- the load-time initial
+    /// condition, so a freshly loaded project's first skin is
+    /// EXACTLY the v4.7 surface (the audit measures this diff).
+    /// On a lattice/support change, existing vertices are
+    /// REMAPPED: a vertex whose support host moved samples the
+    /// old field in the host's frame (its snow travels with
+    /// it); other vertices sample at their world position when
+    /// the old topmost host there matches, and otherwise fall
+    /// back to the closed-form equilibrium for the support now
+    /// beneath them (targetSnow). Patch mass is conserved to
+    /// bilinear-sampling accuracy (audit tolerance 5%).
+    private func simSyncLattice(ox: Float, oz: Float, cs: Float,
+                                vx: Int, vz: Int,
+                                supportY: [Float], hasSup: [Bool],
+                                hostIDs: [UUID?],
+                                snowCeil: [Float], driftFac: [Float],
+                                waterCeil: [Float], waterRate: [Float],
+                                targetSnow: [Float], targetWater: [Float],
+                                forceInit: Bool) {
+        let count = vx * vz
+        guard count > 0, simSourcePipeline != nil else { simInitialised = false; return }
+        // Support signature: quantised support heights + pattern.
+        var hash = 0
+        for i in 0..<count {
+            hash = hash &* 31 &+ (hasSup[i] ? Int(supportY[i] * 200) &+ 7 : -13)
+        }
+        // Per-host centroids of the new lattice.
+        var centroids: [UUID: SIMD2<Float>] = [:]
+        var ccnt: [UUID: Int] = [:]
+        for i in 0..<count where hasSup[i] {
+            guard let h = hostIDs[i] else { continue }
+            let x = ox + Float(i % vx) * cs, z = oz + Float(i / vx) * cs
+            centroids[h, default: SIMD2<Float>(0, 0)] += SIMD2<Float>(x, z)
+            ccnt[h, default: 0] += 1
+        }
+        for (h, c) in Array(centroids) { centroids[h] = c / Float(ccnt[h] ?? 1) }
+        let latticeSame = simInitialised && !forceInit
+            && simVX == vx && simVZ == vz && simOX == ox && simOZ == oz
+            && simCS == cs && simSupportHash == hash
+        if latticeSame {
+            // Same lattice: refresh only the static field buffers
+            // (ceilings move with exposure / max depth).
+            simWrite(simSnowCeilBuf, snowCeil)
+            simWrite(simSnowRateBuf, driftFac)
+            simWrite(simWaterCeilBuf, waterCeil)
+            simWrite(simWaterRateBuf, waterRate)
+            simPrevCentroids = centroids
+            return
+        }
+        var snow = targetSnow
+        var water = targetWater
+        if simInitialised, let oldSnowBuf = simSnowBuf, let oldWaterBuf = simWaterBuf,
+           simVX > 0, simVZ > 0 {
+            let oldSnow = simRead(oldSnowBuf, count: simVX * simVZ)
+            let oldWater = simRead(oldWaterBuf, count: simVX * simVZ)
+            let oldOX = simOX, oldOZ = simOZ, oldCS = simCS
+            let oldVX = simVX, oldVZ = simVZ
+            for i in 0..<count where hasSup[i] {
+                let x = ox + Float(i % vx) * cs, z = oz + Float(i / vx) * cs
+                var dx: Float = 0, dz: Float = 0
+                if let h = hostIDs[i], let nc = centroids[h], let oc = simPrevCentroids[h] {
+                    dx = nc.x - oc.x; dz = nc.y - oc.y
+                    if abs(dx) < 0.001 && abs(dz) < 0.001 { dx = 0; dz = 0 }
+                }
+                if let v = simSampleBilinear(oldSnow, ox: oldOX, oz: oldOZ, cs: oldCS,
+                                             vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
+                    snow[i] = v
+                }
+                if let v = simSampleBilinear(oldWater, ox: oldOX, oz: oldOZ, cs: oldCS,
+                                             vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
+                    water[i] = v
+                }
+            }
+        }
+        simSnowBuf = makeSimBuffer(snow)
+        simWaterBuf = makeSimBuffer(water)
+        simSupportBuf = makeSimBuffer(supportY)
+        simSnowCeilBuf = makeSimBuffer(snowCeil)
+        simSnowRateBuf = makeSimBuffer(driftFac)
+        simWaterCeilBuf = makeSimBuffer(waterCeil)
+        simWaterRateBuf = makeSimBuffer(waterRate)
+        simHasBuf = makeSimBufferU32(hasSup.map { $0 ? 1 : 0 })
+        if simPinnedBuf == nil || (simPinnedBuf?.length ?? 0) != count * 4 {
+            simPinnedBuf = makeSimBufferU32([UInt32](repeating: 0, count: count))
+        }
+        simOX = ox; simOZ = oz; simCS = cs; simVX = vx; simVZ = vz
+        simSupportHash = hash
+        simPrevCentroids = centroids
+        simInitialised = simSnowBuf != nil && simWaterBuf != nil
+        simSettled = false
+    }
+
+    /// Apply recorder edit transfers (vertex delta pairs) to
+    /// the snow state by direct shared-buffer writes, and
+    /// return the resulting depths for the skin.
+    private func simCurrentSnow() -> [Float] {
+        simRead(simSnowBuf, count: simVX * simVZ)
+    }
+    private func simCurrentWater() -> [Float] {
+        simRead(simWaterBuf, count: simVX * simVZ)
+    }
+
+    /// Drop all sim state (Clear build-up / Re-roll): the next
+    /// sheet build re-initialises from the then-current target.
+    func resetWeatherSim() {
+        simInitialised = false
+        simSettled = true
+        simLastTick = 0
+    }
+
+    /// Step the simulation from the render loop. Fixed substeps
+    /// of 1/30 s, at most 4 per frame (excess time is dropped,
+    /// never spiralled); 1 source/sink dispatch + 3 flow passes
+    /// (each = red + black, snow + water) per substep. Skipped
+    /// entirely when nothing can change: no weather input, no
+    /// sink, and the flow settle scan (every 0.5 s, CPU scan of
+    /// the shared buffers) reports max slope excess < 0.5 mm.
+    func tickWeatherSim(now: CFTimeInterval) {
+        guard simInitialised, let src = simSourcePipeline, let flow = simFlowPipeline,
+              let snowB = simSnowBuf, let waterB = simWaterBuf,
+              let supB = simSupportBuf, let ceilB = simSnowCeilBuf,
+              let rateB = simSnowRateBuf, let wCeilB = simWaterCeilBuf,
+              let wRateB = simWaterRateBuf, let hasB = simHasBuf,
+              let pinB = simPinnedBuf else { return }
+        if simLastTick == 0 { simLastTick = now; return }
+        let rawDt = now - simLastTick
+        simLastTick = now
+        guard rawDt > 0 else { return }
+        let inputsActive = simSnowBaseRate > 0 || simSnowSinkRate > 0
+            || simRaining || weatherFreeze > 0.001
+        if !inputsActive && simSettled { simStepsLastFrame = 0; return }
+        // Settle scan at most twice a second while inactive.
+        if !inputsActive, now - simLastSettleScan >= 0.5 {
+            simLastSettleScan = now
+            let count = simVX * simVZ
+            let snow = simRead(snowB, count: count)
+            let sup = simRead(supB, count: count)
+            let maxStep = 0.7536 * simCS
+            var worst: Float = 0
+            for j in 0..<simVZ {
+                for i in 0..<simVX {
+                    let a = j * simVX + i
+                    if snow[a] <= 0 { continue }
+                    if i + 1 < simVX {
+                        let d = abs((sup[a] + snow[a]) - (sup[a + 1] + snow[a + 1]))
+                        if sup[a + 1] != 0 || snow[a + 1] > 0 { worst = max(worst, d - maxStep) }
+                    }
+                    if j + 1 < simVZ {
+                        let b = a + simVX
+                        let d = abs((sup[a] + snow[a]) - (sup[b] + snow[b]))
+                        worst = max(worst, d - maxStep)
+                    }
+                }
+            }
+            if worst < 0.0005 { simSettled = true; simStepsLastFrame = 0; return }
+        }
+        let sub = 1.0 / 30.0
+        let steps = min(4, max(1, Int((rawDt / sub).rounded())))
+        simStepsLastFrame = steps
+        guard let cmd = queue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else { return }
+        var params = SimParams()
+        params.vx = UInt32(simVX); params.vz = UInt32(simVZ)
+        params.cell = simCS
+        params.snowSink = simSnowSinkRate
+        params.compactRate = simCompactRate
+        // ~10 min dry: a full 13.5 mm pool dries in ~600 s.
+        params.waterDry = simRaining ? 0 : Float(0.0135 / 600.0)
+        params.waterDrain = Float(0.0135 / 60.0)
+        params.freezeFrac = weatherFreeze
+        params.snowBase = simSnowBaseRate
+        params.waterBase = simRaining ? simWaterBase : 0
+        let threads = MTLSize(width: simVX * simVZ, height: 1, depth: 1)
+        func bindSim(_ e: MTLComputeCommandEncoder) {
+            e.setBuffer(snowB, offset: 0, index: 0)
+            e.setBuffer(waterB, offset: 0, index: 1)
+            e.setBuffer(supB, offset: 0, index: 2)
+            e.setBuffer(ceilB, offset: 0, index: 3)
+            e.setBuffer(rateB, offset: 0, index: 4)
+            e.setBuffer(wCeilB, offset: 0, index: 5)
+            e.setBuffer(wRateB, offset: 0, index: 6)
+            e.setBuffer(hasB, offset: 0, index: 7)
+            e.setBuffer(pinB, offset: 0, index: 9)
+        }
+        for _ in 0..<steps {
+            params.dt = Float(sub)
+            params.parity = 0; params.kind = 0
+            enc.setComputePipelineState(src)
+            bindSim(enc)
+            enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 8)
+            let w = src.threadExecutionWidth
+            enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+            for _ in 0..<3 {
+                for kind in [UInt32(0), UInt32(1)] {
+                    for parity in [UInt32(0), UInt32(1)] {
+                        params.kind = kind; params.parity = parity
+                        enc.setComputePipelineState(flow)
+                        bindSim(enc)
+                        enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 8)
+                        let wf = flow.threadExecutionWidth
+                        enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: wf, height: 1, depth: 1))
+                        enc.memoryBarrier(scope: .buffers)
+                    }
+                }
+            }
+        }
+        enc.endEncoding()
+        cmd.commit()
+    }
+
     private func appendSnowSheet(
         included: [(obj: SceneObject, local: MeshData, world: MeshData)],
         intruders: [SnowIntruder],
@@ -2753,6 +3100,7 @@ final class Renderer {
             var shade: Float = 1
             var mask: Float = 0
             var depth01: Float = 0
+            var waterD: Float = 0 // v4.8: simulated water depth (m)
             var snowCover: Float = 0
         }
         var verts = [SheetVert](repeating: SheetVert(), count: vx * vz)
@@ -2896,6 +3244,81 @@ final class Renderer {
             }
             prevPlowIntruders = snap
         }
+        // (c2a) v4.8: SIMULATION SYNC. The columns above are
+        // the v4.7 TARGET surface (closed form + imprints +
+        // plow layer). The sim buffers are initialised from it
+        // (load-time initial condition), remapped across
+        // lattice/support changes (moved hosts carry their
+        // patch), and afterwards the skin reads the SIM state:
+        // only vertices where the target differs from the pure
+        // closed-form ceiling -- i.e. where an intruder, a
+        // footprint, or the plow layer is actively shaping the
+        // snow -- receive an edit transfer (target written into
+        // the shared snow buffer). Everywhere else the GPU
+        // simulation's own evolution (deposition, repose,
+        // rounding, melt) is what renders. The CPU relaxation
+        // in (c2) is skipped while the sim is live: the GPU
+        // flow kernel owns repose now.
+        var v48SimActive = false
+        do {
+            let n = vx * vz
+            var supY = [Float](repeating: 0, count: n)
+            var hasS = [Bool](repeating: false, count: n)
+            var hosts = [UUID?](repeating: nil, count: n)
+            var ceilA = [Float](repeating: 0, count: n)
+            var driftA = [Float](repeating: 0, count: n)
+            var wCeil = [Float](repeating: 0, count: n)
+            var wRate = [Float](repeating: 0, count: n)
+            var tSnow = [Float](repeating: 0, count: n)
+            var tWater = [Float](repeating: 0, count: n)
+            for idx in verts.indices {
+                guard let sup = verts[idx].support else { continue }
+                let x = vX(idx % vx), z = vZ(idx / vx)
+                hasS[idx] = true
+                supY[idx] = sup.y
+                hosts[idx] = sup.hostID
+                let taper = wgfSmooth(0.55, 0.75, sup.interpNY)
+                ceilA[idx] = wgfSnowHeight(x, z, amount: sup.amount) * taper
+                driftA[idx] = (0.3 + 1.4 * wgfDrift(x, z)) / 1.0
+                let v = verts[idx]
+                if v.mask > 0.02 {
+                    wCeil[idx] = (0.0035 + 0.0095 * v.depth01)
+                        * wgfSmooth(0.15, 0.6, v.mask) * (1 - v.snowCover)
+                }
+                wRate[idx] = 1.0 / 75.0
+                tSnow[idx] = v.snowH
+                tWater[idx] = wCeil[idx] * min(1, wet * 1.2)
+            }
+            simSyncLattice(ox: ox, oz: oz, cs: cs, vx: vx, vz: vz,
+                           supportY: supY, hasSup: hasS, hostIDs: hosts,
+                           snowCeil: ceilA, driftFac: driftA,
+                           waterCeil: wCeil, waterRate: wRate,
+                           targetSnow: tSnow, targetWater: tWater,
+                           forceInit: false)
+            if simInitialised {
+                v48SimActive = true
+                var snow = simCurrentSnow()
+                if snow.count == n {
+                    var edited = false
+                    for idx in verts.indices where hasS[idx] {
+                        // Edit transfer: only where intruders /
+                        // footprints / plow shape the column
+                        // (target != pure ceiling).
+                        if abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
+                            snow[idx] = tSnow[idx]
+                            edited = true
+                        }
+                    }
+                    if edited { simWrite(simSnowBuf, snow) }
+                    let water = simCurrentWater()
+                    for idx in verts.indices where hasS[idx] {
+                        verts[idx].snowH = snow[idx]
+                        verts[idx].topY = supY[idx] + snow[idx]
+                        if water.count == n { verts[idx].waterD = water[idx] }
+                    }
+                }
+            }
+        }
         // (c2) v4.5: PINNED columns + REPOSE RELAXATION.
         //
         // A column is PINNED when a contacting intruder's
@@ -2987,8 +3410,15 @@ final class Renderer {
                     if layerDelta[idx] <= -0.10 { pinned[idx] = true }
                 }
             }
+            // v4.8: the flow kernel reads the same pinning.
+            if let pinB = simPinnedBuf, pinned.count * 4 == (pinB.length) {
+                let ptr = pinB.contents().bindMemory(to: UInt32.self, capacity: pinned.count)
+                for i in pinned.indices { ptr[i] = pinned[i] ? 1 : 0 }
+            }
             let maxStep = Float(0.7536) * cs // tan(37°) × cell
-            for _ in 0..<48 {
+            // v4.8: skipped while the GPU sim is live (its flow
+            // kernel owns repose + rounding between rebuilds).
+            for _ in 0..<(v48SimActive ? 0 : 48) {
                 var worst: Float = 0
                 for j in 0..<vz {
                     for i in 0..<vx {
@@ -3017,9 +3447,11 @@ final class Renderer {
                 }
                 if worst < 0.0005 { break }
             }
-            for idx in verts.indices {
-                if let s = verts[idx].support {
-                    verts[idx].snowH = max(0, verts[idx].topY - s.y)
+            if !v48SimActive {
+                for idx in verts.indices {
+                    if let s = verts[idx].support {
+                        verts[idx].snowH = max(0, verts[idx].topY - s.y)
+                    }
                 }
             }
             // v4.6 NOTE — no slump write-back, deliberately.
@@ -3080,7 +3512,10 @@ final class Renderer {
                 if wet > 0.001, sup.count == 4 {
                     let mC = corners.reduce(Float(0)) { $0 + verts[$1].mask } / 4
                     let sC = corners.reduce(Float(0)) { $0 + verts[$1].snowCover } / 4
-                    if mC * (1 - sC) > 0.5 {
+                    // v4.8: simulated water forms the sheet too
+                    // (mean depth past the 1.2 mm rim threshold).
+                    let wC = corners.reduce(Float(0)) { $0 + verts[$1].waterD } / 4
+                    if mC * (1 - sC) > 0.5 || (wC > 0.0012 && sC < 0.9) {
                         sheetCells[j * nx + i] = true
                         anySheet = true
                     }
@@ -3264,8 +3699,19 @@ final class Renderer {
                     let base = UInt32(positions.count / 3)
                     for g in ring {
                         let v = verts[g]
-                        let off: Float = v.mask < 0.45 ? -0.0025
-                            : 0.0035 + 0.0095 * v.depth01
+                        // v4.8: the sheet rides the SIMULATED
+                        // depth: verts below the 1.2 mm coverage
+                        // threshold tuck under the support (the
+                        // smooth rim -- coverage fades across
+                        // ~2-4 mm of depth at the perimeter, so
+                        // outlines read as blobs, not steps);
+                        // deeper verts sit at their levelled
+                        // depth, so the surface is near-flat by
+                        // construction of the levelling flow.
+                        let off: Float = v48SimActive
+                            ? (v.waterD > 0.0012 ? v.waterD * 0.9 : -0.0025)
+                            : (v.mask < 0.45 ? -0.0025
+                               : 0.0035 + 0.0095 * v.depth01)
                         positions.append(contentsOf: [vX(g % vx), v.topY + off, vZ(g / vx)])
                         normals.append(contentsOf: [0, 1, 0])
                         uvs.append(contentsOf: [0, 0])
@@ -3993,6 +4439,8 @@ final class Renderer {
         // kernels through the one uniforms() both consume.
         u.hidePlayerHead = hidePlayerHead ? 1 : 0
         u.freezeFrac = weatherFreeze
+        u.waterReflScale = waterReflectionScale
+        u.frameCounter = reflFrameCounter
         return u
     }
 
@@ -4256,6 +4704,10 @@ final class Renderer {
     @discardableResult
     func draw(view: MTKView, camera: CameraBasis, moving: Bool, play: Bool) -> Bool {
         flushDynamic()
+        // v4.8: step the weather simulation (GPU compute) and
+        // advance the water-reflection selection pattern.
+        reflFrameCounter &+= 1
+        tickWeatherSim(now: CACurrentMediaTime())
         // v4.2: the v4.1 framesSinceMove denoise bookkeeping is
         // gone — the pass now keys off this frame having traced
         // (see the display-source selection below) and the

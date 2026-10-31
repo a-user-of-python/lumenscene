@@ -1649,6 +1649,25 @@ final class EditorSession: ObservableObject {
         kickRender()
     }
 
+    /// v4.8 (steering 1): water reflection resolution. Held
+    /// on the renderer exactly like the quality preference
+    /// (renderMode) is -- a renderer-side setting chosen in
+    /// the UI, not project data. Steps: 1.0 Full (default,
+    /// v4.7 quality), 0.5 Half, 0.25 Quarter; the setter
+    /// snaps to the nearest step. UI PLACEMENT for the
+    /// coordinator: a "Water reflections" picker with
+    /// Full / Half / Quarter segments in the Render settings
+    /// surface, beside the existing Quality picker that binds
+    /// renderer.qualityPreference (EditorView ~line 140).
+    var waterReflectionScale: Double { Double(renderer.waterReflectionScale) }
+    func setWaterReflectionScale(_ scale: Double) {
+        let steps: [Double] = [1.0, 0.5, 0.25]
+        let snapped = steps.min(by: { abs($0 - scale) < abs($1 - scale) }) ?? 1.0
+        renderer.waterReflectionScale = Float(snapped)
+        renderer.resetAccumulation()
+        kickRender()
+    }
+
     /// v4.7: live temperature accessors for the UI.
     var liveTemperature: Double? { project.scene.weather.temperature }
     var liveFreeze: Double { buildupFreeze }
@@ -1685,6 +1704,7 @@ final class EditorSession: ObservableObject {
         let seed = UInt32.random(in: 1...UInt32.max)
         project.scene.weather.seed = seed
         renderer.weatherSeed = seed
+        renderer.resetWeatherSim()
         renderer.snowPlow = [:]
         project.scene.weather.plowCells = nil
         renderer.rebuild(scene: project.scene, meshes: meshes)
@@ -1713,6 +1733,7 @@ final class EditorSession: ObservableObject {
         // no snow, no trails.
         renderer.snowPlow = [:]
         project.scene.weather.plowCells = nil
+        renderer.resetWeatherSim()
         renderer.objectSnowAmounts = snowExposureA
         // v3.4: the solid weather geometry goes too — a full
         // rebuild at zero levels removes sheets + displacement.
@@ -2035,6 +2056,37 @@ final class EditorSession: ObservableObject {
             } else if dA < 0 {
                 clampExposuresToAmbient()
             }
+        }
+        // v4.8: feed the GPU simulation its rates (same v4.7
+        // numbers the accumulators above use). Base snow rate is
+        // m/s at drift factor 1; the sink is the temperature
+        // melt when set, else the legacy rain-melt / thaw terms
+        // (suppressed exactly where frameTick suppresses them).
+        do {
+            let stored = project.scene.weather.mode
+            let temp = project.scene.weather.temperature
+            var eff = stored
+            if let t = temp {
+                if t <= 0 && stored == 1 { eff = 2 }
+                if t > 0 && stored == 2 { eff = 1 }
+            }
+            let depth = snowMaxDepth > 0 ? snowMaxDepth : 0.3
+            renderer.simSnowBaseRate = eff == 2
+                ? Float((depth / 100) * weatherRateScale * dynIntensity) : 0
+            if let t = temp, t > 0 {
+                renderer.simSnowSinkRate = Float((depth / 900) * (t / 2.5) * weatherRateScale)
+            } else if temp == nil && eff == 1 {
+                renderer.simSnowSinkRate = Float(depth * weatherRateScale / 300
+                                                 * (0.6 + 0.4 * dynIntensity))
+            } else if temp == nil && eff == 0 {
+                renderer.simSnowSinkRate = Float((depth / 900) * weatherRateScale)
+            } else {
+                renderer.simSnowSinkRate = 0
+            }
+            renderer.simCompactRate = eff == 2
+                ? Float((depth / 900) * 0.5 * weatherRateScale) : 0
+            renderer.simRaining = eff == 1
+            renderer.simWaterBase = Float(dynIntensity * weatherRateScale)
         }
         // v4.7: renderer sees the EFFECTIVE mode (phase layer
         // recomputed here for the every-frame writes; when
