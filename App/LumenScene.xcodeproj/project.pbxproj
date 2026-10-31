@@ -22,6 +22,9 @@
 		F7412A7B3A25A790A38D988D = {isa = PBXBuildFile; fileRef = B576055B9D4E9035A4AFF13C; };
 		851C8F29C73114171B96FB17 = {isa = PBXBuildFile; fileRef = 17CD06A31553B02130CC0006; };
 		DE57C0DE00000000000000B2 = {isa = PBXBuildFile; fileRef = DE57C0DE00000000000000A1; };
+		DE57C0DE00000000000000B3 = {isa = PBXBuildFile; fileRef = DE57C0DE00000000000000A3; };
+		DE57C0DE00000000000000B4 = {isa = PBXBuildFile; fileRef = DE57C0DE00000000000000A4; };
+		DE57C0DE00000000000000B5 = {isa = PBXBuildFile; fileRef = DE57C0DE00000000000000A5; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -39,6 +42,9 @@
 		9F9EB49438D3A1D64AEE6FA7 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Viewport.swift; sourceTree = "<group>"; };
 		B576055B9D4E9035A4AFF13C = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Shaders.metal; sourceTree = "<group>"; };
 		DE57C0DE00000000000000A1 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextureDesigner.swift; sourceTree = "<group>"; };
+		DE57C0DE00000000000000A3 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameNodes.swift; sourceTree = "<group>"; };
+		DE57C0DE00000000000000A4 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameRuntime.swift; sourceTree = "<group>"; };
+		DE57C0DE00000000000000A5 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeEditorView.swift; sourceTree = "<group>"; };
 		35F7358B8C0EA9A13451AFD1 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LumenScene.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A7E6938D864437149217D339 = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		17CD06A31553B02130CC0006 = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -89,6 +95,9 @@
 				9F9EB49438D3A1D64AEE6FA7,
 				B576055B9D4E9035A4AFF13C,
 				DE57C0DE00000000000000A1,
+				DE57C0DE00000000000000A3,
+				DE57C0DE00000000000000A4,
+				DE57C0DE00000000000000A5,
 				A7E6938D864437149217D339,
 			);
 			path = LumenScene;
@@ -176,6 +185,9 @@
 				CBDA1F03B17C013A9FF9ED34,
 				F7412A7B3A25A790A38D988D,
 				DE57C0DE00000000000000B2,
+				DE57C0DE00000000000000B3,
+				DE57C0DE00000000000000B4,
+				DE57C0DE00000000000000B5,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

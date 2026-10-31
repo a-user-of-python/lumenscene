@@ -136,6 +136,10 @@ struct SceneObject: Codable, Equatable, Identifiable {
     var visible: Bool = true
     var transform: Transform3 = Transform3()
     var material: MaterialProps = MaterialProps()
+    /// The trigger area this object belongs to, if any (v4). Objects
+    /// with an area are loaded/unloaded with it by the node graph;
+    /// nil means the object is always present.
+    var areaID: UUID? = nil
 
     static func primitive(_ kind: String, name: String) -> SceneObject {
         var o = SceneObject(name: name, source: "primitive", primitiveKind: kind)
@@ -147,6 +151,37 @@ struct SceneObject: Codable, Equatable, Identifiable {
         default: o.params = [:]
         }
         return o
+    }
+}
+
+extension SceneObject {
+    private enum CodingKeys: String, CodingKey {
+        case id, name, source, primitiveKind, params, meshFile, assetFile
+        case visible, transform, material, areaID
+    }
+
+    // Custom Decodable for backward compatibility: SceneObject used
+    // to rely on the synthesised conformance, which throws on any
+    // missing key — so a v1–v3 project.json (no `areaID`, and possibly
+    // missing any field added since) would fail to load at all. Every
+    // field is therefore decoded with decodeIfPresent and falls back
+    // to exactly the property default above. `name` and `source` had
+    // no property defaults (they were required at construction), so a
+    // missing key falls back to "Object" / "primitive". encode(to:)
+    // stays synthesised — see the note on MaterialProps above.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Object"
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? "primitive"
+        primitiveKind = try c.decodeIfPresent(String.self, forKey: .primitiveKind) ?? "box"
+        params = try c.decodeIfPresent([String: Double].self, forKey: .params) ?? [:]
+        meshFile = try c.decodeIfPresent(String.self, forKey: .meshFile) ?? nil
+        assetFile = try c.decodeIfPresent(String.self, forKey: .assetFile) ?? nil
+        visible = try c.decodeIfPresent(Bool.self, forKey: .visible) ?? true
+        transform = try c.decodeIfPresent(Transform3.self, forKey: .transform) ?? Transform3()
+        material = try c.decodeIfPresent(MaterialProps.self, forKey: .material) ?? MaterialProps()
+        areaID = try c.decodeIfPresent(UUID.self, forKey: .areaID) ?? nil
     }
 }
 
@@ -203,30 +238,62 @@ struct WeatherState: Codable, Equatable {
     var snow: Double = 0
 }
 
+// MARK: - Trigger areas
+
+/// A named box region of the scene (v4). The node graph watches the
+/// player entering/leaving areas (see GameNodes.swift), and objects
+/// whose `areaID` matches can be loaded and unloaded as a group.
+/// `center` and `size` are in metres; `size` is the full extent on
+/// each axis, so the box reaches centre ± size/2.
+struct TriggerArea: Codable, Equatable, Identifiable {
+    var id: UUID = UUID()
+    var name: String = "Area"
+    var center: [Double] = [0, 1.5, 0]   // metres
+    var size: [Double] = [4, 3, 4]       // full extents
+
+    /// True when `p` is inside the box (edges included):
+    /// |p − centre| ≤ size/2 on every axis.
+    func contains(_ p: SIMD3<Float>) -> Bool {
+        guard center.count >= 3, size.count >= 3 else { return false }
+        let c = SIMD3<Float>(Float(center[0]), Float(center[1]), Float(center[2]))
+        let half = SIMD3<Float>(Float(size[0]), Float(size[1]), Float(size[2])) * 0.5
+        let d = simd_abs(p - c)
+        return d.x <= half.x && d.y <= half.y && d.z <= half.z
+    }
+}
+
 // MARK: - Scene & project
 
 struct Scene: Codable, Equatable {
     var objects: [SceneObject] = []
     var camera: CameraState = CameraState()
     var weather: WeatherState = WeatherState()
+    /// Trigger areas (v4); see TriggerArea above.
+    var areas: [TriggerArea] = []
+    /// The Play-mode logic graph (v4); see GameNodes.swift.
+    var graph: NodeGraph = NodeGraph()
 
     func object(id: UUID) -> SceneObject? { objects.first { $0.id == id } }
+    func area(id: UUID) -> TriggerArea? { areas.first { $0.id == id } }
 }
 
 extension Scene {
     private enum CodingKeys: String, CodingKey {
-        case objects, camera, weather
+        case objects, camera, weather, areas, graph
     }
 
     // Custom Decodable for backward compatibility: v1/v2 project.json
-    // files have no `weather` key. Every field falls back to exactly
-    // the property default above. encode(to:) stays synthesised (see
-    // the note on MaterialProps above).
+    // files have no `weather` key, and pre-v4 files have no `areas`
+    // or `graph` keys. Every field falls back to exactly the property
+    // default above. encode(to:) stays synthesised (see the note on
+    // MaterialProps above).
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         objects = try c.decodeIfPresent([SceneObject].self, forKey: .objects) ?? []
         camera = try c.decodeIfPresent(CameraState.self, forKey: .camera) ?? CameraState()
         weather = try c.decodeIfPresent(WeatherState.self, forKey: .weather) ?? WeatherState()
+        areas = try c.decodeIfPresent([TriggerArea].self, forKey: .areas) ?? []
+        graph = try c.decodeIfPresent(NodeGraph.self, forKey: .graph) ?? NodeGraph()
     }
 }
 

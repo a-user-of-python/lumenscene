@@ -29,6 +29,7 @@ struct EditorView: View {
     var onClose: () -> Void
 
     @State private var showImport = false
+    @State private var showNodes = false
     @State private var shareItem: ShareItem?
     @FocusState private var fieldFocus: FieldFocus?
     @FocusState private var kbFocused: Bool
@@ -57,6 +58,7 @@ struct EditorView: View {
         }
         .onKeyPress(phases: .all) { press in handleKey(press) }
         .sheet(isPresented: $showImport) { importSheet }
+        .sheet(isPresented: $showNodes) { NodeEditorView(session: session) }
         .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
     }
 
@@ -105,6 +107,24 @@ struct EditorView: View {
             JoystickView(session: session)
                 .padding(.leading, 22)
                 .padding(.bottom, 26)
+        }
+        // v4.0: the runtime's message banner — display-only and
+        // transient; the pause button and joystick remain the only
+        // Play controls.
+        .overlay(alignment: .top) {
+            if !session.playBanner.isEmpty {
+                Text(session.playBanner)
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 10)
+                    .background(Color.black.opacity(0.55))
+                    .clipShape(Capsule())
+                    .overlay(Capsule().stroke(Color.white.opacity(0.25), lineWidth: 1))
+                    .padding(.top, 16)
+                    .allowsHitTesting(false)
+            }
         }
     }
 
@@ -171,6 +191,10 @@ struct EditorView: View {
             }
             .buttonStyle(.borderedProminent)
             .help("Play: walk around the scene. Pause: back to editing.")
+            Button { showNodes = true } label: {
+                Label("Nodes", systemImage: "point.3.connected.trianglepath.dotted")
+            }
+            .help("Node editor: logic that runs in Play.")
             Menu {
                 Picker("Weather", selection: weatherBinding) {
                     Text("Off").tag(0)
@@ -226,6 +250,8 @@ struct EditorView: View {
                     Button("Cylinder") { session.addPrimitive("cylinder") }
                     Button("Plane") { session.addPrimitive("plane") }
                     Divider()
+                    Button("Trigger Area") { session.addArea() }
+                    Divider()
                     Button("Import Model…") { showImport = true }
                 } label: {
                     Label("Add", systemImage: "plus")
@@ -251,6 +277,53 @@ struct EditorView: View {
                 }
             }
             .listStyle(.plain)
+            Divider()
+            HStack {
+                Text("Areas").font(.headline)
+                Spacer()
+                Button { session.addArea() } label: {
+                    Image(systemName: "plus")
+                }
+                .help("Add a trigger area")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            if session.project.scene.areas.isEmpty {
+                Text("No trigger areas. Areas group objects for node logic and streaming.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                ScrollView {
+                    VStack(spacing: 2) {
+                        ForEach(session.project.scene.areas, id: \.id) { area in
+                            HStack(spacing: 8) {
+                                Image(systemName: "cube.transparent")
+                                    .foregroundStyle(.secondary)
+                                Text(area.name).lineLimit(1)
+                                Spacer()
+                                Text("\(session.project.scene.objects.filter { $0.areaID == area.id }.count)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(session.selectedArea == area.id
+                                        ? Color.accentColor.opacity(0.25) : Color.clear)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                session.selectedArea = area.id
+                                session.selection = nil
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 4)
+                }
+                .frame(maxHeight: 132)
+            }
             Text("Tap an object in the view to select it.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -306,7 +379,10 @@ struct EditorView: View {
 
     @ViewBuilder
     private var propertiesPanel: some View {
-        if let obj = session.selectedObject {
+        if let areaID = session.selectedArea,
+           session.project.scene.areas.contains(where: { $0.id == areaID }) {
+            AreaPropertiesView(session: session, areaID: areaID)
+        } else if let obj = session.selectedObject {
             ObjectPropertiesView(session: session, objectID: obj.id,
                                  fieldFocus: $fieldFocus)
         } else {
@@ -602,6 +678,28 @@ struct ObjectPropertiesView: View {
 
                 Toggle("Visible", isOn: boolOf({ $0.visible }, { $0.visible = $1 }))
 
+                section("Area") {
+                    Menu {
+                        Button("None") { setObjectArea(nil) }
+                        ForEach(session.project.scene.areas, id: \.id) { area in
+                            Button(area.name) { setObjectArea(area.id) }
+                        }
+                    } label: {
+                        HStack {
+                            Text(currentAreaName)
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.callout)
+                        .padding(.vertical, 4)
+                    }
+                    Text("Areas group objects for node triggers and streaming in Play.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
                 Button(role: .destructive) {
                     session.selection = objectID
                     session.deleteSelected()
@@ -739,6 +837,18 @@ struct ObjectPropertiesView: View {
             })
     }
 
+    private var currentAreaName: String {
+        guard let areaID = obj.wrappedValue.areaID else { return "None" }
+        return session.project.scene.areas.first { $0.id == areaID }?.name ?? "None"
+    }
+
+    private func setObjectArea(_ areaID: UUID?) {
+        session.beginEdit()
+        var o = obj.wrappedValue
+        o.areaID = areaID
+        obj.wrappedValue = o
+    }
+
     private var presetBinding: Binding<String> {
         Binding(get: { obj.wrappedValue.material.texturePreset },
                 set: { v in
@@ -748,6 +858,115 @@ struct ObjectPropertiesView: View {
                     o.material.textureFit = TextureGen.isRoad(v)
                     obj.wrappedValue = o
                 })
+    }
+}
+
+// MARK: - Properties panel for one trigger area
+
+/// Area editor shown in the properties panel while an area is
+/// selected: name, centre and size, member count, delete. Areas
+/// are not undoable (session precedent), so edits write straight
+/// through session.updateArea — no beginEdit().
+struct AreaPropertiesView: View {
+    @ObservedObject var session: EditorSession
+    let areaID: UUID
+
+    private var area: TriggerArea? {
+        session.project.scene.areas.first { $0.id == areaID }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if let area {
+                    TextField("Name", text: nameBinding(area))
+                        .textFieldStyle(.roundedBorder)
+
+                    section("Centre") {
+                        axisRow("X", comp(area, \.center, 0), -40...40)
+                        axisRow("Y", comp(area, \.center, 1), -10...40)
+                        axisRow("Z", comp(area, \.center, 2), -40...40)
+                    }
+                    section("Size") {
+                        axisRow("X", comp(area, \.size, 0), 0.2...40)
+                        axisRow("Y", comp(area, \.size, 1), 0.2...40)
+                        axisRow("Z", comp(area, \.size, 2), 0.2...40)
+                    }
+
+                    let members = session.project.scene.objects.filter { $0.areaID == areaID }
+                    section("Members") {
+                        if members.isEmpty {
+                            Text("No objects yet. Assign objects from their properties panel (Area picker).")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            ForEach(members) { member in
+                                Text(member.name).font(.callout).lineLimit(1)
+                            }
+                        }
+                    }
+
+                    Text("The box is drawn in the viewport while editing. Node triggers fire when the player is inside it.")
+                        .font(.caption).foregroundStyle(.secondary)
+
+                    Button(role: .destructive) {
+                        session.deleteArea(areaID)
+                    } label: {
+                        Label("Delete Area", systemImage: "trash")
+                    }
+                } else {
+                    Text("This area no longer exists.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(14)
+        }
+        .background(Color(white: 0.11))
+    }
+
+    @ViewBuilder
+    private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title.uppercased())
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+            content()
+        }
+    }
+
+    /// Same shape as ObjectPropertiesView's axisRow: label, slider,
+    /// value — duplicated here because that helper is private to
+    /// the object editor.
+    private func axisRow(_ label: String, _ value: Binding<Double>,
+                         _ range: ClosedRange<Double>) -> some View {
+        HStack(spacing: 8) {
+            Text(label).frame(width: 26, alignment: .leading)
+            Slider(value: value, in: range)
+            Text(String(format: "%.2f", value.wrappedValue))
+                .frame(width: 46, alignment: .trailing)
+                .monospacedDigit()
+        }
+        .font(.callout)
+    }
+
+    private func nameBinding(_ area: TriggerArea) -> Binding<String> {
+        Binding(
+            get: { area.name },
+            set: { v in
+                var a = area
+                a.name = v
+                session.updateArea(a)
+            })
+    }
+
+    private func comp(_ area: TriggerArea,
+                      _ kp: WritableKeyPath<TriggerArea, [Double]>, _ i: Int) -> Binding<Double> {
+        Binding(
+            get: { area[keyPath: kp][i] },
+            set: { v in
+                var a = area
+                a[keyPath: kp][i] = v
+                session.updateArea(a)
+            })
     }
 }
 

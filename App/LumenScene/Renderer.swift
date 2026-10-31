@@ -67,6 +67,8 @@ struct GPUUniforms {
     var snowLevel: Float = 0
     var dynTime: Float = 0   // v3.2: weather clock (retained for layout; v3.3: unused by the trace kernel)
     var rainFrac: Float = 0  // v3.2: live rain intensity (retained for layout; v3.3: unused by the trace kernel)
+    var dynTriCount: UInt32 = 0  // v4: dynamic-layer triangles (unified ids start at triCount)
+    var padDyn: UInt32 = 0
 }
 
 struct ReprojUniforms {
@@ -118,9 +120,36 @@ struct TonemapParams {
     var pad: Float = 0
 }
 
+struct LineUniforms {
+    var camOrigin = SIMD4<Float>(0, 0, 0, 0)
+    var camRight = SIMD4<Float>(1, 0, 0, 0)
+    var camUp = SIMD4<Float>(0, 1, 0, 0)
+    var camForward = SIMD4<Float>(0, 0, -1, 0)
+    var tanFovAspect = SIMD2<Float>(0.7, 1)
+    var pad0: Float = 0
+    var pad1: Float = 0
+}
+
+/// Sentinel object id for dynamic triangles that carry no scene
+/// object (particle soups, anonymous dynamic entries). pick()
+/// never returns it: a nearer sentinel hit occludes and yields
+/// nil, exactly like a hit on unpickable geometry.
+private let dynNilObjectSentinel = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
+
 typealias CameraBasis = (origin: SIMD3<Float>, forward: SIMD3<Float>, right: SIMD3<Float>, up: SIMD3<Float>)
 
 final class Renderer {
+    /// v4: one dynamic-layer entry — a local mesh baked by
+    /// `matrix` on compose/flush, shaded with `material`, and
+    /// reported by pick() as `objectID` (nil = unpickable).
+    struct DynEntry {
+        var key: UUID
+        var mesh: MeshData
+        var matrix: float4x4
+        var material: GPUMaterial
+        var objectID: UUID?
+    }
+
     /// One renderer for the whole app (building the procedural
     /// texture arrays takes a moment; never rebuild it per view).
     static let shared: Renderer? = Renderer()
@@ -135,6 +164,7 @@ final class Renderer {
     private var tonemapPipeline: MTLRenderPipelineState?
     private var precipPipeline: MTLRenderPipelineState?
     private var precipSeedBuffer: MTLBuffer?
+    private var linePipeline: MTLRenderPipelineState?
     private var fieldPipeline: MTLComputePipelineState?
     /// Baked weather field (v3.3): level-independent, baked
     /// once at init — see bakeWeatherField().
@@ -154,6 +184,77 @@ final class Renderer {
     private var triCount: Int = 0
     private var emissiveCount: Int = 0
     private var totalEmissiveArea: Float = 0
+
+    // v4 dynamic layer: a second triangle soup beside the static
+    // one, in its own buffers (slots 11-17) and its own AS.
+    // Unified ids: static 0..<triCount, dynamic triCount... .
+    private var dynAccel: MTLAccelerationStructure?
+    private var dynPosBuffer: MTLBuffer?
+    private var dynNrmBuffer: MTLBuffer?
+    private var dynUVBuffer: MTLBuffer?
+    private var dynColBuffer: MTLBuffer?
+    private var dynIdxBuffer: MTLBuffer?
+    private var dynTriMatBuffer: MTLBuffer?
+    private var dynTriCount: Int = 0
+    private var dynDummyBuffer: MTLBuffer?
+    private var cpuDynPositions: [Float] = []
+    private var cpuDynNormals: [Float] = []
+    private var cpuDynUVs: [Float] = []
+    private var cpuDynColors: [Float] = []
+    private var cpuDynIndices: [UInt32] = []
+    private var cpuDynTriMats: [UInt32] = []
+    /// Per-dynamic-tri offset into the dynamic material section
+    /// (entry order, then soup order); cpuDynTriMats is this plus
+    /// the dynamic material base, refreshed when the static
+    /// material count moves.
+    private var cpuDynMatOffsets: [Int] = []
+    private var cpuDynTriObject: [UUID] = []
+    private var dynEntries: [DynEntry] = []
+    private var particleSoupsStored: [(mesh: MeshData, material: GPUMaterial)] = []
+    private var dynDirtyKeys: Set<UUID> = []
+    private struct DynSlice {
+        var vertexStart: Int = 0
+        var vertexCount: Int = 0
+        var triStart: Int = 0
+        var triCount: Int = 0
+    }
+    private var dynSlices: [UUID: DynSlice] = [:]
+    /// Static object materials from the last rebuild/material
+    /// update (WITHOUT the sheet/dynamic/particle tail) — the
+    /// full GPU table is composed from this plus renderer state.
+    private var cachedStaticMaterials: [GPUMaterial] = []
+    /// Emissive tris contributed by the dynamic layer in the
+    /// last full emissive build (drives the rescan skip).
+    private var dynEmissiveTriCount: Int = 0
+
+    // v4 light culling: full emissive set + culled set. The
+    // active pair is what emisTriBuffer/emisCDFBuffer and
+    // emissiveCount/totalEmissiveArea currently describe.
+    private var fullEmisTris: [UInt32] = []
+    private var fullEmisCDF: [Float] = []
+    private var fullEmisAreas: [Float] = []
+    private var fullEmisCentroids: [SIMD3<Float>] = []
+    private var fullTotalEmissiveArea: Float = 0
+    private var culledEmisTris: [UInt32] = []
+    private var culledEmisCDF: [Float] = []
+    private var culledTotalEmissiveArea: Float = 0
+    private var cullingActive: Bool = false
+    private var lastCullCamera: CameraBasis?
+    private var lastCullTime: CFTimeInterval = 0
+    /// When false, NEE always samples the full emissive set.
+    var lightCullingEnabled: Bool = true
+
+    /// v4 area streaming: scene objects whose areaID is in this
+    /// set are excluded by rebuild/updateMaterialsOnly.
+    var unloadedAreaIDs: Set<UUID> = []
+    /// v4 edit-mode area-box overlay (world-space AABBs).
+    var debugBoxes: [(min: SIMD3<Float>, max: SIMD3<Float>, color: SIMD4<Float>)] = []
+    private var _collisionTriangles: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = []
+    /// Static world-space triangles, refreshed by rebuild()
+    /// (post weather geometry — read from the CPU mirrors).
+    var collisionTriangles: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] {
+        _collisionTriangles
+    }
 
     // CPU copies for picking + material-only updates.
     private var cpuPositions: [Float] = []
@@ -323,6 +424,14 @@ final class Renderer {
             desc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
             desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
             precipPipeline = try? device.makeRenderPipelineState(descriptor: desc)
+        }
+        if let vfn = library.makeFunction(name: "lineVertex"),
+           let ffn = library.makeFunction(name: "lineFragment") {
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = vfn
+            desc.fragmentFunction = ffn
+            desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+            linePipeline = try? device.makeRenderPipelineState(descriptor: desc)
         }
         // Precipitation seeds: 2048 x SIMD4<Float>, each component
         // in [0,1), from a deterministic LCG so frames are stable.
@@ -533,7 +642,7 @@ final class Renderer {
         // material — so updateMaterialsOnly can reproduce the
         // exact same material table without the geometry.
         var included: [(obj: SceneObject, world: MeshData)] = []
-        for obj in scene.objects where obj.visible {
+        for obj in scene.objects where obj.visible && !isUnloadedArea(obj) {
             let local: MeshData
             if obj.source == "primitive" {
                 local = MeshGen.primitive(kind: obj.primitiveKind, params: obj.params)
@@ -552,7 +661,7 @@ final class Renderer {
         var sheetEmitted = false
         for (obj, world) in included {
             let matIndex = UInt32(materials.count)
-            materials.append(gpuMaterial(for: obj))
+            materials.append(gpuMaterialForObject(obj))
             objectOrder.append(obj.id)
             if weatherGeoActive {
                 appendWeatherGeometry(world: world, objectID: obj.id,
@@ -576,10 +685,8 @@ final class Renderer {
                 }
             }
         }
-        if sheetEmitted {
-            materials.append(sheetMaterial())
-        }
         sceneHasSheetMaterial = sheetEmitted
+        cachedStaticMaterials = materials
 
         triCount = indices.count / 3
         cpuPositions = positions
@@ -587,9 +694,13 @@ final class Renderer {
         cpuTriObject = triObjects
         cpuTriMats = triMats
         cachedObjectOrder = objectOrder
-
-        uploadEmissiveIndex(materials: materials)
-        matBuffer = makeBuffer(materials)
+        _collisionTriangles = computeCollisionTriangles()
+        // The dynamic material base may have moved with the new
+        // static count; the dynamic layer itself survives.
+        refreshDynTriMats()
+        let fullMats = fullMaterialTable()
+        uploadEmissiveIndex(materials: fullMats)
+        matBuffer = makeBuffer(fullMats)
 
         posBuffer = makeBuffer(positions)
         nrmBuffer = makeBuffer(normals)
@@ -612,7 +723,7 @@ final class Renderer {
         // The included-object list must match the cached geometry
         // exactly (same inclusion rule as the full rebuild).
         var candidate: [UUID] = []
-        for obj in scene.objects where obj.visible {
+        for obj in scene.objects where obj.visible && !isUnloadedArea(obj) {
             if obj.source == "primitive" {
                 candidate.append(obj.id)
             } else if let m = meshes[obj.id], !m.isEmpty {
@@ -624,22 +735,36 @@ final class Renderer {
         materials.reserveCapacity(candidate.count)
         for id in candidate {
             guard let obj = scene.object(id: id) else { return false }
-            materials.append(gpuMaterial(for: obj))
+            materials.append(gpuMaterialForObject(obj))
         }
-        // v3.4: reproduce the geometry rebuild's material table
-        // exactly — the puddle sheet material rides last.
-        if sceneHasSheetMaterial { materials.append(sheetMaterial()) }
-        uploadEmissiveIndex(materials: materials)
-        matBuffer = makeBuffer(materials)
+        // v3.4/v4: reproduce the geometry rebuild's material
+        // table exactly — static objects, the puddle sheet
+        // material (when the geometry emitted sheets), then the
+        // renderer's dynamic-entry and particle-soup materials.
+        cachedStaticMaterials = materials
+        refreshDynTriMats()
+        let fullMats = fullMaterialTable()
+        uploadEmissiveIndex(materials: fullMats)
+        matBuffer = makeBuffer(fullMats)
         resetAccumulation()
         return true
     }
 
     /// Builds the emissive triangle list + area CDF into GPU
     /// buffers from the cached CPU geometry and a material table.
+    /// v4: the index spans BOTH triangle sets with unified ids
+    /// (static 0..<triCount, dynamic triCount..<triCount+
+    /// dynTriCount; positions come from the respective CPU
+    /// arrays). The result becomes the FULL set — light culling
+    /// (see draw) may later swap a culled subset in as the
+    /// active set. Optimisation: on per-frame particle-soup
+    /// uploads, when no dynamic/particle material is emissive
+    /// and the dynamic layer contributed no emissive tris last
+    /// time either, the dynamic tris are not rescanned at all.
     private func uploadEmissiveIndex(materials: [GPUMaterial]) {
         var emisTris: [UInt32] = []
         var emisAreas: [Float] = []
+        var emisCentroids: [SIMD3<Float>] = []
         if triCount > 0 {
             for t in 0..<triCount {
                 let m = materials[Int(cpuTriMats[t])]
@@ -652,16 +777,100 @@ final class Renderer {
                 if area > 1e-9 {
                     emisTris.append(UInt32(t))
                     emisAreas.append(area)
+                    emisCentroids.append((p0 + p1 + p2) / 3)
                 }
             }
         }
-        emissiveCount = emisTris.count
+        var dynEmis = 0
+        if dynTriCount > 0 {
+            let dynHasEmissive = dynEntries.contains { ($0.material.flags & 1) != 0 }
+                || particleSoupsStored.contains { ($0.material.flags & 1) != 0 }
+            let skipDynScan = !dynHasEmissive && dynEmissiveTriCount == 0
+            if !skipDynScan {
+                for dt in 0..<dynTriCount {
+                    let m = materials[Int(cpuDynTriMats[dt])]
+                    guard (m.flags & 1) != 0 else { continue }
+                    let a = cpuDynIndices[3 * dt], b = cpuDynIndices[3 * dt + 1], c = cpuDynIndices[3 * dt + 2]
+                    let p0 = SIMD3<Float>(cpuDynPositions[3 * Int(a)], cpuDynPositions[3 * Int(a) + 1], cpuDynPositions[3 * Int(a) + 2])
+                    let p1 = SIMD3<Float>(cpuDynPositions[3 * Int(b)], cpuDynPositions[3 * Int(b) + 1], cpuDynPositions[3 * Int(b) + 2])
+                    let p2 = SIMD3<Float>(cpuDynPositions[3 * Int(c)], cpuDynPositions[3 * Int(c) + 1], cpuDynPositions[3 * Int(c) + 2])
+                    let area = 0.5 * simd_length(simd_cross(p1 - p0, p2 - p0))
+                    if area > 1e-9 {
+                        emisTris.append(UInt32(triCount + dt))
+                        emisAreas.append(area)
+                        emisCentroids.append((p0 + p1 + p2) / 3)
+                        dynEmis += 1
+                    }
+                }
+            }
+        }
+        dynEmissiveTriCount = dynEmis
         var cdf: [Float] = []
         var acc: Float = 0
         for a in emisAreas { acc += a; cdf.append(acc) }
-        totalEmissiveArea = acc
-        emisTriBuffer = makeBuffer(emisTris)
+        fullEmisTris = emisTris
+        fullEmisCDF = cdf
+        fullEmisAreas = emisAreas
+        fullEmisCentroids = emisCentroids
+        fullTotalEmissiveArea = acc
+        culledEmisTris = []
+        culledEmisCDF = []
+        culledTotalEmissiveArea = 0
+        cullingActive = false
+        lastCullCamera = nil
+        lastCullTime = 0
+        applyEmissiveSet(tris: emisTris, cdf: cdf, total: acc)
+    }
+
+    /// Point the active emissive buffers/counts at one set.
+    private func applyEmissiveSet(tris: [UInt32], cdf: [Float], total: Float) {
+        emissiveCount = tris.count
+        totalEmissiveArea = total
+        emisTriBuffer = makeBuffer(tris)
         emisCDFBuffer = makeBuffer(cdf)
+    }
+
+    /// Restore the full emissive set as active (no accumulation
+    /// reset here — callers decide).
+    private func restoreFullEmissive() {
+        cullingActive = false
+        applyEmissiveSet(tris: fullEmisTris, cdf: fullEmisCDF,
+                         total: fullTotalEmissiveArea)
+    }
+
+    /// Re-activate the stored culled set (used around stills).
+    private func activateCulledEmissive() {
+        cullingActive = true
+        applyEmissiveSet(tris: culledEmisTris, cdf: culledEmisCDF,
+                         total: culledTotalEmissiveArea)
+    }
+
+    /// Compute the culled CDF for a camera: keep every emissive
+    /// tri (static + dynamic, via the unified full set) whose
+    /// centroid is within 7 m of the camera OR inside the
+    /// expanded frustum (angle to the view forward < 75°).
+    private func computeCulledSet(camera: CameraBasis)
+        -> (tris: [UInt32], cdf: [Float], total: Float) {
+        var tris: [UInt32] = []
+        var cdf: [Float] = []
+        var acc: Float = 0
+        let fwd = simd_normalize(camera.forward)
+        let cosLimit: Float = 0.258819 // cos(75°)
+        for i in 0..<fullEmisTris.count {
+            let c = fullEmisCentroids[i]
+            let rel = c - camera.origin
+            let dist = simd_length(rel)
+            var keep = dist <= 7
+            if !keep, dist > 1e-5 {
+                keep = simd_dot(rel / dist, fwd) > cosLimit
+            }
+            if keep {
+                tris.append(fullEmisTris[i])
+                acc += fullEmisAreas[i]
+                cdf.append(acc)
+            }
+        }
+        return (tris, cdf, acc)
     }
 
     private func makeBuffer<T>(_ array: [T]) -> MTLBuffer? {
@@ -671,7 +880,7 @@ final class Renderer {
         }
     }
 
-    private func gpuMaterial(for obj: SceneObject) -> GPUMaterial {
+    func gpuMaterialForObject(_ obj: SceneObject) -> GPUMaterial {
         let m = obj.material
         var g = GPUMaterial()
         var base = m.baseColor.simd
@@ -1114,6 +1323,310 @@ final class Renderer {
         accel = structure
     }
 
+    // MARK: - Dynamic layer, areas, light-culling support (v4)
+    //
+    // The dynamic layer is a second world-space triangle soup
+    // beside the static one: dynamic entries (keyed, matrix-
+    // driven) plus up to 8 particle soups, composed into CPU
+    // mirrors + GPU buffers (slots 11-17) + its own AS. The
+    // material table is contractual everywhere:
+    //   [static object materials…, sheetMaterial if emitted,
+    //    dynamic entry materials in entry order,
+    //    particle soup materials in soup order]
+    // Dynamic/particle materials are renderer state — static
+    // rebuilds and material-only updates APPEND them, so they
+    // survive static rebuilds. Total dynamic budget: 90,000
+    // triangles; entries/soups are added in order and the first
+    // one that would overflow the cap is truncated to the
+    // remaining budget (the rest of it dropped), after which
+    // nothing further is added.
+
+    /// The object's area id (SceneObject.areaID, v4).
+    private func objectAreaID(_ obj: SceneObject) -> UUID? {
+        obj.areaID
+    }
+
+    private func isUnloadedArea(_ obj: SceneObject) -> Bool {
+        guard let aid = objectAreaID(obj) else { return false }
+        return unloadedAreaIDs.contains(aid)
+    }
+
+    /// Index of the first dynamic material in the full table.
+    private var dynMatBase: Int {
+        cachedStaticMaterials.count + (sceneHasSheetMaterial ? 1 : 0)
+    }
+
+    /// The full GPU material table, in the contractual order.
+    private func fullMaterialTable() -> [GPUMaterial] {
+        var mats = cachedStaticMaterials
+        if sceneHasSheetMaterial { mats.append(sheetMaterial()) }
+        for entry in dynEntries { mats.append(entry.material) }
+        for soup in particleSoupsStored { mats.append(soup.material) }
+        return mats
+    }
+
+    /// Recompute cpuDynTriMats (+ its GPU buffer) from the
+    /// stored per-tri material offsets and the current base.
+    private func refreshDynTriMats() {
+        let base = dynMatBase
+        cpuDynTriMats = cpuDynMatOffsets.map { UInt32(base + $0) }
+        dynTriMatBuffer = makeBuffer(cpuDynTriMats)
+    }
+
+    private func computeCollisionTriangles()
+        -> [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] {
+        var out: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = []
+        out.reserveCapacity(max(triCount, 0))
+        guard triCount > 0 else { return out }
+        for t in 0..<triCount {
+            let ia = Int(cpuIndices[3 * t]), ib = Int(cpuIndices[3 * t + 1]), ic = Int(cpuIndices[3 * t + 2])
+            out.append((
+                SIMD3<Float>(cpuPositions[3 * ia], cpuPositions[3 * ia + 1], cpuPositions[3 * ia + 2]),
+                SIMD3<Float>(cpuPositions[3 * ib], cpuPositions[3 * ib + 1], cpuPositions[3 * ib + 2]),
+                SIMD3<Float>(cpuPositions[3 * ic], cpuPositions[3 * ic + 1], cpuPositions[3 * ic + 2])))
+        }
+        return out
+    }
+
+    /// Full replace of the dynamic entries (ordered).
+    func setDynamicEntries(_ entries: [DynEntry]) {
+        let structureChanged = entries.map { $0.key } != dynEntries.map { $0.key }
+        dynEntries = entries
+        dynDirtyKeys.removeAll()
+        composeDynamic(structureChanged: structureChanged)
+    }
+
+    /// Cheap matrix update: marks the entry dirty; the re-bake
+    /// happens in flushDynamic() at the top of draw(). Does NOT
+    /// reset accumulation (reprojection rejects stale history
+    /// by position, as with camera moves).
+    func updateDynamicMatrix(key: UUID, matrix: float4x4) {
+        guard let idx = dynEntries.firstIndex(where: { $0.key == key }) else { return }
+        dynEntries[idx].matrix = matrix
+        dynDirtyKeys.insert(key)
+    }
+
+    func setDynamicMaterial(key: UUID, material: GPUMaterial) {
+        guard let idx = dynEntries.firstIndex(where: { $0.key == key }) else { return }
+        dynEntries[idx].material = material
+        let fullMats = fullMaterialTable()
+        matBuffer = makeBuffer(fullMats)
+        uploadEmissiveIndex(materials: fullMats)
+        resetAccumulation()
+    }
+
+    func removeDynamicEntry(key: UUID) {
+        guard dynEntries.contains(where: { $0.key == key }) else { return }
+        dynEntries.removeAll { $0.key == key }
+        dynDirtyKeys.remove(key)
+        composeDynamic(structureChanged: true)
+    }
+
+    /// Particle soups (at most 8 kept), appended after the
+    /// dynamic entries in both geometry and the material table.
+    /// May be called per frame: when neither the soup count nor
+    /// the total dynamic tri count changes, compose does not
+    /// reset accumulation.
+    func setParticleSoups(_ soups: [(mesh: MeshData, material: GPUMaterial)]) {
+        let capped = Array(soups.prefix(8))
+        let structureChanged = capped.count != particleSoupsStored.count
+        particleSoupsStored = capped
+        composeDynamic(structureChanged: structureChanged)
+    }
+
+    /// Re-bake every dynamic entry + particle soup into the CPU
+    /// mirrors, rebuild the dynamic GPU buffers and AS, refresh
+    /// the material table and the unified emissive index.
+    /// Resets accumulation once when the composition changed
+    /// structurally (entries/soups added/removed) or the total
+    /// dynamic tri count changed.
+    private func composeDynamic(structureChanged: Bool) {
+        let oldDynTriCount = dynTriCount
+        let budget = 90_000
+        var positions: [Float] = []
+        var normals: [Float] = []
+        var uvArr: [Float] = []
+        var colArr: [Float] = []
+        var indices: [UInt32] = []
+        var matOffsets: [Int] = []
+        var triObjects: [UUID] = []
+        var slices: [UUID: DynSlice] = [:]
+        var totalTris = 0
+        var capped = false
+
+        func appendSoup(world: MeshData, matOffset: Int, objectID: UUID?) -> DynSlice {
+            let vBase = UInt32(positions.count / 3)
+            let slice = DynSlice(vertexStart: Int(vBase), vertexCount: world.vertexCount,
+                                 triStart: totalTris, triCount: 0)
+            positions += world.positions
+            normals += world.normals
+            uvArr += world.uvs
+            colArr += world.colors
+            let available = max(budget - totalTris, 0)
+            let included = min(world.triangleCount, available)
+            for t in 0..<included {
+                let a = world.indices[3 * t], b = world.indices[3 * t + 1], c = world.indices[3 * t + 2]
+                indices += [vBase + a, vBase + b, vBase + c]
+                matOffsets.append(matOffset)
+                triObjects.append(objectID ?? dynNilObjectSentinel)
+            }
+            totalTris += included
+            if included < world.triangleCount { capped = true }
+            var out = slice
+            out.triCount = included
+            return out
+        }
+
+        for (i, pair) in dynEntries.enumerated() {
+            if capped { break }
+            let world = pair.local.baked(by: pair.matrix)
+            slices[pair.key] = appendSoup(world: world, matOffset: i,
+                                          objectID: pair.objectID)
+        }
+        for (j, soup) in particleSoupsStored.enumerated() {
+            if capped { break }
+            _ = appendSoup(world: soup.mesh,
+                           matOffset: dynEntries.count + j, objectID: nil)
+        }
+
+        cpuDynPositions = positions
+        cpuDynNormals = normals
+        cpuDynUVs = uvArr
+        cpuDynColors = colArr
+        cpuDynIndices = indices
+        cpuDynMatOffsets = matOffsets
+        cpuDynTriObject = triObjects
+        dynSlices = slices
+        dynTriCount = totalTris
+
+        dynPosBuffer = makeBuffer(positions)
+        dynNrmBuffer = makeBuffer(normals)
+        dynUVBuffer = makeBuffer(uvArr)
+        dynColBuffer = makeBuffer(colArr)
+        dynIdxBuffer = makeBuffer(indices)
+        refreshDynTriMats()
+        buildDynamicAccelerationStructure()
+        let fullMats = fullMaterialTable()
+        matBuffer = makeBuffer(fullMats)
+        uploadEmissiveIndex(materials: fullMats)
+        if structureChanged || totalTris != oldDynTriCount {
+            resetAccumulation()
+        }
+    }
+
+    /// Re-bake dirty entries' vertices (matrix updates only)
+    /// into the dynamic mirrors, re-upload the position/normal
+    /// buffers and rebuild the dynamic AS. Runs at the top of
+    /// draw(); never resets accumulation.
+    private func flushDynamic() {
+        guard !dynDirtyKeys.isEmpty else { return }
+        let dirty = dynDirtyKeys
+        dynDirtyKeys.removeAll()
+        var anyBaked = false
+        for key in dirty {
+            guard let pair = dynEntries.first(where: { $0.key == key }),
+                  let slice = dynSlices[key], slice.vertexCount > 0 else { continue }
+            let world = pair.local.baked(by: pair.matrix)
+            guard world.vertexCount == slice.vertexCount else { continue }
+            let start = slice.vertexStart * 3
+            let count = slice.vertexCount * 3
+            if start + count <= cpuDynPositions.count {
+                cpuDynPositions.replaceSubrange(start..<(start + count), with: world.positions)
+                cpuDynNormals.replaceSubrange(start..<(start + count), with: world.normals)
+                anyBaked = true
+            }
+            // An emissive entry moved: refresh the full-set
+            // centroids of its tris in place (areas are unchanged
+            // by the matrix in the common rigid case; the CDF —
+            // and therefore the GPU buffers — stay as they are).
+            if (pair.material.flags & 1) != 0, slice.triCount > 0 {
+                for dt in slice.triStart..<(slice.triStart + slice.triCount) {
+                    let unified = UInt32(triCount + dt)
+                    guard let fi = fullEmisTris.firstIndex(of: unified) else { continue }
+                    let a = cpuDynIndices[3 * dt], b = cpuDynIndices[3 * dt + 1], c = cpuDynIndices[3 * dt + 2]
+                    let p0 = SIMD3<Float>(cpuDynPositions[3 * Int(a)], cpuDynPositions[3 * Int(a) + 1], cpuDynPositions[3 * Int(a) + 2])
+                    let p1 = SIMD3<Float>(cpuDynPositions[3 * Int(b)], cpuDynPositions[3 * Int(b) + 1], cpuDynPositions[3 * Int(b) + 2])
+                    let p2 = SIMD3<Float>(cpuDynPositions[3 * Int(c)], cpuDynPositions[3 * Int(c) + 1], cpuDynPositions[3 * Int(c) + 2])
+                    fullEmisCentroids[fi] = (p0 + p1 + p2) / 3
+                }
+            }
+        }
+        guard anyBaked else { return }
+        dynPosBuffer = makeBuffer(cpuDynPositions)
+        dynNrmBuffer = makeBuffer(cpuDynNormals)
+        buildDynamicAccelerationStructure()
+        // Keep an active culled set honest about moved lights —
+        // silently (no accumulation reset for matrix updates).
+        if cullingActive, let lc = lastCullCamera {
+            let culled = computeCulledSet(camera: lc)
+            culledEmisTris = culled.tris
+            culledEmisCDF = culled.cdf
+            culledTotalEmissiveArea = culled.total
+            activateCulledEmissive()
+        }
+    }
+
+    private func buildDynamicAccelerationStructure() {
+        dynAccel = nil
+        guard rayTracingSupported, dynTriCount > 0,
+              let dynPosBuffer, let dynIdxBuffer else { return }
+        let geom = MTLAccelerationStructureTriangleGeometryDescriptor()
+        geom.vertexBuffer = dynPosBuffer
+        geom.vertexStride = 12
+        geom.vertexFormat = .float3
+        geom.indexBuffer = dynIdxBuffer
+        geom.indexType = .uint32
+        geom.triangleCount = dynTriCount
+        geom.opaque = true
+        let desc = MTLPrimitiveAccelerationStructureDescriptor()
+        desc.geometryDescriptors = [geom]
+        let sizes = device.accelerationStructureSizes(descriptor: desc)
+        guard let structure = device.makeAccelerationStructure(size: sizes.accelerationStructureSize),
+              let scratch = device.makeBuffer(length: sizes.buildScratchBufferSize, options: .storageModePrivate),
+              let cmd = queue.makeCommandBuffer(),
+              let enc = cmd.makeAccelerationStructureCommandEncoder() else { return }
+        enc.build(accelerationStructure: structure, descriptor: desc,
+                  scratchBuffer: scratch, scratchBufferOffset: 0)
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        dynAccel = structure
+    }
+
+    private func dynamicDummyBuffer() -> MTLBuffer {
+        if let d = dynDummyBuffer { return d }
+        let b = device.makeBuffer(length: 4, options: .storageModeShared)!
+        dynDummyBuffer = b
+        return b
+    }
+
+    /// Bind the dynamic layer at slots 11-17 for a compute
+    /// encoder. With no dynamic triangles, slots 11-16 get a
+    /// dummy 4-byte buffer and slot 17 gets the static AS (the
+    /// kernels skip it via dynTriCount == 0, but the slot must
+    /// still be bound).
+    private func bindDynamicBuffers(_ enc: MTLComputeCommandEncoder) {
+        let dummy = dynamicDummyBuffer()
+        if dynTriCount > 0 {
+            enc.setBuffer(dynPosBuffer ?? dummy, offset: 0, index: 11)
+            enc.setBuffer(dynNrmBuffer ?? dummy, offset: 0, index: 12)
+            enc.setBuffer(dynUVBuffer ?? dummy, offset: 0, index: 13)
+            enc.setBuffer(dynColBuffer ?? dummy, offset: 0, index: 14)
+            enc.setBuffer(dynIdxBuffer ?? dummy, offset: 0, index: 15)
+            enc.setBuffer(dynTriMatBuffer ?? dummy, offset: 0, index: 16)
+            if let dynAccel {
+                enc.setAccelerationStructure(dynAccel, bufferIndex: 17)
+            } else if let accel {
+                enc.setAccelerationStructure(accel, bufferIndex: 17)
+            }
+        } else {
+            for i in 11...16 { enc.setBuffer(dummy, offset: 0, index: i) }
+            if let accel {
+                enc.setAccelerationStructure(accel, bufferIndex: 17)
+            }
+        }
+    }
+
     // MARK: Accumulation state
 
     /// Hard reset: the next frame starts from an empty accumulation
@@ -1264,6 +1777,7 @@ final class Renderer {
         u.snowLevel = weatherSnow
         u.dynTime = weatherDynTime
         u.rainFrac = weatherDynRain
+        u.dynTriCount = UInt32(dynTriCount)
         return u
     }
 
@@ -1291,6 +1805,7 @@ final class Renderer {
         enc.setBuffer(triMatBuffer, offset: 0, index: 6)
         enc.setBuffer(matBuffer, offset: 0, index: 7)
         enc.setAccelerationStructure(accel, bufferIndex: 10)
+        bindDynamicBuffers(enc)
         let aspect = Float(guide.width) / Float(max(guide.height, 1))
         var u = uniforms(camera: camera, aspect: aspect, seed: 0,
                          bounces: 0, cap: 0, glassBudget: 0)
@@ -1352,6 +1867,7 @@ final class Renderer {
         enc.setBuffer(emisTriBuffer, offset: 0, index: 8)
         enc.setBuffer(emisCDFBuffer, offset: 0, index: 9)
         enc.setAccelerationStructure(accel, bufferIndex: 10)
+        bindDynamicBuffers(enc)
         let aspect = Float(accum.width) / Float(max(accum.height, 1))
         for i in 0..<count {
             var u = uniforms(camera: camera, aspect: aspect,
@@ -1432,6 +1948,56 @@ final class Renderer {
         }
     }
 
+    /// Area-box overlay (v4, edit mode only): expands
+    /// debugBoxes into a line list (24 vertices / 12 edges per
+    /// box) with per-vertex colours and draws it over the
+    /// presented drawable in its own .load pass, like precip.
+    private func encodeLineOverlay(cmd: MTLCommandBuffer, drawable: CAMetalDrawable,
+                                   camera: CameraBasis, view: MTKView) {
+        guard !debugBoxes.isEmpty, let linePipeline else { return }
+        var verts: [SIMD4<Float>] = []
+        var cols: [SIMD4<Float>] = []
+        verts.reserveCapacity(debugBoxes.count * 24)
+        cols.reserveCapacity(debugBoxes.count * 24)
+        let edges: [(Int, Int)] = [(0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3),
+                                   (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7)]
+        for box in debugBoxes {
+            var corners: [SIMD3<Float>] = []
+            for i in 0..<8 {
+                corners.append(SIMD3<Float>(
+                    (i & 1) == 0 ? box.min.x : box.max.x,
+                    (i & 2) == 0 ? box.min.y : box.max.y,
+                    (i & 4) == 0 ? box.min.z : box.max.z))
+            }
+            for (a, b) in edges {
+                for c in [corners[a], corners[b]] {
+                    verts.append(SIMD4<Float>(c, 1))
+                    cols.append(box.color)
+                }
+            }
+        }
+        guard let vBuf = makeBuffer(verts), let cBuf = makeBuffer(cols) else { return }
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = drawable.texture
+        pass.colorAttachments[0].loadAction = .load
+        pass.colorAttachments[0].storeAction = .store
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return }
+        enc.setRenderPipelineState(linePipeline)
+        var lu = LineUniforms()
+        lu.camOrigin = SIMD4<Float>(camera.origin, 0)
+        lu.camRight = SIMD4<Float>(camera.right, 0)
+        lu.camUp = SIMD4<Float>(camera.up, 0)
+        lu.camForward = SIMD4<Float>(camera.forward, 0)
+        lu.tanFovAspect = SIMD2<Float>(
+            tan(fovY / 2),
+            Float(view.drawableSize.width) / Float(max(view.drawableSize.height, 1)))
+        enc.setVertexBytes(&lu, length: MemoryLayout<LineUniforms>.stride, index: 0)
+        enc.setVertexBuffer(vBuf, offset: 0, index: 1)
+        enc.setVertexBuffer(cBuf, offset: 0, index: 2)
+        enc.drawPrimitives(type: .line, vertexStart: 0, vertexCount: verts.count)
+        enc.endEncoding()
+    }
+
     /// Tonemap parameters for a live frame. With `shimmer` set,
     /// the fragment adds the display-rate rain-ripple shimmer
     /// on puddle pixels (v3.3); stills pass false so exports
@@ -1451,12 +2017,48 @@ final class Renderer {
     /// next draw only then — a converged, untouched scene sleeps).
     @discardableResult
     func draw(view: MTKView, camera: CameraBasis, moving: Bool, play: Bool) -> Bool {
+        flushDynamic()
         presentationDirty = false
         guard let drawable = view.currentDrawable,
               let passDesc = view.currentRenderPassDescriptor,
               let cmd = queue.makeCommandBuffer(),
               view.drawableSize.width > 0, view.drawableSize.height > 0
         else { return false }
+
+        // v4 light culling: while moving or playing, NEE samples
+        // only the emissive tris near/ahead of the camera. This
+        // changes only WHICH lights are sampled during
+        // interaction — when motion stops the full set is
+        // restored and settled frames converge with every light.
+        let wantCull = lightCullingEnabled && (moving || play)
+        if wantCull {
+            let now = CACurrentMediaTime()
+            var needCull = !cullingActive
+            if let lc = lastCullCamera {
+                if simd_length(camera.origin - lc.origin) > 1.5 { needCull = true }
+                let cosA = simd_dot(simd_normalize(camera.forward),
+                                    simd_normalize(lc.forward))
+                if cosA < 0.9781476 { needCull = true } // rotated > ~12°
+            } else {
+                needCull = true
+            }
+            if lastCullTime > 0, now - lastCullTime > 0.25 { needCull = true }
+            if needCull {
+                lastCullCamera = camera
+                lastCullTime = now
+                if !fullEmisTris.isEmpty {
+                    let culled = computeCulledSet(camera: camera)
+                    culledEmisTris = culled.tris
+                    culledEmisCDF = culled.cdf
+                    culledTotalEmissiveArea = culled.total
+                    activateCulledEmissive()
+                    resetAccumulation()
+                }
+            }
+        } else if cullingActive {
+            restoreFullEmissive()
+            resetAccumulation()
+        }
 
         let t = targets(moving: moving, play: play)
         lastMaxSettle = t.maxSettle
@@ -1524,6 +2126,9 @@ final class Renderer {
             }
             if weatherMode != 0 {
                 encodePrecip(cmd: cmd, drawable: drawable, camera: camera, view: view)
+            }
+            if !play {
+                encodeLineOverlay(cmd: cmd, drawable: drawable, camera: camera, view: view)
             }
             // Settled: dynamic resolution stands down — the next
             // motion starts from the tier's full motion scale.
@@ -1635,6 +2240,11 @@ final class Renderer {
         // Precipitation overlay (live draw only).
         encodePrecip(cmd: cmd, drawable: drawable, camera: camera, view: view)
 
+        // Area-box overlay (edit mode only), after precip.
+        if !play {
+            encodeLineOverlay(cmd: cmd, drawable: drawable, camera: camera, view: view)
+        }
+
         // v3.4 dynamic resolution feedback: the delivered cadence
         // of traced frames (completion-to-completion) is the
         // ground truth for "is this holding 60 fps". While moving,
@@ -1692,11 +2302,20 @@ final class Renderer {
     func renderStillPNG(camera: CameraBasis, width: Int, height: Int, samples: Int) -> Data? {
         guard let accum = makeAccumTexture(width: width, height: height),
               let cmd = queue.makeCommandBuffer() else { return nil }
+        // Stills always use the FULL emissive set: force-restore
+        // it around the trace, then put the culled set back (the
+        // command buffer is waited on below before any swap-back
+        // could race the GPU reads).
+        let wasCulling = cullingActive
+        if wasCulling { restoreFullEmissive() }
         clearAccum(accum, cmd: cmd)
         let traced = encodeTrace(accum: accum, camera: camera, count: samples,
                                  seedStart: 0, bounces: 6, cap: 1_000_000,
                                  glassBudget: 6, cmd: cmd)
-        guard traced else { return nil }
+        guard traced else {
+            if wasCulling { activateCulledEmissive() }
+            return nil
+        }
         // Tonemap into a readable BGRA texture.
         let targetDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
@@ -1744,13 +2363,14 @@ final class Renderer {
             out, UTType.png.identifier as CFString, 1, nil) else { return nil }
         CGImageDestinationAddImage(dest, image, nil)
         guard CGImageDestinationFinalize(dest) else { return nil }
+        if wasCulling { activateCulledEmissive() }
         return out as Data
     }
 
     // MARK: Picking (CPU raycast over the merged world triangles)
 
     func pick(origin: SIMD3<Float>, dir: SIMD3<Float>) -> UUID? {
-        guard cpuIndices.count >= 3 else { return nil }
+        guard cpuIndices.count >= 3 || cpuDynIndices.count >= 3 else { return nil }
         var best: Float = .greatestFiniteMagnitude
         var bestObj: UUID? = nil
         let triTotal = cpuIndices.count / 3
@@ -1762,6 +2382,21 @@ final class Renderer {
             if let d = rayTriangle(origin: origin, dir: dir, p0: p0, p1: p1, p2: p2), d < best {
                 best = d
                 bestObj = cpuTriObject[t]
+            }
+        }
+        // v4: dynamic mirrors too — nearest hit overall wins. A
+        // dynamic hit with the sentinel id is unpickable: it
+        // still occludes (best is set) and returns nil.
+        let dynTotal = cpuDynIndices.count / 3
+        for t in 0..<dynTotal {
+            let ia = Int(cpuDynIndices[3 * t]), ib = Int(cpuDynIndices[3 * t + 1]), ic = Int(cpuDynIndices[3 * t + 2])
+            let p0 = SIMD3<Float>(cpuDynPositions[3 * ia], cpuDynPositions[3 * ia + 1], cpuDynPositions[3 * ia + 2])
+            let p1 = SIMD3<Float>(cpuDynPositions[3 * ib], cpuDynPositions[3 * ib + 1], cpuDynPositions[3 * ib + 2])
+            let p2 = SIMD3<Float>(cpuDynPositions[3 * ic], cpuDynPositions[3 * ic + 1], cpuDynPositions[3 * ic + 2])
+            if let d = rayTriangle(origin: origin, dir: dir, p0: p0, p1: p1, p2: p2), d < best {
+                best = d
+                let oid = cpuDynTriObject[t]
+                bestObj = (oid == dynNilObjectSentinel) ? nil : oid
             }
         }
         return bestObj
@@ -1782,5 +2417,36 @@ final class Renderer {
         if v < 0 || u + v > 1 { return nil }
         let d = simd_dot(e2, qvec) * inv
         return d > 1e-4 ? d : nil
+    }
+}
+
+/// Top-level aliases so callers can write the entry type
+/// unqualified under either name; the struct itself is nested
+/// in Renderer (Renderer.DynEntry). `DynamicEntry` is the name
+/// the editor session uses for its entry mirror.
+typealias DynEntry = Renderer.DynEntry
+typealias DynamicEntry = Renderer.DynEntry
+
+extension Renderer.DynEntry {
+    /// The entry's local-space mesh (alias of the stored
+    /// `mesh`), for callers written against the `local` name.
+    var local: MeshData {
+        get { mesh }
+        set { mesh = newValue }
+    }
+
+    /// Construct without an explicit key (a fresh key is
+    /// minted); the entry is then anonymous to the key-based
+    /// update/remove calls unless the caller reads `key` back.
+    init(local: MeshData, matrix: float4x4, material: GPUMaterial, objectID: UUID?) {
+        self.init(key: UUID(), mesh: local, matrix: matrix,
+                  material: material, objectID: objectID)
+    }
+
+    /// Construct with an explicit key and the `local` name.
+    init(key: UUID, local: MeshData, matrix: float4x4,
+         material: GPUMaterial, objectID: UUID?) {
+        self.init(key: key, mesh: local, matrix: matrix,
+                  material: material, objectID: objectID)
     }
 }

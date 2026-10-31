@@ -80,6 +80,8 @@ struct Uniforms {
     float snowLevel;           // v3: 0 none .. 1 full cover (up-facing)
     float dynTime;             // v3.2: weather clock (retained for layout; v3.3: unused by the trace kernel)
     float rainFrac;            // v3.2: live rain intensity (retained for layout; v3.3: unused by the trace kernel)
+    uint dynTriCount;          // v4: dynamic-layer triangle count (unified ids start at triCount)
+    uint padDyn;
 };
 
 struct Material {
@@ -261,6 +263,13 @@ kernel void pathTraceKernel(
     device const uint* emissiveTris [[buffer(8)]],
     device const float* emissiveCDF [[buffer(9)]],
     acceleration_structure<> accel [[buffer(10)]],
+    device const float* dynPositions [[buffer(11)]],
+    device const float* dynNormals [[buffer(12)]],
+    device const float* dynUVs [[buffer(13)]],
+    device const float* dynColors [[buffer(14)]],
+    device const uint* dynIndices [[buffer(15)]],
+    device const uint* dynTriMat [[buffer(16)]],
+    acceleration_structure<> dynAccel [[buffer(17)]],
     uint2 pixel [[thread_position_in_grid]])
 {
     uint width = accum.get_width();
@@ -302,40 +311,68 @@ kernel void pathTraceKernel(
     uint refracts = 0;
 
     for (uint bounce = 0; bounce <= u.maxBounces; ++bounce) {
-        auto hit = isect.intersect(ray, accel);
-        if (hit.type == intersection_type::none) {
+        // v4: merged static + dynamic intersection. Static tris
+        // are ids 0..<triCount, dynamic tris are triCount..<
+        // triCount+dynTriCount; the nearer hit of the two AS
+        // traversals wins and selects the attribute set below.
+        auto sHit = isect.intersect(ray, accel);
+        bool haveHit = sHit.type != intersection_type::none;
+        float hitDist = haveHit ? sHit.distance : 1e30f;
+        uint primID = haveHit ? sHit.primitive_id : 0u;
+        float2 hitBary = haveHit ? sHit.triangle_barycentric_coord : float2(0);
+        bool hitFront = haveHit ? sHit.triangle_front_facing : true;
+        bool isDynHit = false;
+        if (u.dynTriCount > 0) {
+            raytracing::ray dynRay = ray;
+            if (haveHit) dynRay.max_distance = hitDist;
+            auto dHit = isect.intersect(dynRay, dynAccel);
+            if (dHit.type != intersection_type::none
+                && (!haveHit || dHit.distance < hitDist)) {
+                haveHit = true; isDynHit = true;
+                hitDist = dHit.distance; primID = dHit.primitive_id;
+                hitBary = dHit.triangle_barycentric_coord;
+                hitFront = dHit.triangle_front_facing;
+            }
+        }
+        if (!haveHit) {
             radiance += throughput * envColor(ray.direction, u.envIntensity);
             break;
         }
         // Attenuate the segment just travelled inside glass.
         if (inMedium) {
-            throughput *= exp(mediumLog * hit.distance);
+            throughput *= exp(mediumLog * hitDist);
         }
 
-        uint tri = hit.primitive_id;
-        uint i0 = indices[3 * tri], i1 = indices[3 * tri + 1], i2 = indices[3 * tri + 2];
-        float3 p0 = float3(positions[3 * i0], positions[3 * i0 + 1], positions[3 * i0 + 2]);
-        float3 p1 = float3(positions[3 * i1], positions[3 * i1 + 1], positions[3 * i1 + 2]);
-        float3 p2 = float3(positions[3 * i2], positions[3 * i2 + 1], positions[3 * i2 + 2]);
-        float bc1 = hit.triangle_barycentric_coord.x;
-        float bc2 = hit.triangle_barycentric_coord.y;
+        device const float* hPositions = isDynHit ? dynPositions : positions;
+        device const float* hNormals = isDynHit ? dynNormals : normals;
+        device const float* hUVs = isDynHit ? dynUVs : uvs;
+        device const float* hColors = isDynHit ? dynColors : colors;
+        device const uint* hIndices = isDynHit ? dynIndices : indices;
+        device const uint* hTriMat = isDynHit ? dynTriMat : triMat;
+        uint tri = primID;
+        uint i0 = hIndices[3 * tri], i1 = hIndices[3 * tri + 1], i2 = hIndices[3 * tri + 2];
+        float3 p0 = float3(hPositions[3 * i0], hPositions[3 * i0 + 1], hPositions[3 * i0 + 2]);
+        float3 p1 = float3(hPositions[3 * i1], hPositions[3 * i1 + 1], hPositions[3 * i1 + 2]);
+        float3 p2 = float3(hPositions[3 * i2], hPositions[3 * i2 + 1], hPositions[3 * i2 + 2]);
+        float bc1 = hitBary.x;
+        float bc2 = hitBary.y;
         float bc0 = 1.0f - bc1 - bc2;
         float3 hitPos = p0 * bc0 + p1 * bc1 + p2 * bc2;
         float3 nInterp = normalize(
-            float3(normals[3 * i0], normals[3 * i0 + 1], normals[3 * i0 + 2]) * bc0 +
-            float3(normals[3 * i1], normals[3 * i1 + 1], normals[3 * i1 + 2]) * bc1 +
-            float3(normals[3 * i2], normals[3 * i2 + 1], normals[3 * i2 + 2]) * bc2);
+            float3(hNormals[3 * i0], hNormals[3 * i0 + 1], hNormals[3 * i0 + 2]) * bc0 +
+            float3(hNormals[3 * i1], hNormals[3 * i1 + 1], hNormals[3 * i1 + 2]) * bc1 +
+            float3(hNormals[3 * i2], hNormals[3 * i2 + 1], hNormals[3 * i2 + 2]) * bc2);
         float3 vColor =
-            float3(colors[3 * i0], colors[3 * i0 + 1], colors[3 * i0 + 2]) * bc0 +
-            float3(colors[3 * i1], colors[3 * i1 + 1], colors[3 * i1 + 2]) * bc1 +
-            float3(colors[3 * i2], colors[3 * i2 + 1], colors[3 * i2 + 2]) * bc2;
+            float3(hColors[3 * i0], hColors[3 * i0 + 1], hColors[3 * i0 + 2]) * bc0 +
+            float3(hColors[3 * i1], hColors[3 * i1 + 1], hColors[3 * i1 + 2]) * bc1 +
+            float3(hColors[3 * i2], hColors[3 * i2 + 1], hColors[3 * i2 + 2]) * bc2;
         float2 vUV =
-            float2(uvs[2 * i0], uvs[2 * i0 + 1]) * bc0 +
-            float2(uvs[2 * i1], uvs[2 * i1 + 1]) * bc1 +
-            float2(uvs[2 * i2], uvs[2 * i2 + 1]) * bc2;
+            float2(hUVs[2 * i0], hUVs[2 * i0 + 1]) * bc0 +
+            float2(hUVs[2 * i1], hUVs[2 * i1 + 1]) * bc1 +
+            float2(hUVs[2 * i2], hUVs[2 * i2 + 1]) * bc2;
 
-        Material mat = materials[triMat[tri]];
-        bool front = hit.triangle_front_facing;
+        Material mat = materials[hTriMat[tri]];
+        bool front = hitFront;
         float3 ns = front ? nInterp : -nInterp; // shading normal, against the ray
         float3 geoN = normalize(cross(p1 - p0, p2 - p0));
         if (dot(geoN, ns) < 0) geoN = -geoN;
@@ -390,8 +427,8 @@ kernel void pathTraceKernel(
                 // tangent-space normal mapping — light rakes across
                 // the surface relief.
                 float3 e1 = p1 - p0, e2 = p2 - p0;
-                float2 duv1 = float2(uvs[2 * i1] - uvs[2 * i0], uvs[2 * i1 + 1] - uvs[2 * i0 + 1]);
-                float2 duv2 = float2(uvs[2 * i2] - uvs[2 * i0], uvs[2 * i2 + 1] - uvs[2 * i0 + 1]);
+                float2 duv1 = float2(hUVs[2 * i1] - hUVs[2 * i0], hUVs[2 * i1 + 1] - hUVs[2 * i0 + 1]);
+                float2 duv2 = float2(hUVs[2 * i2] - hUVs[2 * i0], hUVs[2 * i2 + 1] - hUVs[2 * i0 + 1]);
                 float det = duv1.x * duv2.y - duv2.x * duv1.y;
                 float3 T = abs(det) > 1e-10f
                     ? normalize((e1 * duv2.y - e2 * duv1.y) / det)
@@ -629,10 +666,16 @@ kernel void pathTraceKernel(
                 if (emissiveCDF[mid] <= pickU) lo = mid + 1; else hi = mid;
             }
             uint etri = emissiveTris[min(lo, u.emissiveCount - 1)];
-            uint e0 = indices[3 * etri], e1 = indices[3 * etri + 1], e2 = indices[3 * etri + 2];
-            float3 q0 = float3(positions[3 * e0], positions[3 * e0 + 1], positions[3 * e0 + 2]);
-            float3 q1 = float3(positions[3 * e1], positions[3 * e1 + 1], positions[3 * e1 + 2]);
-            float3 q2 = float3(positions[3 * e2], positions[3 * e2 + 1], positions[3 * e2 + 2]);
+            // v4: emissive ids are unified across both sets.
+            bool eIsDyn = etri >= u.triCount;
+            uint eLocal = eIsDyn ? (etri - u.triCount) : etri;
+            device const float* ePositions = eIsDyn ? dynPositions : positions;
+            device const uint* eIndices = eIsDyn ? dynIndices : indices;
+            device const uint* eTriMat = eIsDyn ? dynTriMat : triMat;
+            uint e0 = eIndices[3 * eLocal], e1 = eIndices[3 * eLocal + 1], e2 = eIndices[3 * eLocal + 2];
+            float3 q0 = float3(ePositions[3 * e0], ePositions[3 * e0 + 1], ePositions[3 * e0 + 2]);
+            float3 q1 = float3(ePositions[3 * e1], ePositions[3 * e1 + 1], ePositions[3 * e1 + 2]);
+            float3 q2 = float3(ePositions[3 * e2], ePositions[3 * e2 + 1], ePositions[3 * e2 + 2]);
             float r1 = rng.nextFloat(), r2 = rng.nextFloat();
             float sq = sqrt(r1);
             float3 lp = q0 * (1 - sq) + q1 * (sq * (1 - r2)) + q2 * (sq * r2);
@@ -650,8 +693,13 @@ kernel void pathTraceKernel(
                 sray.min_distance = 0.0f;
                 sray.max_distance = dist - 0.003f;
                 auto shit = shadowIsect.intersect(sray, accel);
-                if (shit.type == intersection_type::none) {
-                    Material em = materials[triMat[etri]];
+                bool occluded = shit.type != intersection_type::none;
+                if (!occluded && u.dynTriCount > 0) {
+                    auto dshit = shadowIsect.intersect(sray, dynAccel);
+                    occluded = dshit.type != intersection_type::none;
+                }
+                if (!occluded) {
+                    Material em = materials[eTriMat[eLocal]];
                     float3 Le = em.emissive.rgb * em.emissive.a;
                     radiance += throughput * (albedo / M_PI_F) * Le
                               * cosS * cosE * u.totalEmissiveArea / d2;
@@ -750,6 +798,13 @@ kernel void guideKernel(
     device const uint* triMat [[buffer(6)]],
     device const Material* materials [[buffer(7)]],
     acceleration_structure<> accel [[buffer(10)]],
+    device const float* dynPositions [[buffer(11)]],
+    device const float* dynNormals [[buffer(12)]],
+    device const float* dynUVs [[buffer(13)]],
+    device const float* dynColors [[buffer(14)]],
+    device const uint* dynIndices [[buffer(15)]],
+    device const uint* dynTriMat [[buffer(16)]],
+    acceleration_structure<> dynAccel [[buffer(17)]],
     uint2 pixel [[thread_position_in_grid]])
 {
     uint width = guide.get_width();
@@ -768,26 +823,52 @@ kernel void guideKernel(
     intersector<triangle_data> isect;
     isect.assume_geometry_type(geometry_type::triangle);
     isect.accept_any_intersection(false);
-    auto hit = isect.intersect(ray, accel);
-    if (hit.type == intersection_type::none) {
+    // v4: merged static + dynamic primary hit (nearer wins),
+    // same material resolution as the trace kernel — a dynamic
+    // FLAG_SHEET / glass / reflection-dominant hit therefore
+    // gets exactly the trace kernel's reusability treatment in
+    // the ghosting logic below.
+    auto sHit = isect.intersect(ray, accel);
+    bool haveHit = sHit.type != intersection_type::none;
+    float hitDist = haveHit ? sHit.distance : 1e30f;
+    uint primID = haveHit ? sHit.primitive_id : 0u;
+    float2 hitBary = haveHit ? sHit.triangle_barycentric_coord : float2(0);
+    bool isDynHit = false;
+    if (u.dynTriCount > 0) {
+        raytracing::ray dynRay = ray;
+        if (haveHit) dynRay.max_distance = hitDist;
+        auto dHit = isect.intersect(dynRay, dynAccel);
+        if (dHit.type != intersection_type::none
+            && (!haveHit || dHit.distance < hitDist)) {
+            haveHit = true; isDynHit = true;
+            hitDist = dHit.distance; primID = dHit.primitive_id;
+            hitBary = dHit.triangle_barycentric_coord;
+        }
+    }
+    if (!haveHit) {
         guide.write(float4(0, 0, 0, 0), pixel);
         guideNormal.write(float4(0, 0, 0, 0), pixel);
         return;
     }
-    uint tri = hit.primitive_id;
-    uint i0 = indices[3 * tri], i1 = indices[3 * tri + 1], i2 = indices[3 * tri + 2];
-    float3 p0 = float3(positions[3 * i0], positions[3 * i0 + 1], positions[3 * i0 + 2]);
-    float3 p1 = float3(positions[3 * i1], positions[3 * i1 + 1], positions[3 * i1 + 2]);
-    float3 p2 = float3(positions[3 * i2], positions[3 * i2 + 1], positions[3 * i2 + 2]);
-    float bc1 = hit.triangle_barycentric_coord.x;
-    float bc2 = hit.triangle_barycentric_coord.y;
+    (void)dynUVs; (void)dynColors;
+    device const float* hPositions = isDynHit ? dynPositions : positions;
+    device const float* hNormals = isDynHit ? dynNormals : normals;
+    device const uint* hIndices = isDynHit ? dynIndices : indices;
+    device const uint* hTriMat = isDynHit ? dynTriMat : triMat;
+    uint tri = primID;
+    uint i0 = hIndices[3 * tri], i1 = hIndices[3 * tri + 1], i2 = hIndices[3 * tri + 2];
+    float3 p0 = float3(hPositions[3 * i0], hPositions[3 * i0 + 1], hPositions[3 * i0 + 2]);
+    float3 p1 = float3(hPositions[3 * i1], hPositions[3 * i1 + 1], hPositions[3 * i1 + 2]);
+    float3 p2 = float3(hPositions[3 * i2], hPositions[3 * i2 + 1], hPositions[3 * i2 + 2]);
+    float bc1 = hitBary.x;
+    float bc2 = hitBary.y;
     float bc0 = 1.0f - bc1 - bc2;
     float3 hitPos = p0 * bc0 + p1 * bc1 + p2 * bc2;
     float3 nInterp = normalize(
-        float3(normals[3 * i0], normals[3 * i0 + 1], normals[3 * i0 + 2]) * bc0 +
-        float3(normals[3 * i1], normals[3 * i1 + 1], normals[3 * i1 + 2]) * bc1 +
-        float3(normals[3 * i2], normals[3 * i2 + 1], normals[3 * i2 + 2]) * bc2);
-    Material mat = materials[triMat[tri]];
+        float3(hNormals[3 * i0], hNormals[3 * i0 + 1], hNormals[3 * i0 + 2]) * bc0 +
+        float3(hNormals[3 * i1], hNormals[3 * i1 + 1], hNormals[3 * i1 + 2]) * bc1 +
+        float3(hNormals[3 * i2], hNormals[3 * i2 + 1], hNormals[3 * i2 + 2]) * bc2);
+    Material mat = materials[hTriMat[tri]];
     float reusable = (mat.flags & FLAG_GLASS) ? 0.0f : 1.0f;
     if ((mat.flags & FLAG_SHEET) != 0u) {
         // v3.4: water sheets are pure reflection — view-dependent,
@@ -1211,4 +1292,51 @@ fragment float4 precipFragment(PrecipOut in [[stage_in]]) {
     float disc = 1.0f - smoothstep(0.35f, 1.0f, d);
     float alpha = 0.9f * disc * in.fade;
     return float4(float3(0.93f, 0.96f, 1.0f), alpha);
+}
+
+// MARK: - Area-box overlay (v4: edit-mode debug/area boxes)
+//
+// Tiny line pipeline: Swift expands each debug box into 24
+// line-list vertices (12 edges) with a per-vertex colour.
+// Projection is manual, exactly like the precipitation vertex:
+// rel = world - camOrigin, z = dot(rel, forward), NDC from the
+// right/up components over (z * tanFov * aspect).
+
+struct LineUniforms {
+    float3 camOrigin;
+    float3 camRight;
+    float3 camUp;
+    float3 camForward;
+    float2 tanFovAspect; // x: tan(half vertical fov), y: aspect
+    float pad0;
+    float pad1;
+};
+
+struct LineOut {
+    float4 pos [[position]];
+    float4 color;
+};
+
+vertex LineOut lineVertex(uint vid [[vertex_id]],
+                          constant LineUniforms& u [[buffer(0)]],
+                          device const float4* verts [[buffer(1)]],
+                          device const float4* cols [[buffer(2)]]) {
+    LineOut out;
+    out.color = cols[vid];
+    float3 world = verts[vid].xyz;
+    float3 rel = world - u.camOrigin;
+    float z = dot(rel, u.camForward);
+    if (z < 0.05f) {
+        out.pos = float4(3.0f, 3.0f, 0.5f, 1.0f); // clipped
+        return out;
+    }
+    float tanF = u.tanFovAspect.x;
+    float2 ndc = float2(dot(rel, u.camRight) / (z * tanF * u.tanFovAspect.y),
+                        dot(rel, u.camUp) / (z * tanF));
+    out.pos = float4(ndc.x, ndc.y, 0.5f, 1.0f);
+    return out;
+}
+
+fragment float4 lineFragment(LineOut in [[stage_in]]) {
+    return in.color;
 }

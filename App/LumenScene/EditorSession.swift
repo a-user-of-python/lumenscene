@@ -15,19 +15,73 @@ enum MoveKey: Hashable { case w, a, s, d, q, e, up, down, left, right }
 @MainActor
 final class EditorSession: ObservableObject {
     @Published var project: Project
-    @Published var selection: UUID?
+    @Published var selection: UUID? {
+        // An object selection and an area selection are mutually
+        // exclusive: the properties panel shows exactly one editor.
+        didSet { if selection != nil, selectedArea != nil { selectedArea = nil } }
+    }
+    /// v4.0: the trigger area selected in the tree's Areas section
+    /// (edited in the properties panel instead of an object).
+    @Published var selectedArea: UUID? {
+        didSet { if selectedArea != nil, selection != nil { selection = nil } }
+    }
     @Published var mode: EditorMode = .edit
     @Published var status: String = ""
     @Published var undoDepth: Int = 0
     @Published var redoDepth: Int = 0
+    /// v4.0: transient Play-mode banner (node "Show Message"
+    /// action). Display-only; frameTick clears it at expiry.
+    @Published var playBanner: String = ""
 
     let renderer: Renderer
+    /// v4.0: the node-graph game runtime. Inert in edit mode;
+    /// started/stopped by toggleMode().
+    let runtime: GameRuntime
     private(set) var meshes: [UUID: MeshData] = [:]
 
     private struct Snapshot: Codable { var objects: [SceneObject] }
     private var undoStack: [Data] = []
     private var redoStack: [Data] = []
     private var editGestureAt: Date = .distantPast
+
+    // MARK: v4.0 Play-session state (node runtime + promotion)
+
+    /// Restore point taken the moment Play is entered: the scene
+    /// objects (via the same snapshot() the undo stack uses) plus
+    /// the weather mode. Exiting Play restores both, so everything
+    /// the runtime did — moves, material swaps, hides, area
+    /// streaming — is wiped and the scene returns to exactly the
+    /// state the user pressed Play on. Deliberately separate from
+    /// restore(): that one is undo plumbing (selection fix-ups,
+    /// stack bookkeeping) and must not run on the Play boundary.
+    private var playSnapshot: Data?
+    private var playWeatherMode: Int = 0
+
+    /// PROMOTION, the mechanism in one paragraph: the renderer
+    /// draws static objects from one baked soup (rebuilt on edit)
+    /// and dynamic objects from per-object entries the runtime can
+    /// move/re-skin per frame without a rebuild. The first time
+    /// the runtime touches an object in Play it is "promoted": a
+    /// dynamic entry is created for it AND its scene `visible` is
+    /// set to false, so every static rebuild (area load/unload,
+    /// weather geometry) naturally excludes it — the static layer
+    /// has no per-object exclusion list, and `visible == false` is
+    /// the exclusion it already understands. The object's real
+    /// visibility lives in these sets instead: promoted but not in
+    /// `hiddenPromotedIDs` (runtime hide) and not in
+    /// `areaHiddenPromotedIDs` (its area is streamed out) = its
+    /// dynamic entry is on screen. The scene's false `visible`
+    /// flags are never user-visible — the editor UI is hidden in
+    /// Play — and the Play-exit snapshot restore undoes them all.
+    var promotedIDs: Set<UUID> = []
+    var hiddenPromotedIDs: Set<UUID> = []
+    private var areaHiddenPromotedIDs: Set<UUID> = []
+    /// Session-side mirror of the renderer's dynamic entries, so
+    /// promotion can hand setDynamicEntries the full list.
+    private var dynamicEntries: [DynamicEntry] = []
+    /// Areas the runtime has streamed out this Play session.
+    private var runtimeUnloaded: Set<UUID> = []
+    private var bannerExpiry: Date?
 
     /// Live weather build-up (source of truth while editing).
     /// Mutating `project` every frame would fire objectWillChange
@@ -68,8 +122,10 @@ final class EditorSession: ObservableObject {
     private var lastCameraActivity: CFTimeInterval = 0
 
     init(project: Project, renderer: Renderer) {
+        self.runtime = GameRuntime()
         self.project = project
         self.renderer = renderer
+        runtime.session = self
         for obj in project.scene.objects where obj.source == "model" {
             if let file = obj.meshFile,
                let mesh = ProjectStore.readMesh(projectID: project.id, fileName: file) {
@@ -106,6 +162,11 @@ final class EditorSession: ObservableObject {
     func wantsFrame() -> Bool {
         renderer.frameWanted || !pressedKeys.isEmpty || touchActive
             || project.scene.weather.mode != 0
+            // v4.0: the node runtime asks for frames while it has
+            // live work (tweens, timers, particles); a showing
+            // banner also keeps frames coming so its expiry lands.
+            || (mode == .play && runtime.needsFrame)
+            || !playBanner.isEmpty
     }
 
     /// Camera input happened (orbit / pan / zoom / focus / mode
@@ -212,6 +273,10 @@ final class EditorSession: ObservableObject {
                     || old.source != newValue.source
                     || old.primitiveKind != newValue.primitiveKind
                     || old.meshFile != newValue.meshFile
+                    // v4.0: area membership decides which objects a
+                    // streamed (unloaded) area's static rebuild
+                    // includes, so it is a geometry-class change.
+                    || old.areaID != newValue.areaID
                 scheduleRebuild(geometry: geometry)
             })
     }
@@ -456,11 +521,294 @@ final class EditorSession: ObservableObject {
     func toggleMode() {
         pressedKeys.removeAll() // a held key must not survive the switch
         touchVector = .zero // a stuck joystick must not survive either
-        mode = (mode == .edit) ? .play : .edit
+        if mode == .edit {
+            // Entering Play. FIRST take the restore snapshot —
+            // before the runtime touches anything — then clear
+            // all promotion/streaming state so the session starts
+            // from the scene exactly as authored.
+            playSnapshot = snapshot()
+            playWeatherMode = project.scene.weather.mode
+            promotedIDs.removeAll()
+            hiddenPromotedIDs.removeAll()
+            areaHiddenPromotedIDs.removeAll()
+            dynamicEntries.removeAll()
+            runtimeUnloaded.removeAll()
+            playBanner = ""
+            bannerExpiry = nil
+            mode = .play
+            runtime.start()
+        } else {
+            // Exiting Play: stop the runtime, clear ALL dynamic
+            // renderer state (entries, particles, area streaming),
+            // then restore the pre-Play snapshot + weather mode.
+            runtime.stop()
+            renderer.setDynamicEntries([])
+            dynamicEntries.removeAll()
+            renderer.setParticleSoups([])
+            renderer.unloadedAreaIDs = []
+            runtimeUnloaded.removeAll()
+            restorePlaySnapshot()
+            if project.scene.weather.mode != playWeatherMode {
+                setWeatherMode(playWeatherMode)
+            }
+            promotedIDs.removeAll()
+            hiddenPromotedIDs.removeAll()
+            areaHiddenPromotedIDs.removeAll()
+            playBanner = ""
+            bannerExpiry = nil
+            mode = .edit
+        }
         renderer.resetAccumulation()
         noteCameraActivity()
         status = mode == .play ? "Play mode — walk around. Pause to edit."
                                 : "Edit mode."
+    }
+
+    /// Undo-free restore of the Play-entry object snapshot. See
+    /// `playSnapshot`: unlike restore() this does not touch the
+    /// undo/redo stacks or the selection — the selection the user
+    /// had when they pressed Play is still valid on return, and
+    /// the undo history must read as if Play never happened.
+    private func restorePlaySnapshot() {
+        guard let data = playSnapshot else { return }
+        playSnapshot = nil
+        guard let snap = try? JSONDecoder().decode(Snapshot.self, from: data) else { return }
+        project.scene.objects = snap.objects
+        renderer.rebuild(scene: project.scene, meshes: meshes)
+        kickRender()
+    }
+
+    // MARK: v4.0 Runtime funnels (called by GameRuntime only)
+
+    /// The object's local (unbaked) mesh: primitives regenerate
+    /// from their params; imported models use the loaded mesh.
+    private func localMesh(for obj: SceneObject) -> MeshData? {
+        if obj.source == "primitive" {
+            return MeshGen.primitive(kind: obj.primitiveKind, params: obj.params)
+        }
+        return meshes[obj.id]
+    }
+
+    /// Bring one object under runtime control (see the promotion
+    /// note on `promotedIDs`). The dynamic entry is built from the
+    /// object's CURRENT transform/material, so promotion itself
+    /// never visibly changes the object; the static rebuild at the
+    /// end drops it from the baked soup in the same frame.
+    private func promoteObject(id: UUID) {
+        guard mode == .play, !promotedIDs.contains(id),
+              let idx = project.scene.objects.firstIndex(where: { $0.id == id })
+        else { return }
+        let obj = project.scene.objects[idx]
+        guard let mesh = localMesh(for: obj), !mesh.isEmpty else { return }
+        promotedIDs.insert(id)
+        if !obj.visible {
+            // Already hidden as authored: no entry, and it counts
+            // as runtime-hidden so a later show can add the entry.
+            hiddenPromotedIDs.insert(id)
+        }
+        // The promotion mechanism: from here the static layer must
+        // never draw this object again this Play session.
+        project.scene.objects[idx].visible = false
+        syncDynamicEntry(id: id)
+        renderer.rebuild(scene: project.scene, meshes: meshes)
+        kickRender()
+    }
+
+    /// Reconcile one promoted object's dynamic entry with its
+    /// tracked visibility: entry present iff promoted, not
+    /// runtime-hidden, and not parked by an unloaded area.
+    private func syncDynamicEntry(id: UUID) {
+        guard promotedIDs.contains(id),
+              let obj = project.scene.object(id: id) else { return }
+        let shouldShow = !hiddenPromotedIDs.contains(id)
+            && !areaHiddenPromotedIDs.contains(id)
+        let hasEntry = dynamicEntries.contains { $0.key == id }
+        if shouldShow, !hasEntry, let mesh = localMesh(for: obj), !mesh.isEmpty {
+            dynamicEntries.append(DynamicEntry(
+                key: id, mesh: mesh, matrix: obj.transform.matrix,
+                material: renderer.gpuMaterialForObject(obj), objectID: id))
+            renderer.setDynamicEntries(dynamicEntries)
+        } else if !shouldShow, hasEntry {
+            dynamicEntries.removeAll { $0.key == id }
+            renderer.removeDynamicEntry(key: id)
+        }
+        kickRender()
+    }
+
+    /// Runtime transform write. NOTE on the @Published cost: the
+    /// scene write goes through the published `project`, so during
+    /// an active tween/rotation this invalidates the Play overlay
+    /// per frame — the v3.1 menu-storm pattern. It is accepted
+    /// here as a BOUNDED exception: it only happens while a
+    /// runtime animation is actually running, only in Play (the
+    /// editor body is not shown; the overlay is a pause button, a
+    /// joystick and a banner), and the write keeps the scene
+    /// truthful — what actually renders is the renderer's dynamic
+    /// matrix below. mutateScene/scheduleRebuild are deliberately
+    /// NOT used: a static rebuild would fight the promotion.
+    func runtimeSetTransform(_ id: UUID, _ t: Transform3) {
+        guard let idx = project.scene.objects.firstIndex(where: { $0.id == id })
+        else { return }
+        if !promotedIDs.contains(id) { promoteObject(id: id) }
+        project.scene.objects[idx].transform = t
+        if let ei = dynamicEntries.firstIndex(where: { $0.key == id }) {
+            dynamicEntries[ei].matrix = t.matrix
+        }
+        renderer.updateDynamicMatrix(key: id, matrix: t.matrix)
+        kickRender()
+    }
+
+    func runtimeSetMaterial(_ id: UUID, _ m: MaterialProps) {
+        guard let idx = project.scene.objects.firstIndex(where: { $0.id == id })
+        else { return }
+        if !promotedIDs.contains(id) { promoteObject(id: id) }
+        project.scene.objects[idx].material = m
+        let obj = project.scene.objects[idx]
+        let gpu = renderer.gpuMaterialForObject(obj)
+        if let ei = dynamicEntries.firstIndex(where: { $0.key == id }) {
+            dynamicEntries[ei].material = gpu
+        }
+        renderer.setDynamicMaterial(key: id, material: gpu)
+        kickRender()
+    }
+
+    func runtimeSetVisible(_ id: UUID, _ visible: Bool) {
+        guard let idx = project.scene.objects.firstIndex(where: { $0.id == id })
+        else { return }
+        if promotedIDs.contains(id) {
+            // Promoted: visibility is entry presence. The scene
+            // flag stays false (promotion mechanism); the tracked
+            // sets carry the truth.
+            if visible { hiddenPromotedIDs.remove(id) } else { hiddenPromotedIDs.insert(id) }
+            syncDynamicEntry(id: id)
+        } else if visible {
+            project.scene.objects[idx].visible = true
+            renderer.rebuild(scene: project.scene, meshes: meshes)
+        } else {
+            project.scene.objects[idx].visible = false
+            renderer.rebuild(scene: project.scene, meshes: meshes)
+        }
+        kickRender()
+    }
+
+    /// Particle soups arrive with a material SOURCE object; the
+    /// renderer wants the baked GPU material for it.
+    func runtimeSetParticleSoups(_ soups: [(mesh: MeshData, materialObject: SceneObject)]) {
+        renderer.setParticleSoups(soups.map {
+            (mesh: $0.mesh, material: renderer.gpuMaterialForObject($0.materialObject))
+        })
+        kickRender()
+    }
+
+    func runtimeLoadArea(_ id: UUID) {
+        runtimeUnloaded.remove(id)
+        renderer.unloadedAreaIDs = runtimeUnloaded
+        // Promoted members come back too — if they were visible.
+        for obj in project.scene.objects where obj.areaID == id && promotedIDs.contains(obj.id) {
+            areaHiddenPromotedIDs.remove(obj.id)
+            syncDynamicEntry(id: obj.id)
+        }
+        // Static rebuild: non-promoted members rejoin the soup
+        // (promoted members stay excluded — visible == false).
+        renderer.rebuild(scene: project.scene, meshes: meshes)
+        runtime.collisionDidChange()
+        kickRender()
+    }
+
+    func runtimeUnloadArea(_ id: UUID) {
+        runtimeUnloaded.insert(id)
+        renderer.unloadedAreaIDs = runtimeUnloaded
+        // Hide promoted members' dynamic entries for as long as
+        // the area is out; loading restores them if visible.
+        for obj in project.scene.objects where obj.areaID == id && promotedIDs.contains(obj.id) {
+            areaHiddenPromotedIDs.insert(obj.id)
+            syncDynamicEntry(id: obj.id)
+        }
+        renderer.rebuild(scene: project.scene, meshes: meshes)
+        runtime.collisionDidChange()
+        kickRender()
+    }
+
+    /// Areas currently streamed IN: every authored area minus the
+    /// runtime-unloaded set.
+    var runtimeLoadedAreaIDs: Set<UUID> {
+        Set(project.scene.areas.map(\.id)).subtracting(runtimeUnloaded)
+    }
+
+    func runtimeShowMessage(_ text: String, seconds: Double) {
+        playBanner = text
+        bannerExpiry = Date().addingTimeInterval(seconds)
+        kickRender()
+    }
+
+    /// Teleport the Play camera. The target is an object's origin:
+    /// a floor-level marker (y < 1) means "stand here", so the eye
+    /// goes 1.7 m above it; a target already at eye height (or
+    /// higher) is used as the eye position as-is.
+    func runtimeTeleportPlayer(to t: SIMD3<Float>) {
+        let eyeY = t.y < 1.0 ? Double(t.y) + 1.7 : Double(t.y)
+        project.scene.camera.playPosition = [Double(t.x), eyeY, Double(t.z)]
+        noteCameraActivity()
+    }
+
+    func runtimeSetWeather(mode weatherMode: Int, clear: Bool) {
+        setWeatherMode(weatherMode)
+        if clear { clearWeatherBuildup() }
+    }
+
+    // MARK: v4.0 Areas & graph editing (views call these)
+
+    /// Add a trigger area centred on the orbit target. Areas and
+    /// the node graph are NOT undoable (same precedent as weather:
+    /// undo snapshots cover scene objects only).
+    func addArea() {
+        let t = project.scene.camera.target
+        let area = TriggerArea(id: UUID(), name: uniqueAreaName(),
+                               center: [t[0], 1.0, t[2]], size: [4, 3, 4])
+        project.scene.areas.append(area)
+        selectedArea = area.id
+        status = "Added trigger area \(area.name)."
+        kickRender()
+    }
+
+    private func uniqueAreaName() -> String {
+        let names = Set(project.scene.areas.map(\.name))
+        if !names.contains("Area") { return "Area" }
+        var n = 2
+        while names.contains("Area \(n)") { n += 1 }
+        return "Area \(n)"
+    }
+
+    func deleteArea(_ id: UUID) {
+        project.scene.areas.removeAll { $0.id == id }
+        if selectedArea == id { selectedArea = nil }
+        runtimeUnloaded.remove(id)
+        // Objects keep no dangling membership; membership feeds
+        // streaming rebuilds, so un-assigning is a geometry change.
+        var unassigned = false
+        for i in project.scene.objects.indices where project.scene.objects[i].areaID == id {
+            project.scene.objects[i].areaID = nil
+            unassigned = true
+        }
+        if unassigned { renderer.rebuild(scene: project.scene, meshes: meshes) }
+        status = "Deleted trigger area."
+        kickRender()
+    }
+
+    func updateArea(_ area: TriggerArea) {
+        guard let idx = project.scene.areas.firstIndex(where: { $0.id == area.id })
+        else { return }
+        project.scene.areas[idx] = area
+        // Areas are not part of the baked soup — the debug boxes
+        // refreshed in frameTick are their only visuals, so no
+        // rebuild is needed, just a frame.
+        kickRender()
+    }
+
+    /// Node-graph edits land here: a plain assignment, saved with
+    /// the project on Save, not covered by Undo.
+    func updateGraph(_ graph: NodeGraph) {
+        project.scene.graph = graph
     }
 
     // MARK: Weather
@@ -595,6 +943,32 @@ final class EditorSession: ObservableObject {
             project.scene.weather.wetness = buildupWet
             project.scene.weather.snow = buildupSnow
         }
+        // v4.0: banner expiry — a published write only on the
+        // frame where it actually lapses.
+        if !playBanner.isEmpty, let expiry = bannerExpiry, Date() >= expiry {
+            playBanner = ""
+            bannerExpiry = nil
+        }
+        // v4.0: the node runtime ticks BEFORE the draw, so
+        // everything it moves/shows this frame is in the frame.
+        if mode == .play, runtime.running {
+            let p = project.scene.camera.playPosition
+            runtime.tick(dt: dt, playerPos: SIMD3<Float>(Float(p[0]), Float(p[1]), Float(p[2])))
+        }
+        // v4.0: in edit mode the trigger areas draw as debug
+        // boxes — a plain renderer write each tick, no published
+        // churn. The selected area burns brighter.
+        if mode == .edit {
+            renderer.debugBoxes = project.scene.areas.map { area in
+                let c = area.center, s = area.size
+                let lo = SIMD3<Float>(Float(c[0] - s[0] / 2), Float(c[1] - s[1] / 2), Float(c[2] - s[2] / 2))
+                let hi = SIMD3<Float>(Float(c[0] + s[0] / 2), Float(c[1] + s[1] / 2), Float(c[2] + s[2] / 2))
+                let color = area.id == selectedArea
+                    ? SIMD4<Float>(1.0, 0.72, 0.15, 0.95)
+                    : SIMD4<Float>(0.15, 0.75, 0.9, 0.35)
+                return (min: lo, max: hi, color: color)
+            }
+        }
         let moving = !pressedKeys.isEmpty
             || touchActive
             || (now - lastCameraActivity) < 0.35
@@ -699,7 +1073,21 @@ final class EditorSession: ObservableObject {
     }
 
     func handleTap(ndc: SIMD2<Float>, aspect: Float) {
-        guard mode == .edit else { return }
+        if mode == .play {
+            // Play taps pick through the FIRST-PERSON camera (the
+            // orbit rig rayFor uses is meaningless in Play) and
+            // forward hits to the runtime — tap-to-interact for
+            // node graphs. Misses are ignored.
+            let basis = project.scene.camera.playBasis()
+            let tanH = tan(renderer.fovY / 2)
+            let dir = simd_normalize(basis.forward
+                                     + basis.right * (ndc.x * tanH * aspect)
+                                     + basis.up * (ndc.y * tanH))
+            if let hit = renderer.pick(origin: basis.origin, dir: dir) {
+                runtime.handleTap(objectID: hit)
+            }
+            return
+        }
         if let hit = pickAt(ndc: ndc, aspect: aspect) {
             selection = hit
             if let name = project.scene.objects.first(where: { $0.id == hit })?.name {
