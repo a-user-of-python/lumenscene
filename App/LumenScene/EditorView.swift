@@ -31,6 +31,11 @@ struct EditorView: View {
     @State private var showImport = false
     @State private var showNodes = false
     @State private var shareItem: ShareItem?
+    /// v4.2: the top bar switches to its compact row (icon-only
+    /// back button, Weather folded into the More menu, narrower
+    /// title field) when the window is too narrow for the full
+    /// row — driven by the bar's measured width, not a guess.
+    @State private var barCompact = false
     @FocusState private var fieldFocus: FieldFocus?
     @FocusState private var kbFocused: Bool
 
@@ -164,16 +169,44 @@ struct EditorView: View {
 
     // MARK: Top bar
 
+    // v4.2 TOP BAR, rebuilt. The v4.1 bar carried ten controls
+    // whose combined intrinsic width met or exceeded the bar's
+    // width at Sean's 1180 pt layout, the title field was a
+    // fixed, inflexible 210 pt, and NOT ONE label had lineLimit
+    // or fixedSize discipline — so when SwiftUI ran out of
+    // width it took its lowest-resistance path and WRAPPED the
+    // label text mid-word, doubling the bar's height into tall
+    // narrow pills ("Proje/cts", "No/de/s", "Ex-/port"…).
+    // The fix attacks both halves: (1) less demand — the title
+    // field is flexible (120–230 pt, compact 84–230) and the
+    // two secondary menus (Render quality, Export) fold into
+    // one trailing More menu; (2) wrapping made structurally
+    // impossible — every label is lineLimit(1) and every
+    // control fixedSize horizontally, so a control is always
+    // its natural single-line size; (3) a compact row (icon
+    // back button, Weather inside More) engages below 1020 pt
+    // measured width for split-view widths. Primary actions
+    // (Play, Nodes, Save, Weather in the full row) stay one
+    // tap; everything else is at most one extra tap via More.
     private var topBar: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Button { onClose() } label: {
-                Label("Projects", systemImage: "chevron.left")
+                if barCompact {
+                    Image(systemName: "chevron.left")
+                } else {
+                    Label("Projects", systemImage: "chevron.left")
+                        .lineLimit(1)
+                }
             }
+            .fixedSize(horizontal: true, vertical: false)
+            .help("Back to projects")
             TextField("Project name", text: $session.project.name)
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 210)
+                .frame(minWidth: barCompact ? 84 : 120,
+                       idealWidth: barCompact ? 130 : 200,
+                       maxWidth: 230)
                 .focused($fieldFocus, equals: .projectName)
-            Spacer()
+            Spacer(minLength: 8)
             Button { session.undo() } label: {
                 Image(systemName: "arrow.uturn.backward")
             }
@@ -188,40 +221,42 @@ struct EditorView: View {
             Button { session.toggleMode() } label: {
                 Label(session.mode == .edit ? "Play" : "Pause",
                       systemImage: session.mode == .edit ? "play.fill" : "pause.fill")
+                    .lineLimit(1)
             }
             .buttonStyle(.borderedProminent)
+            .fixedSize(horizontal: true, vertical: false)
             .help("Play: walk around the scene. Pause: back to editing.")
             Button { showNodes = true } label: {
                 Label("Nodes", systemImage: "point.3.connected.trianglepath.dotted")
+                    .lineLimit(1)
             }
+            .fixedSize(horizontal: true, vertical: false)
             .help("Node editor: logic that runs in Play.")
-            Menu {
-                Picker("Weather", selection: weatherBinding) {
-                    Text("Off").tag(0)
-                    Text("Rain").tag(1)
-                    Text("Snow").tag(2)
+            if !barCompact {
+                Menu {
+                    weatherMenuItems
+                } label: {
+                    Label("Weather", systemImage: "cloud.rain")
+                        .lineLimit(1)
                 }
-                if session.project.scene.weather.wetness > 0.01
-                    || session.project.scene.weather.snow > 0.01 {
-                    Divider()
-                    Button("Clear ground build-up") { session.clearWeatherBuildup() }
-                }
-            } label: {
-                Label("Weather", systemImage: "cloud.rain")
+                .fixedSize(horizontal: true, vertical: false)
             }
+            Button { session.save() } label: {
+                Label("Save", systemImage: "square.and.arrow.down")
+                    .lineLimit(1)
+            }
+            .fixedSize(horizontal: true, vertical: false)
             Menu {
+                if barCompact {
+                    weatherMenuItems
+                    Divider()
+                }
                 Picker("Quality", selection: qualityBinding) {
                     Text("Auto").tag(0)
                     Text("High detail").tag(1)
                     Text("Battery saver").tag(2)
                 }
-            } label: {
-                Label("Render", systemImage: "wand.and.stars")
-            }
-            Button { session.save() } label: {
-                Label("Save", systemImage: "square.and.arrow.down")
-            }
-            Menu {
+                Divider()
                 Button("Export project package (.zip)") {
                     if let url = session.exportPackageURL() { shareItem = ShareItem(url: url) }
                 }
@@ -229,12 +264,35 @@ struct EditorView: View {
                     if let url = session.exportPNGURL() { shareItem = ShareItem(url: url) }
                 }
             } label: {
-                Label("Export", systemImage: "square.and.arrow.up")
+                Image(systemName: "ellipsis.circle")
             }
+            .fixedSize(horizontal: true, vertical: false)
+            .help("Render quality and export")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(Color(white: 0.13))
+        .onGeometryChange(for: Bool.self) { proxy in
+            proxy.size.width < 1020
+        } action: { _, compact in
+            barCompact = compact
+        }
+    }
+
+    /// The Weather menu's contents, shared by the full row's
+    /// Weather menu and the compact row's More menu.
+    @ViewBuilder
+    private var weatherMenuItems: some View {
+        Picker("Weather", selection: weatherBinding) {
+            Text("Off").tag(0)
+            Text("Rain").tag(1)
+            Text("Snow").tag(2)
+        }
+        if session.project.scene.weather.wetness > 0.01
+            || session.project.scene.weather.snow > 0.01 {
+            Divider()
+            Button("Clear ground build-up") { session.clearWeatherBuildup() }
+        }
     }
 
     // MARK: Object tree (left)

@@ -96,8 +96,12 @@ struct GPUMaterial {
 struct DenoiseUniforms {
     var camOrigin = SIMD4<Float>(0, 0, 0, 0) // xyz used; w pads float3
     var strength: Float = 1
-    var pad0: Float = 0
-    var pad1: Float = 0
+    // v4.2: per-class denoise hand-off (effective samples where
+    // the blend reaches zero) — reusable/diffuse class, then
+    // the non-reusable (glass/reflection) class. Same offsets
+    // as the former pad0/pad1; the Metal mirror matches.
+    var fadeEnd: Float = 0
+    var fadeEndSpec: Float = 0
 }
 
 struct PrecipUniforms {
@@ -395,11 +399,6 @@ final class Renderer {
     /// governor's ~2 s stand-down timer (guarded by dynLock).
     private var dynStillSince: CFTimeInterval = 0
     private let dynLock = NSLock()
-    /// v4.1 (F12): frames since motion last stopped (reset on
-    /// any moving draw, counted up otherwise). The denoise gate
-    /// stays open for ~45 frames after motion so newly exposed,
-    /// still-young pixels keep their denoise.
-    private var framesSinceMove: Int = 10_000
     /// Weather dynamics (v3.2), written by the session every
     /// tick alongside the levels: a slow surge clock, the live
     /// intensity it produces, the rain-only intensity the trace
@@ -2256,11 +2255,13 @@ final class Renderer {
     }
 
     /// Spatial denoise of the current accumulation into the
-    /// display texture (interactive / Play frames only — the
-    /// settled frame is always shown raw).
+    /// display texture (display-only — the accumulation, the
+    /// settled frame and stills are never filtered; see the
+    /// kernel's header comment in Shaders.metal).
     private func encodeDenoise(accum: MTLTexture, guide: MTLTexture,
                                guideNormal: MTLTexture, output: MTLTexture,
-                               strength: Float, camera: CameraBasis,
+                               strength: Float, fadeEnd: Float, fadeEndSpec: Float,
+                               camera: CameraBasis,
                                cmd: MTLCommandBuffer) -> Bool {
         guard let denoisePipeline,
               let enc = cmd.makeComputeCommandEncoder() else { return false }
@@ -2272,6 +2273,8 @@ final class Renderer {
         var u = DenoiseUniforms()
         u.camOrigin = SIMD4<Float>(camera.origin, 0)
         u.strength = strength
+        u.fadeEnd = fadeEnd
+        u.fadeEndSpec = fadeEndSpec
         enc.setBytes(&u, length: MemoryLayout<DenoiseUniforms>.stride, index: 0)
         dispatch(enc, pipeline: denoisePipeline, width: accum.width, height: accum.height)
         enc.endEncoding()
@@ -2393,12 +2396,10 @@ final class Renderer {
     @discardableResult
     func draw(view: MTKView, camera: CameraBasis, moving: Bool, play: Bool) -> Bool {
         flushDynamic()
-        // v4.1 (F12): denoise "recently moved" bookkeeping.
-        if moving {
-            framesSinceMove = 0
-        } else if framesSinceMove < 10_000 {
-            framesSinceMove += 1
-        }
+        // v4.2: the v4.1 framesSinceMove denoise bookkeeping is
+        // gone — the pass now keys off this frame having traced
+        // (see the display-source selection below) and the
+        // per-pixel fade handles young pixels directly.
         presentationDirty = false
         guard let drawable = view.currentDrawable,
               let passDesc = view.currentRenderPassDescriptor,
@@ -2604,21 +2605,35 @@ final class Renderer {
             sampleCount = 0
         }
 
-        // Display source: interactive / Play / still-converging
-        // frames go through the spatial denoise pass; the settled
-        // frame (sampleCount >= maxSettle) is shown raw.
+        // Display source (v4.2 rework): any frame that TRACED
+        // goes through the spatial denoise pass; the settled
+        // frame never reaches here (the settled fast path above
+        // presents the raw accumulation and returns), and a
+        // static re-present (nothing traced) shows raw too.
+        // The v3.1/v4.1 gate (pass off at 160 global samples)
+        // existed because the old fade was zero past 96 samples
+        // anyway; with the v4.2 class-aware fade the pass earns
+        // its keep across the whole settle tail — per-pixel
+        // alpha decides each pixel's blend, so mature pixels
+        // are untouched while young/noisy ones are cleaned.
+        // Cost: one bilateral pass per traced frame (it already
+        // ran on every moving/Play frame); at settle the frame
+        // chain stops, so the resting cost is zero.
         var displaySource = curAccum
-        // v4.1 (F12): the gate also stays open for ~45 frames
-        // after motion stops — per-pixel alpha (the shader's
-        // own fade) is the real signal, and newly exposed young
-        // pixels need the pass even when the GLOBAL sampleCount
-        // is already high.
-        if accel != nil, moving || play || sampleCount < 160 || framesSinceMove < 45,
+        if accel != nil, traced,
            denoisePipeline != nil, let displayTex, let curGuideNormal {
-            let strength: Float = (play || moving) ? 1.0 : 0.65
+            let strength: Float = (play || moving) ? 1.0 : 0.8
+            // Hand-off ends scale with the tier's settle cap:
+            // diffuse hands over at 60% of the cap, the
+            // reflection class rides the denoise to the cap
+            // itself (its fade is exactly 0 there, and past
+            // the cap the settled path shows raw regardless).
+            let capF = Float(t.maxSettle)
             if encodeDenoise(accum: curAccum, guide: curGuide,
                              guideNormal: curGuideNormal, output: displayTex,
-                             strength: strength, camera: camera, cmd: cmd) {
+                             strength: strength,
+                             fadeEnd: capF * 0.6, fadeEndSpec: capF,
+                             camera: camera, cmd: cmd) {
                 displaySource = displayTex
             }
         }

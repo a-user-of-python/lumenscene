@@ -207,10 +207,23 @@ final class GameRuntime {
     /// Pending (source node, out pin) fires awaiting delivery.
     private var fireQueue: [(from: UUID, pin: String)] = []
     /// Deliveries spent in the current entry point (tick / start /
-    /// tap). Reset by the entry point, shared by every drain it
-    /// triggers, capped at 1024 — excess fires are dropped.
+    /// tap). Reset ONCE by the entry point and shared by every
+    /// drain it triggers (v4.2: tick's two drains draw on ONE
+    /// budget — previously the post-advance drain reset it, which
+    /// handed a self-sustaining fire cycle a fresh budget every
+    /// phase, forever). Capped at deliveryCap; past the cap the
+    /// drain stops and undelivered fires stay queued (F9).
     private var deliveriesUsed = 0
     private let deliveryCap = 1024
+    /// v4.2 storm breaker: consecutive ticks whose final drain
+    /// still could not empty the queue within the tick budget.
+    /// A finite chain always drains within a few ticks; only a
+    /// self-sustaining cycle (a graph loop that re-seeds itself
+    /// every drain) saturates indefinitely — after
+    /// stormTickLimit consecutive saturated ticks the backlog is
+    /// cleared so no wiring can pin the main thread forever.
+    private var saturatedTicks = 0
+    private let stormTickLimit = 4
 
     // MARK: - Deterministic RNG (splitmix64)
 
@@ -314,6 +327,10 @@ final class GameRuntime {
                             Float(camera.playPosition.count > 2 ? camera.playPosition[2] : 3.5)),
                          yaw: camera.playYaw, pitch: camera.playPitch)
         checkpointPose = nil
+        // v4.2: the player position is valid from the first tick
+        // onward — a spawn wired to Play Starts can already read
+        // it (Spawn at Player) before any tick has run.
+        lastPlayerPos = playEntryPose.position
         // N6: a fall node starts armed only when the player starts
         // at or above its height — starting below the line is not
         // a drop. The existing re-arm logic in
@@ -392,6 +409,7 @@ final class GameRuntime {
         particleGravityScale = 1
         fireQueue = []
         deliveriesUsed = 0
+        saturatedTicks = 0
         emitters = [:]
         decimationCache = [:]
         collisionTris = []
@@ -453,7 +471,13 @@ final class GameRuntime {
         fireDueDelays()
         checkAreas(playerPos: playerPos)
         checkProximityAndFall(playerPos: playerPos)
-        processQueue()
+        // v4.2: ONE delivery budget per tick, shared by both
+        // drains. The first drain is soft-capped at 3/4 of the
+        // budget so behaviour fires raised during the advance
+        // phase (tween "arrived", chase "caught") always keep a
+        // reserve — the F9 starvation concern — without handing
+        // a self-sustaining cycle a second full budget per tick.
+        processQueue(limit: deliveryCap * 3 / 4)
 
         advanceTweens(dt: step)
         advanceRotations(dt: step)
@@ -462,11 +486,26 @@ final class GameRuntime {
         advanceScaleTweens(dt: step)
         applyLightFx()
         expireClones()
-        // F9: the post-advance drain (tween "arrived", behaviour
-        // "arrived"/"caught" fires) gets a FRESH delivery budget,
-        // so a busy first drain cannot starve it.
-        deliveriesUsed = 0
-        processQueue()
+        processQueue(limit: deliveryCap)
+        // v4.2 storm breaker: if the post-advance drain STILL
+        // ends with undelivered fires, this tick was saturated.
+        // Finite chains clear the counter by draining; a cycle
+        // that re-seeds itself every drain saturates every tick,
+        // and after stormTickLimit in a row its backlog is
+        // dropped — the one deliberate drop, so no graph wiring
+        // (e.g. a caught chain looped back on itself) can freeze
+        // the app. Ordinary chains never come near this: the
+        // breaker needs >~4,000 undelivered deliveries sustained
+        // across four consecutive ticks.
+        if fireQueue.isEmpty {
+            saturatedTicks = 0
+        } else {
+            saturatedTicks += 1
+            if saturatedTicks >= stormTickLimit {
+                fireQueue.removeAll()
+                saturatedTicks = 0
+            }
+        }
 
         updateEmitters(dt: Float(step))
         buildAndSendSoups()
@@ -622,24 +661,29 @@ final class GameRuntime {
     /// Drains the fire queue: each fire delivers to every link
     /// leaving that pin, executing the target node. Executions may
     /// enqueue further fires, which the same drain picks up.
-    /// F9: past the per-phase delivery cap the drain STOPS and the
+    /// F9: past the delivery limit the drain STOPS and the
     /// undelivered fires stay queued for the next entry point —
-    /// no fire is silently dropped, and a fire is never delivered
-    /// half-way (the cap is checked against a whole fire's links
-    /// before it is consumed, except for a single fire whose own
-    /// link count alone exceeds the remaining cap).
-    private func processQueue() {
+    /// no fire is silently dropped (the storm breaker in tick()
+    /// is the one deliberate exception), and a fire is never
+    /// delivered half-way (the limit is checked against a whole
+    /// fire's links before it is consumed, except for a single
+    /// fire whose own link count alone exceeds the remaining
+    /// budget). `limit` is the entry point's total budget;
+    /// deliveriesUsed carries across the drains of one entry
+    /// point, so a limit below deliveryCap acts as a soft cap
+    /// that reserves the remainder for a later drain.
+    private func processQueue(limit: Int = 1024) {
         var head = 0
         while head < fireQueue.count {
             let fire = fireQueue[head]
             let links = linksByPin[pinKey(fire.from, fire.pin)] ?? []
             if deliveriesUsed > 0
-                && deliveriesUsed + links.count > deliveryCap {
+                && deliveriesUsed + links.count > limit {
                 break   // keep this fire (and everything after it) queued
             }
             head += 1
             for link in links {
-                if deliveriesUsed >= deliveryCap { break }
+                if deliveriesUsed >= limit { break }
                 deliveriesUsed += 1
                 if let target = nodesByID[link.to] {
                     execute(target, inputPin: link.toPin)
@@ -863,10 +907,22 @@ final class GameRuntime {
                 // CURRENT runtime material is passed explicitly as
                 // the override, per the spawn contract.
                 var transform = currentTransform(of: source)
-                if let atID = node.ref("at"),
+                if node.boolean("atPlayer", false) {
+                    // v4.2: spawn at the player — the clone keeps
+                    // the source's facing/scale and lands at the
+                    // player's feet (eye position − 1.7 eye
+                    // height; Play locks eye height, so this is
+                    // the floor the player is standing on).
+                    transform.position = [Double(lastPlayerPos.x),
+                                          Double(lastPlayerPos.y - 1.7),
+                                          Double(lastPlayerPos.z)]
+                } else if let atID = node.ref("at"),
                    let atObject = session.project.scene.object(id: atID) {
                     transform = currentTransform(of: atObject)
                 }
+                // v4.2: displacement — the clone lands offset
+                // from the anchor instead of exactly inside it.
+                applySpawnOffset(node, to: &transform)
                 let material = currentMaterial(of: source)
                 let ids = session.runtimeSpawnClones(
                     [(sourceID: sourceID, transform: transform, material: material)])
@@ -882,7 +938,19 @@ final class GameRuntime {
             if let sourceID = node.ref("source"),
                let source = session.project.scene.object(id: sourceID) {
                 let template = currentTransform(of: source)
-                let centre = position(of: template)
+                // v4.2: the pattern centre is the source's
+                // position, or the player's feet with Centre on
+                // Player; the offset then shifts the whole centre
+                // — it composes with the pattern's own placement
+                // (every clone keeps its pattern position relative
+                // to the shifted centre).
+                var centre = position(of: template)
+                if node.boolean("atPlayer", false) {
+                    centre = SIMD3<Float>(lastPlayerPos.x,
+                                          lastPlayerPos.y - 1.7,
+                                          lastPlayerPos.z)
+                }
+                centre += spawnOffset(of: node)
                 let count = clampedInt(node.num("count", 8), 1, 64)
                 let spacing = Float(node.num("spacing", 1.5))
                 let radius = Float(node.num("radius", 4))
@@ -1049,11 +1117,24 @@ final class GameRuntime {
 
         case "actChasePlayer":
             if let id = node.ref("object"),
-               session.project.scene.object(id: id) != nil {
+               let obj = session.project.scene.object(id: id) {
                 var behaviour = MovementBehaviour(kind: .chase, nodeID: node.id)
                 behaviour.speed = node.num("speed", 2)
                 behaviour.stopDistance = node.num("stopDistance", 1.2)
                 behaviour.fly = node.boolean("fly", false)
+                // v4.2: a chase (re)started while the pair are
+                // already inside the re-arm radius starts
+                // DISARMED — otherwise wiring Caught back into
+                // Chase Player refires Caught on the very next
+                // tick, every tick, for as long as they stay in
+                // range. Arming follows the tick's own hysteresis:
+                // armed only when currently beyond 1.5× the catch
+                // radius (same caughtRadius as advanceMovement).
+                var toPlayer = lastPlayerPos
+                    - position(of: currentTransform(of: obj))
+                if !behaviour.fly { toPlayer.y = 0 }
+                let caughtRadius = max(Float(behaviour.stopDistance), 0.05)
+                behaviour.caughtArmed = simd_length(toPlayer) > caughtRadius * 1.5
                 movement[id] = behaviour
                 tweens[id] = nil
             }
@@ -1434,6 +1515,25 @@ final class GameRuntime {
         SIMD3<Float>(Float(t.position[0]), Float(t.position[1]), Float(t.position[2]))
     }
 
+    /// v4.2: the spawn nodes' Offset X/Y/Z params as a vector
+    /// (metres, world axes). Zero for nodes saved before the
+    /// params existed (catalogue defaults merge at start()).
+    private func spawnOffset(of node: LogicNode) -> SIMD3<Float> {
+        SIMD3<Float>(Float(node.num("offsetX", 0)),
+                     Float(node.num("offsetY", 0)),
+                     Float(node.num("offsetZ", 0)))
+    }
+
+    /// v4.2: shift a spawn transform's position by the node's
+    /// offset (no-op at the zero default).
+    private func applySpawnOffset(_ node: LogicNode, to transform: inout Transform3) {
+        let offset = spawnOffset(of: node)
+        if offset != .zero {
+            let p = position(of: transform) + offset
+            transform.position = [Double(p.x), Double(p.y), Double(p.z)]
+        }
+    }
+
     // MARK: - MoveTo tweens
 
     private func startMoveTo(_ node: LogicNode) {
@@ -1595,6 +1695,20 @@ final class GameRuntime {
                 }
 
             case .chase:
+                // v4.2: a hidden chaser neither hunts nor catches.
+                // The natural Caught wiring — Show Message, then
+                // Hide the chaser — must END the hunt: previously
+                // the behaviour kept steering invisibly, re-armed
+                // whenever the player stepped past the re-arm
+                // radius, and caught them again, forever. The slot
+                // is kept (a later Show resumes the chase) but
+                // disarmed, so a re-show inside the catch radius
+                // doesn't instantly re-fire Caught either.
+                if !session.runtimeIsObjectVisible(id) {
+                    behaviour.caughtArmed = false
+                    movement[id] = behaviour
+                    break
+                }
                 var cur = position(of: currentTransform(of: obj))
                 var toPlayer = lastPlayerPos - cur
                 if !behaviour.fly { toPlayer.y = 0 }

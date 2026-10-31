@@ -999,22 +999,57 @@ kernel void guideKernel(
 // the primary-hit position, the interpolated surface normal, and
 // luminance. Neighbours blend only within the same reusability
 // class (diffuse/emissive vs glass/environment), so the filter
-// never smears across glass or silhouette edges. The blend fades
-// out as a pixel's sample count climbs toward ~96, handing over
-// to the raw (unbiased) image; the renderer only runs this pass
-// for interactive / Play display and always shows the settled
-// frame raw. Output keeps the accumulated-sum convention
-// (rgb = mean * alpha) so the tonemap is unchanged.
+// never smears across glass or silhouette edges. Output keeps
+// the accumulated-sum convention (rgb = mean * alpha) so the
+// tonemap is unchanged. This pass is DISPLAY-ONLY: it reads the
+// accumulation and writes a separate display texture; the
+// accumulation itself — and therefore the settled frame and
+// every still export — is never touched by it.
+//
+// v4.2 REWORK (device report 2026-10-31: "still getting a
+// little bit of fuzz", worst on an emissive-lit textured face
+// and in a dark glossy reflection): the v3 fade handed over to
+// raw at ~96 effective samples for EVERY class, and the pass
+// stopped running at 160 global samples — leaving the whole
+// 160→768 settle tail raw. Diffuse at 96 samples is fairly
+// clean; glossy/reflection pixels (the non-reusable class)
+// carry several times the per-sample variance and got the
+// same 96 budget. Now the fade is class-aware and driven by
+// uniforms: the blend reaches zero at fadeEnd for the reusable
+// class and at fadeEndSpec (the settle cap) for the
+// non-reusable class, along a smoothstep that starts at a
+// quarter of the hand-off. The non-reusable class also gets a
+// wider luminance sigma and a softer normal exponent below:
+// its neighbours legitimately differ (each reflects a
+// different part of the room), so the v3 weights rejected
+// exactly the neighbours the noisiest class needed. Young
+// pixels (< 32 effective samples — reflection pixels restart
+// from zero on every camera move) additionally sample four
+// diagonal taps at distance 2, phased out by 32 samples.
 
 struct DenoiseUniforms {
     float3 camOrigin;
     float strength;
-    float pad0;
-    float pad1;
+    // Effective-sample count where the blend reaches zero, per
+    // reusability class (v4.2; formerly two pad floats).
+    float fadeEnd;
+    float fadeEndSpec;
 };
 
 static float denoiseLuminance(float3 c) {
     return dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+// One neighbour's bilateral weight (position × normal ×
+// luminance), before the spatial kernel weight is applied.
+static float denoiseTapWeight(float3 cPos, float3 cN, float cLum,
+                              float3 nPos, float3 nN, float nLum,
+                              float sp, float lumSigma, float nPow) {
+    float3 dp = nPos - cPos;
+    float wp = exp(-dot(dp, dp) / (2.0f * sp * sp));
+    float wn = pow(clamp(dot(cN, nN), 0.0f, 1.0f), nPow);
+    float wl = exp(-abs(nLum - cLum) / lumSigma);
+    return wp * wn * wl;
 }
 
 kernel void denoiseKernel(
@@ -1041,6 +1076,16 @@ kernel void denoiseKernel(
     // Position tolerance scales with distance from the camera.
     float sp = max(0.04f, 0.012f * distance(u.camOrigin, gc.xyz));
 
+    // v4.2: the non-reusable class (glass / environment /
+    // reflection-dominant) gets a wider luminance sigma and a
+    // softer normal exponent — its neighbours legitimately
+    // differ in radiance (each reflects a different part of
+    // the room), and the v3 weights rejected them, leaving
+    // the highest-variance class with the least filtering.
+    bool specClass = gc.w < 0.5f;
+    float lumSigma = (0.12f + 0.25f * lumC) * (specClass ? 2.25f : 1.0f);
+    float nPow = specClass ? 4.0f : 6.0f;
+
     float3 sum = float3(0);
     float wSum = 0.0f;
     for (int dy = -1; dy <= 1; ++dy) {
@@ -1053,19 +1098,46 @@ kernel void denoiseKernel(
             if (nAcc.a < 1.0f) continue;
             float3 meanN = nAcc.rgb / max(nAcc.a, 1.0f);
             float3 nn = guideNormal.read(uint2(np)).xyz;
-            float3 dp = g.xyz - gc.xyz;
-            float wp = exp(-dot(dp, dp) / (2.0f * sp * sp));
-            float wn = pow(clamp(dot(nc, nn), 0.0f, 1.0f), 6.0f);
-            float wl = exp(-abs(denoiseLuminance(meanN) - lumC) / (0.12f + 0.25f * lumC));
             float ws = (dx == 0 && dy == 0) ? (4.0f / 16.0f)
                      : ((dx == 0 || dy == 0) ? (2.0f / 16.0f) : (1.0f / 16.0f));
-            float w = wp * wn * wl * ws;
+            float w = denoiseTapWeight(gc.xyz, nc, lumC, g.xyz, nn,
+                                       denoiseLuminance(meanN),
+                                       sp, lumSigma, nPow) * ws;
             sum += meanN * w;
             wSum += w;
         }
     }
+    // v4.2: young pixels get four extra diagonal taps at
+    // distance 2 (a 5x5-ish footprint for the worst noise),
+    // phased out by 32 effective samples.
+    float young = clamp((32.0f - c.a) / 32.0f, 0.0f, 1.0f);
+    if (young > 0.0f) {
+        for (int sy = -1; sy <= 1; sy += 2) {
+            for (int sx = -1; sx <= 1; sx += 2) {
+                int2 np = int2(pixel) + int2(2 * sx, 2 * sy);
+                if (np.x < 0 || np.y < 0 || np.x >= int(width) || np.y >= int(height)) continue;
+                float4 g = guide.read(uint2(np));
+                if (g.w != gc.w) continue;
+                float4 nAcc = accum.read(uint2(np));
+                if (nAcc.a < 1.0f) continue;
+                float3 meanN = nAcc.rgb / max(nAcc.a, 1.0f);
+                float3 nn = guideNormal.read(uint2(np)).xyz;
+                float w = denoiseTapWeight(gc.xyz, nc, lumC, g.xyz, nn,
+                                           denoiseLuminance(meanN),
+                                           sp, lumSigma, nPow)
+                        * (1.0f / 16.0f) * young;
+                sum += meanN * w;
+                wSum += w;
+            }
+        }
+    }
     float3 filtered = wSum > 1e-6f ? sum / wSum : mean;
-    float fade = clamp(1.0f - c.a / 96.0f, 0.0f, 1.0f);
+    // v4.2: class-aware hand-off — the blend now reaches zero
+    // at the per-class fade end (a smoothstep starting at a
+    // quarter of it) instead of a flat 96 samples for all.
+    float fadeEnd = specClass ? u.fadeEndSpec : u.fadeEnd;
+    float fade = fadeEnd > 0.0f
+        ? 1.0f - smoothstep(0.25f * fadeEnd, fadeEnd, c.a) : 0.0f;
     float3 blended = mix(mean, filtered, u.strength * fade);
     output.write(float4(blended * c.a, c.a), pixel);
 }

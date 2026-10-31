@@ -423,21 +423,29 @@ enum NodeCatalog {
 
         NodeKindSpec(
             kind: "actSpawn", title: "Spawn Object", category: "Actions",
-            blurb: "Makes a copy of the chosen object appear. Spawned copies are decoration — particles and taps pass them by.",
+            blurb: "Makes a copy of the chosen object appear at another object (or at the player), shifted by the offset. Spawned copies are decoration — particles and taps pass them by.",
             hasIn: true, outs: ["out"],
             params: [
                 NodeParamSpec(key: "source", label: "Source Object", type: .objectRef, def: .ref(nil)),
                 NodeParamSpec(key: "at", label: "At Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "atPlayer", label: "Spawn at Player (ignores At Object)", type: .bool, def: .bool(false)),
+                NodeParamSpec(key: "offsetX", label: "Offset X (m)", type: .number, def: .number(0), min: -50, max: 50),
+                NodeParamSpec(key: "offsetY", label: "Offset Y (m)", type: .number, def: .number(0), min: -50, max: 50),
+                NodeParamSpec(key: "offsetZ", label: "Offset Z (m)", type: .number, def: .number(0), min: -50, max: 50),
                 NodeParamSpec(key: "lifetime", label: "Lifetime (seconds, 0 = until despawned)", type: .number, def: .number(0), min: 0, max: 600),
             ]),
 
         NodeKindSpec(
             kind: "actSpawnPattern", title: "Spawn Pattern", category: "Actions",
-            blurb: "Makes many copies of the chosen object appear in a pattern around it. Spawned copies are decoration — particles and taps pass them by.",
+            blurb: "Makes many copies of the chosen object appear in a pattern around the source object (or around the player), shifted by the offset. Spawned copies are decoration — particles and taps pass them by.",
             hasIn: true, outs: ["out"],
             params: [
                 NodeParamSpec(key: "source", label: "Source Object", type: .objectRef, def: .ref(nil)),
                 NodeParamSpec(key: "pattern", label: "Pattern", type: .choice, def: .text("Grid"), choices: ["Grid", "Ring", "Scatter", "Line"]),
+                NodeParamSpec(key: "atPlayer", label: "Centre on Player (pattern forms around you)", type: .bool, def: .bool(false)),
+                NodeParamSpec(key: "offsetX", label: "Offset X (m)", type: .number, def: .number(0), min: -50, max: 50),
+                NodeParamSpec(key: "offsetY", label: "Offset Y (m)", type: .number, def: .number(0), min: -50, max: 50),
+                NodeParamSpec(key: "offsetZ", label: "Offset Z (m)", type: .number, def: .number(0), min: -50, max: 50),
                 NodeParamSpec(key: "count", label: "Count", type: .number, def: .number(8), min: 1, max: 64),
                 NodeParamSpec(key: "spacing", label: "Spacing (m)", type: .number, def: .number(1.5), min: 0.1, max: 50),
                 NodeParamSpec(key: "radius", label: "Radius (m)", type: .number, def: .number(4), min: 0.5, max: 100),
