@@ -126,6 +126,7 @@ final class Renderer {
     private var denoisePipeline: MTLComputePipelineState?
     private var tonemapPipeline: MTLRenderPipelineState?
     private var precipPipeline: MTLRenderPipelineState?
+    private var precipSeedBuffer: MTLBuffer?
 
     // Scene GPU state.
     private var accel: MTLAccelerationStructure?
@@ -198,10 +199,13 @@ final class Renderer {
     var weatherMode: Int = 0
     var weatherWet: Float = 0
     var weatherSnow: Float = 0
+    var precipAvailable: Bool { precipPipeline != nil }
     /// Weather levels used by the previous draw; a change softens
     /// reprojection history so the ground visibly wets/dries.
     private var lastWet: Float = 0
     private var lastSnow: Float = 0
+    private var lastTracedWet: Float = -1
+    private var lastTracedSnow: Float = -1
 
     /// 0 = Auto, 1 = High detail, 2 = Battery saver.
     var qualityPreference: Int = 0
@@ -271,6 +275,28 @@ final class Renderer {
             desc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
             desc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
             precipPipeline = try? device.makeRenderPipelineState(descriptor: desc)
+        }
+        // Precipitation seeds: 2048 x SIMD4<Float>, each component
+        // in [0,1), from a deterministic LCG so frames are stable.
+        do {
+            var seeds: [SIMD4<Float>] = []
+            seeds.reserveCapacity(2048)
+            var state: UInt32 = 12345
+            for _ in 0..<2048 {
+                state = state &* 1664525 &+ 1013904223
+                let x = Float(state >> 8) * (1.0 / 16777216.0)
+                state = state &* 1664525 &+ 1013904223
+                let y = Float(state >> 8) * (1.0 / 16777216.0)
+                state = state &* 1664525 &+ 1013904223
+                let z = Float(state >> 8) * (1.0 / 16777216.0)
+                state = state &* 1664525 &+ 1013904223
+                let w = Float(state >> 8) * (1.0 / 16777216.0)
+                seeds.append(SIMD4<Float>(x, y, z, w))
+            }
+            precipSeedBuffer = seeds.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return nil }
+                return device.makeBuffer(bytes: base, length: raw.count, options: .storageModeShared)
+            }
         }
         thermalObserver = NotificationCenter.default.addObserver(
             forName: ProcessInfo.thermalStateDidChangeNotification,
@@ -861,6 +887,37 @@ final class Renderer {
             || simd_length(a.up - b.up) > 1e-5
     }
 
+    /// Precipitation overlay (live draw only): a fresh pass
+    /// over the presented drawable, loading what the tonemap
+    /// wrote. Rain = 1600 instances, snow = 1200 instances.
+    private func encodePrecip(cmd: MTLCommandBuffer, drawable: CAMetalDrawable, camera: CameraBasis, view: MTKView) {
+        if weatherMode == 1 || weatherMode == 2, let precipPipeline, let precipSeedBuffer {
+            let precipPass = MTLRenderPassDescriptor()
+            precipPass.colorAttachments[0].texture = drawable.texture
+            precipPass.colorAttachments[0].loadAction = .load
+            precipPass.colorAttachments[0].storeAction = .store
+            if let penc = cmd.makeRenderCommandEncoder(descriptor: precipPass) {
+                penc.setRenderPipelineState(precipPipeline)
+                var pu = PrecipUniforms()
+                pu.camOrigin = SIMD4<Float>(camera.origin, 0)
+                pu.camRight = SIMD4<Float>(camera.right, 0)
+                pu.camUp = SIMD4<Float>(camera.up, 0)
+                pu.camForward = SIMD4<Float>(camera.forward, 0)
+                pu.tanFovAspect = SIMD2<Float>(
+                    tan(fovY / 2),
+                    Float(view.drawableSize.width) / Float(max(view.drawableSize.height, 1)))
+                pu.time = Float(CACurrentMediaTime().truncatingRemainder(dividingBy: 3600))
+                pu.mode = UInt32(weatherMode)
+                penc.setVertexBytes(&pu, length: MemoryLayout<PrecipUniforms>.stride, index: 0)
+                penc.setBuffer(precipSeedBuffer, offset: 0, index: 1)
+                let particleCount = weatherMode == 1 ? 1600 : 1200
+                penc.drawPrimitives(type: .triangle, vertexStart: 0,
+                                    vertexCount: particleCount * 6)
+                penc.endEncoding()
+            }
+        }
+    }
+
     /// One frame for the live MTKView. Returns true when another
     /// frame would still change the picture (the caller chains the
     /// next draw only then — a converged, untouched scene sleeps).
@@ -881,6 +938,8 @@ final class Renderer {
         // in pre-change samples.
         let weatherLevelsMoved = abs(weatherWet - lastWet) > 0.004
             || abs(weatherSnow - lastSnow) > 0.004
+        let weatherLevelsQuiet = abs(weatherWet - lastTracedWet) <= 0.004
+            && abs(weatherSnow - lastTracedSnow) <= 0.004
         let pixelW = max(1, Int(Float(view.drawableSize.width) * t.scale))
         let pixelH = max(1, Int(Float(view.drawableSize.height) * t.scale))
         if accumTex[0] == nil || accumTex[0]!.width != pixelW || accumTex[0]!.height != pixelH {
@@ -902,9 +961,12 @@ final class Renderer {
         // Settled fast path: history valid, camera identical to
         // the last presented frame, sample cap reached — just
         // present the finished image (which lives in the other
-        // ping-pong slot) and sleep. Never taken while weather
-        // is active (precipitation must keep animating).
-        if accel != nil, weatherMode == 0, historyValid, sampleCount >= t.maxSettle,
+        // ping-pong slot) and sleep. Also serves weather-on
+        // frames when the wet/snow levels have not moved since
+        // the last trace (the settled image already includes
+        // that shading); precipitation is overlaid on top and
+        // the frame chain stays alive so it keeps animating.
+        if accel != nil, (weatherMode == 0 || weatherLevelsQuiet), historyValid, sampleCount >= t.maxSettle,
            let pc = prevCamera, !cameraChanged(pc, camera),
            let settled = accumTex[src] {
             if let tonemapPipeline,
@@ -916,12 +978,15 @@ final class Renderer {
                 renc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
                 renc.endEncoding()
             }
+            if weatherMode != 0 {
+                encodePrecip(cmd: cmd, drawable: drawable, camera: camera, view: view)
+            }
             cmd.present(drawable)
             cmd.commit()
             wasMoving = moving
             lastWet = weatherWet
             lastSnow = weatherSnow
-            return false
+            return weatherMode != 0
         }
 
         var traced = false
@@ -971,6 +1036,8 @@ final class Renderer {
                                cap: Float(t.maxSettle), glassBudget: t.glassBudget,
                                cmd: cmd) {
                     traced = true
+                    lastTracedWet = weatherWet
+                    lastTracedSnow = weatherSnow
                     sampleCount += UInt32(t.spp)
                     frameSeedCounter &+= UInt32(t.spp)
                 } else {
@@ -992,7 +1059,7 @@ final class Renderer {
         // frames go through the spatial denoise pass; the settled
         // frame (sampleCount >= maxSettle) is shown raw.
         var displaySource = curAccum
-        if accel != nil, moving || play || sampleCount < t.maxSettle,
+        if accel != nil, moving || play || sampleCount < 160,
            denoisePipeline != nil, let displayTex, let curGuideNormal {
             let strength: Float = (play || moving) ? 1.0 : 0.65
             if encodeDenoise(accum: curAccum, guide: curGuide,
@@ -1012,33 +1079,8 @@ final class Renderer {
             renc.endEncoding()
         }
 
-        // Precipitation overlay (live draw only): a fresh pass
-        // over the presented drawable, loading what the tonemap
-        // wrote. Rain = 900 streaks, snow = 700 sprites.
-        if weatherMode == 1 || weatherMode == 2, let precipPipeline {
-            let precipPass = MTLRenderPassDescriptor()
-            precipPass.colorAttachments[0].texture = drawable.texture
-            precipPass.colorAttachments[0].loadAction = .load
-            precipPass.colorAttachments[0].storeAction = .store
-            if let penc = cmd.makeRenderCommandEncoder(descriptor: precipPass) {
-                penc.setRenderPipelineState(precipPipeline)
-                var pu = PrecipUniforms()
-                pu.camOrigin = SIMD4<Float>(camera.origin, 0)
-                pu.camRight = SIMD4<Float>(camera.right, 0)
-                pu.camUp = SIMD4<Float>(camera.up, 0)
-                pu.camForward = SIMD4<Float>(camera.forward, 0)
-                pu.tanFovAspect = SIMD2<Float>(
-                    tan(fovY / 2),
-                    Float(view.drawableSize.width) / Float(max(view.drawableSize.height, 1)))
-                pu.time = Float(CACurrentMediaTime().truncatingRemainder(dividingBy: 3600))
-                pu.mode = UInt32(weatherMode)
-                penc.setVertexBytes(&pu, length: MemoryLayout<PrecipUniforms>.stride, index: 0)
-                let particleCount = weatherMode == 1 ? 900 : 700
-                penc.drawPrimitives(type: .triangle, vertexStart: 0,
-                                    vertexCount: particleCount * 6)
-                penc.endEncoding()
-            }
-        }
+        // Precipitation overlay (live draw only).
+        encodePrecip(cmd: cmd, drawable: drawable, camera: camera, view: view)
 
         cmd.present(drawable)
         cmd.commit()

@@ -118,6 +118,34 @@ static uint hash32(uint x) {
     return x;
 }
 
+// MARK: - Weather noise (v3.1: shaped wet / snow fields)
+//
+// 2D value noise in [0,1] over an integer lattice. Corner values
+// come from hash32 of the lattice coords mixed with two large
+// odd constants; uint(ix) on a negative coord wraps modulo 2^32,
+// which is fine here — the wrap IS the hash input.
+static float wnoise2(float2 p) {
+    int2 ip = int2(floor(p));
+    float2 f = fract(p);
+    float2 s = f * f * (3.0f - 2.0f * f);
+    uint h00 = hash32((uint(ip.x) * 0x8da6b343u) ^ (uint(ip.y) * 0xd8163841u));
+    uint h10 = hash32((uint(ip.x + 1) * 0x8da6b343u) ^ (uint(ip.y) * 0xd8163841u));
+    uint h01 = hash32((uint(ip.x) * 0x8da6b343u) ^ (uint(ip.y + 1) * 0xd8163841u));
+    uint h11 = hash32((uint(ip.x + 1) * 0x8da6b343u) ^ (uint(ip.y + 1) * 0xd8163841u));
+    float v00 = float(h00 >> 8) * (1.0f / 16777216.0f);
+    float v10 = float(h10 >> 8) * (1.0f / 16777216.0f);
+    float v01 = float(h01 >> 8) * (1.0f / 16777216.0f);
+    float v11 = float(h11 >> 8) * (1.0f / 16777216.0f);
+    return mix(mix(v00, v10, s.x), mix(v01, v11, s.x), s.y);
+}
+
+// 3-octave fbm of wnoise2, output roughly [0,1].
+static float wfbm2(float2 p) {
+    return 0.55f * wnoise2(p)
+         + 0.30f * wnoise2(p * 2.0f)
+         + 0.15f * wnoise2(p * 4.0f);
+}
+
 // MARK: - Helpers
 
 static float3 cosineDirection(float3 n, thread RNG& rng) {
@@ -317,16 +345,72 @@ kernel void pathTraceKernel(
         // the shading normal toward the geometric up-face.
         float upFace = smoothstep(0.5f, 0.85f, geoN.y);
         float wet = u.wetLevel * upFace;
-        float snowC = u.snowLevel * upFace;
+        float snowGlobal = u.snowLevel * upFace;
         float gloss = (mat.texIndex > 0) ? clamp(1.0f - texRough, 0.0f, 1.0f) : 0.0f;
-        if (wet > 0.001f) {
-            albedo *= (1.0f - 0.45f * wet);
-            gloss = max(gloss, wet * 0.85f);
+        // Shaped weather field (v3.1): defaults are exactly the
+        // v3 global behaviour (wetF = wet, snowCover = snowGlobal,
+        // no puddle, drift 0.5, depth = snowGlobal). The shaped
+        // field is only evaluated on the first two bounces —
+        // deeper bounces keep the global levels, since the spatial
+        // detail is invisible there and the noise costs samples.
+        // When both levels are ~0 nothing below changes anything,
+        // so the dry settled image is unchanged from v3.
+        float wetF = wet;
+        float snowCover = snowGlobal;
+        float puddle = 0.0f;
+        float drift = 0.5f;
+        float depth = snowGlobal;
+        if ((u.wetLevel > 0.001f || u.snowLevel > 0.001f) && bounce <= 1u) {
+            // Wetness spreads and pools unevenly.
+            wetF = clamp(wet * (0.7f + 0.6f * wfbm2(hitPos.xz * 1.3f + float2(4.7f, 9.1f))),
+                         0.0f, 1.0f);
+            // Puddles: low spots of a broad field fill once the
+            // rain level pushes the threshold below their value.
+            float pf = wfbm2(hitPos.xz * 0.32f + float2(17.31f, 3.97f));
+            float thr = mix(1.05f, 0.35f,
+                            pow(clamp(u.wetLevel, 0.0f, 1.0f), 0.75f));
+            puddle = smoothstep(thr + 0.05f, thr - 0.05f, pf) * upFace
+                   * smoothstep(0.03f, 0.15f, u.wetLevel);
+            // Snow piles in drifts: depth varies with the field,
+            // cover turns on where the drifted depth is enough.
+            drift = wfbm2(hitPos.xz * 0.5f + float2(9.17f, 27.3f));
+            depth = u.snowLevel * mix(0.3f, 1.7f, drift);
+            snowCover = smoothstep(0.45f, 0.75f, depth) * upFace;
         }
-        if (snowC > 0.001f) {
-            albedo = mix(albedo, float3(0.88f, 0.91f, 0.97f), snowC * 0.92f);
-            gloss *= (1.0f - snowC);
-            shadingN = normalize(mix(shadingN, geoN, snowC * 0.6f));
+        // 1. Wet: darkened, glossier.
+        if (wetF > 0.001f) {
+            albedo *= (1.0f - 0.45f * wetF);
+            gloss = max(gloss, wetF * 0.85f);
+        }
+        // 2. Puddle: mirror-flat standing water over the wet base.
+        if (puddle > 0.001f) {
+            albedo *= (1.0f - 0.5f * puddle);
+            gloss = max(gloss, puddle);
+            shadingN = normalize(mix(shadingN, geoN, puddle));
+        }
+        // 3. Snow: whitened, gloss killed, normal mounded by the
+        // drift gradient (or softened toward the face, as v3).
+        if (snowCover > 0.001f) {
+            snowCover *= (1.0f - puddle); // no snow inside puddles
+        }
+        if (snowCover > 0.001f) {
+            albedo = mix(albedo, float3(0.88f, 0.91f, 0.97f), snowCover * 0.92f);
+            albedo *= 1.0f - 0.18f * snowCover * (1.0f - drift);
+            gloss *= (1.0f - snowCover);
+            bool relief = false;
+            if (bounce <= 1u && geoN.y > 0.7f) {
+                float gx = wfbm2((hitPos.xz + float2(0.35f, 0.0f)) * 0.5f
+                                 + float2(9.17f, 27.3f)) - drift;
+                float gz = wfbm2((hitPos.xz + float2(0.0f, 0.35f)) * 0.5f
+                                 + float2(9.17f, 27.3f)) - drift;
+                float3 mound = normalize(float3(-gx * depth * 1.4f, 1.0f,
+                                                -gz * depth * 1.4f));
+                shadingN = normalize(mix(shadingN, mound, snowCover * 0.6f));
+                relief = true;
+            }
+            if (!relief) {
+                shadingN = normalize(mix(shadingN, geoN, snowCover * 0.6f));
+            }
         }
 
         // ---- Glass: reflect / refract with Fresnel. Past the
@@ -741,13 +825,15 @@ fragment float4 tonemapFragment(VSOut in [[stage_in]],
 
 // MARK: - Precipitation overlay (v3: rain / snow, live draw only)
 //
-// Procedural particles in a camera-centred box, generated purely
-// from the vertex id — no buffers. Each particle is a camera-
-// aware quad (two triangles, 6 vertices): rain is a short streak
-// aligned to its fall velocity; snow is a camera-facing soft
-// sprite. Projection is manual (same basis maths as the primary
-// ray) and the pass has no depth attachment, so particles simply
-// blend over the tonemapped frame in draw order.
+// Procedural particles in a camera-centred box, seeded from a
+// per-particle buffer (v3.1: buffer(1), 2048 float4 entries of
+// (cellX, cellY, cellZ, rand), each in [0,1] — placement and
+// speed come from the seed, not a vertex-id hash). Each particle
+// is a camera-aware quad (two triangles, 6 vertices): rain is a
+// short streak aligned to its fall velocity; snow is a camera-
+// facing soft sprite. Projection is manual (same basis maths as
+// the primary ray) and the pass has no depth attachment, so
+// particles simply blend over the tonemapped frame in draw order.
 
 struct PrecipUniforms {
     float3 camOrigin;
@@ -766,12 +852,9 @@ struct PrecipOut {
     float kind; // 1 rain, 2 snow (mirrors PrecipUniforms.mode)
 };
 
-static float precipHash(uint x) {
-    return float(hash32(x) >> 8) * (1.0f / 16777216.0f);
-}
-
 vertex PrecipOut precipVertex(uint vid [[vertex_id]],
-                              constant PrecipUniforms& u [[buffer(0)]]) {
+                              constant PrecipUniforms& u [[buffer(0)]],
+                              device const float4* seeds [[buffer(1)]]) {
     PrecipOut out;
     out.uv = float2(0);
     out.fade = 0.0f;
@@ -785,20 +868,21 @@ vertex PrecipOut precipVertex(uint vid [[vertex_id]],
     float cy = (corner == 2u || corner == 3u || corner == 5u) ? 1.0f : -1.0f;
     out.uv = float2(cx * 0.5f + 0.5f, cy * 0.5f + 0.5f);
 
+    // Buffer-driven seed: xyz = base cell in [0,1]^3, w = the
+    // particle's random (speed, sway phase, flake size).
+    float4 seed = seeds[inst];
+    float3 base = seed.xyz;
+
     bool rain = u.mode == 1u;
     float3 box = rain ? float3(36.0f, 22.0f, 36.0f) : float3(34.0f, 20.0f, 34.0f);
-    float hSpeed = precipHash(inst * 5u + 3u);
-    float speed = rain ? (10.0f + hSpeed * 3.0f) : (1.0f + hSpeed * 0.9f);
+    float speed = rain ? (10.0f + seed.w * 4.0f) : (0.9f + seed.w * 1.1f);
     float3 wind = float3(1.2f, 0.0f, 0.4f);
 
-    float3 base = float3(precipHash(inst * 5u + 0u),
-                         precipHash(inst * 5u + 1u),
-                         precipHash(inst * 5u + 2u));
     float3 p = base * box;
     p.y = fmod(p.y - u.time * speed, box.y);
     if (p.y < 0.0f) p.y += box.y;
     if (!rain) {
-        float phase = precipHash(inst * 5u + 4u) * 6.2831853f;
+        float phase = seed.w * 6.2831853f;
         p.x += sin(u.time * 0.8f + phase) * 0.35f;
     }
     // Box is centred on the camera in xz; y runs from 2 m below
@@ -819,9 +903,11 @@ vertex PrecipOut precipVertex(uint vid [[vertex_id]],
         float3 sideRaw = cross(axis, viewDir);
         float sideLen = length(sideRaw);
         float3 side = sideLen > 1e-4f ? sideRaw / sideLen : u.camRight;
-        world = centre + side * (cx * 0.014f * 0.5f) + axis * (cy * 0.5f * 0.5f);
+        // Streak: 0.016 m half-width, 0.6 m long (0.3 half-length).
+        world = centre + side * (cx * 0.016f) + axis * (cy * 0.3f);
     } else {
-        float size = 0.05f + precipHash(inst * 5u + 4u) * 0.05f;
+        // Camera-facing disc, diameter 0.09–0.18 m by seed.
+        float size = 0.09f + seed.w * 0.09f;
         world = centre + u.camRight * (cx * size * 0.5f) + u.camUp * (cy * size * 0.5f);
     }
 
@@ -834,7 +920,7 @@ vertex PrecipOut precipVertex(uint vid [[vertex_id]],
 
     float farDist = rain ? 30.0f : 28.0f;
     float fadeFar = 1.0f - smoothstep(farDist * 0.65f, farDist, centreDist);
-    float fadeNear = smoothstep(0.0f, 1.2f, centreDist);
+    float fadeNear = smoothstep(0.0f, 0.8f, centreDist);
     out.fade = fadeFar * fadeNear;
     return out;
 }
@@ -843,7 +929,7 @@ fragment float4 precipFragment(PrecipOut in [[stage_in]]) {
     if (in.kind < 1.5f) {
         // Rain: faint blue-grey streak, fading along its length.
         float lengthFade = sin(3.14159265f * clamp(in.uv.y, 0.0f, 1.0f));
-        float alpha = 0.30f * lengthFade * in.fade;
+        float alpha = 0.50f * lengthFade * in.fade;
         return float4(float3(0.72f, 0.80f, 0.95f), alpha);
     }
     // Snow: soft radial disc.

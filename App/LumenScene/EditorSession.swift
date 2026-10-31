@@ -29,6 +29,14 @@ final class EditorSession: ObservableObject {
     private var redoStack: [Data] = []
     private var editGestureAt: Date = .distantPast
 
+    /// Live weather build-up (source of truth while editing).
+    /// Mutating `project` every frame would fire objectWillChange
+    /// 60x/s and re-evaluate the whole editor UI, so frameTick
+    /// advances these plain accumulators and only syncs the
+    /// published values when the displayed percentage changes.
+    private var buildupWet: Double = 0
+    private var buildupSnow: Double = 0
+
     var pressedKeys: Set<MoveKey> = []
 
     /// Touch joystick vector (Play mode): x = strafe right,
@@ -50,6 +58,8 @@ final class EditorSession: ObservableObject {
                 meshes[obj.id] = mesh
             }
         }
+        buildupWet = project.scene.weather.wetness
+        buildupSnow = project.scene.weather.snow
         renderer.onNeedsFrame = { [weak self] in self?.kickRender() }
         _ = renderer.reloadTextureArraysIfNeeded()
         renderer.rebuild(scene: project.scene, meshes: meshes)
@@ -433,12 +443,27 @@ final class EditorSession: ObservableObject {
     /// state, but NOT undoable — undo snapshots only cover objects,
     /// so no beginEdit() here.
     func setWeatherMode(_ mode: Int) {
+        // Accumulators stay the source of truth — do not reset
+        // them on a mode change (they were initialised from the
+        // project and are kept in sync with it).
         project.scene.weather.mode = mode
         kickRender()
+        if mode != 0 && !renderer.precipAvailable {
+            status = "Precipitation unavailable on this device — ground effects still apply."
+        }
+    }
+
+    /// Flush the live build-up accumulators into the published
+    /// project. Called before anything writes the project to disk.
+    func syncWeatherToProject() {
+        project.scene.weather.wetness = buildupWet
+        project.scene.weather.snow = buildupSnow
     }
 
     /// Clear rain wetness / snow cover back to dry ground.
     func clearWeatherBuildup() {
+        buildupWet = 0
+        buildupSnow = 0
         project.scene.weather.wetness = 0
         project.scene.weather.snow = 0
         renderer.resetAccumulation()
@@ -453,23 +478,37 @@ final class EditorSession: ObservableObject {
         defer { lastTick = now }
         let dt = lastTick.map { Float(now - $0) } ?? 0
         if dt > 0 && dt < 0.25 { applyMovement(dt: dt) }
-        // Weather build-up advances with real time while it is
-        // precipitating: rain wets the ground over ~75 s and melts
-        // snow slowly; snow covers the ground over ~100 s.
-        if project.scene.weather.mode != 0, dt > 0, dt <= 0.25 {
+        // Weather build-up advances with real time: rain wets
+        // the ground over ~75 s and melts snow slowly; snow
+        // covers the ground over ~100 s; with precipitation off
+        // the ground dries / thaws gently. This advances the
+        // plain accumulators only — NOT the published project —
+        // so a weather scene no longer re-evaluates the whole
+        // SwiftUI editor body every frame.
+        if dt > 0, dt <= 0.25 {
             switch project.scene.weather.mode {
             case 1:
-                project.scene.weather.wetness = min(1, project.scene.weather.wetness + Double(dt) / 75)
-                project.scene.weather.snow = max(0, project.scene.weather.snow - Double(dt) / 300)
+                buildupWet = min(1, buildupWet + Double(dt) / 75)
+                buildupSnow = max(0, buildupSnow - Double(dt) / 300)
             case 2:
-                project.scene.weather.snow = min(1, project.scene.weather.snow + Double(dt) / 100)
+                buildupSnow = min(1, buildupSnow + Double(dt) / 100)
+            case 0:
+                buildupWet = max(0, buildupWet - Double(dt) / 600)
+                buildupSnow = max(0, buildupSnow - Double(dt) / 900)
             default:
                 break
             }
         }
         renderer.weatherMode = project.scene.weather.mode
-        renderer.weatherWet = Float(project.scene.weather.wetness)
-        renderer.weatherSnow = Float(project.scene.weather.snow)
+        renderer.weatherWet = Float(buildupWet)
+        renderer.weatherSnow = Float(buildupSnow)
+        // Published sync only when the displayed (whole-percent)
+        // value actually changes.
+        if Int((buildupWet * 100).rounded()) != Int((project.scene.weather.wetness * 100).rounded())
+            || Int((buildupSnow * 100).rounded()) != Int((project.scene.weather.snow * 100).rounded()) {
+            project.scene.weather.wetness = buildupWet
+            project.scene.weather.snow = buildupSnow
+        }
         let moving = !pressedKeys.isEmpty
             || touchActive
             || (now - lastCameraActivity) < 0.35
@@ -588,6 +627,7 @@ final class EditorSession: ObservableObject {
     // MARK: Save / export
 
     func save() {
+        syncWeatherToProject()
         project.modifiedAt = Date()
         // The thumbnail is the view the user is actually looking
         // at — orbit camera in edit mode, first-person in Play.
@@ -599,11 +639,13 @@ final class EditorSession: ObservableObject {
     }
 
     func exportPackageURL() -> URL? {
+        syncWeatherToProject()
         save()
         return ProjectStore.exportPackage(projectID: project.id)
     }
 
     func exportPNGURL() -> URL? {
+        syncWeatherToProject()
         let basis = mode == .play ? project.scene.camera.playBasis()
                                   : project.scene.camera.orbitBasis()
         guard let png = renderer.renderStillPNG(camera: basis, width: 1600, height: 1200, samples: 128)
