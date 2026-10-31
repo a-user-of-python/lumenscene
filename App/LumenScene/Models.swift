@@ -140,6 +140,13 @@ struct SceneObject: Codable, Equatable, Identifiable {
     /// with an area are loaded/unloaded with it by the node graph;
     /// nil means the object is always present.
     var areaID: UUID? = nil
+    /// v4.3: this object's own accumulated snow, in absolute metres
+    /// (the ambient accumulation it has caught up with — see
+    /// WeatherState.snowAmount). Persisted on Save by the session;
+    /// nil means "never written" — old projects load as if the
+    /// object had fully caught up with the ambient snow, which
+    /// preserves their look exactly.
+    var snowExposure: Double? = nil
 
     static func primitive(_ kind: String, name: String) -> SceneObject {
         var o = SceneObject(name: name, source: "primitive", primitiveKind: kind)
@@ -157,7 +164,7 @@ struct SceneObject: Codable, Equatable, Identifiable {
 extension SceneObject {
     private enum CodingKeys: String, CodingKey {
         case id, name, source, primitiveKind, params, meshFile, assetFile
-        case visible, transform, material, areaID
+        case visible, transform, material, areaID, snowExposure
     }
 
     // Custom Decodable for backward compatibility: SceneObject used
@@ -182,6 +189,7 @@ extension SceneObject {
         transform = try c.decodeIfPresent(Transform3.self, forKey: .transform) ?? Transform3()
         material = try c.decodeIfPresent(MaterialProps.self, forKey: .material) ?? MaterialProps()
         areaID = try c.decodeIfPresent(UUID.self, forKey: .areaID) ?? nil
+        snowExposure = try c.decodeIfPresent(Double.self, forKey: .snowExposure) ?? nil
     }
 }
 
@@ -236,6 +244,17 @@ struct WeatherState: Codable, Equatable {
     var mode: Int = 0
     var wetness: Double = 0
     var snow: Double = 0
+    /// v4.3: the snow depth (metres) the user wants accumulation
+    /// to build toward — the Weather sheet's Max Snow Depth.
+    /// Default 0.3 reproduces the v1–v4.2 look exactly.
+    var maxDepth: Double = 0.3
+    /// v4.3: per-project seed for the weather field's snow-drift
+    /// pattern. 0 = the legacy (v4.2) field, bit-for-bit.
+    var seed: UInt32 = 0
+    /// v4.3: ABSOLUTE snow accumulation in metres at the
+    /// normalised drift factor. nil in old files, where it is
+    /// derived as `snow * maxDepth` on load.
+    var snowAmount: Double? = nil
 }
 
 // MARK: - Trigger areas
@@ -388,16 +407,25 @@ extension CameraState {
 
 extension WeatherState {
     private enum CodingKeys: String, CodingKey {
-        case mode, wetness, snow
+        case mode, wetness, snow, maxDepth, seed, snowAmount
     }
 
     // Hand-written defensive Decodable (previously synthesised):
     // missing or mistyped keys fall back to the property defaults.
+    // v4.3: the new keys MUST decode this way — v1–v4.2 files have
+    // none of them, and a synthesised conformance would throw on
+    // the first missing key and fail the whole project load.
+    // Absent maxDepth -> 0.3 (the historical cap), absent seed ->
+    // 0 (the legacy field), absent snowAmount -> nil (derived
+    // from `snow * maxDepth` by the session on load).
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         mode = (try? c.decodeIfPresent(Int.self, forKey: .mode)) ?? nil ?? 0
         wetness = (try? c.decodeIfPresent(Double.self, forKey: .wetness)) ?? nil ?? 0
         snow = (try? c.decodeIfPresent(Double.self, forKey: .snow)) ?? nil ?? 0
+        maxDepth = (try? c.decodeIfPresent(Double.self, forKey: .maxDepth)) ?? nil ?? 0.3
+        seed = (try? c.decodeIfPresent(UInt32.self, forKey: .seed)) ?? nil ?? 0
+        snowAmount = (try? c.decodeIfPresent(Double.self, forKey: .snowAmount)) ?? nil
     }
 }
 

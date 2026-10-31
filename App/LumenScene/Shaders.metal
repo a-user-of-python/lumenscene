@@ -221,16 +221,32 @@ static float3 envColor(float3 dir, float intensity) {
 
 // MARK: - Weather field bake (v3.3)
 //
-// One-shot bake at renderer init: the level-independent
-// weather field over a 64 m world window centred on the
-// origin. R = puddle metaball potential, G = wet pooling fbm,
-// B = snow drift fbm, A = broad pooling fbm — the exact fields
-// the v3.1/v3.2 path kernel used to evaluate procedurally per
+// Bake at renderer init (v4.3: re-run whenever the weather
+// SEED changes): the level-independent weather field over a
+// 64 m world window centred on the origin. R = puddle
+// metaball potential, G = wet pooling fbm, B = snow drift
+// fbm, A = broad pooling fbm — the exact fields the
+// v3.1/v3.2 path kernel used to evaluate procedurally per
 // hit per sample (~75 hash evaluations). Wet/snow LEVELS are
-// thresholds applied analytically in the path kernel, so this
-// texture never needs refreshing when build-up changes.
+// thresholds applied analytically in the path kernel, so
+// this texture never needs refreshing when build-up changes.
+// v4.3: seed parameters for the bake, derived CPU-side by
+// SplitMix32 from the project's weather seed (see
+// weatherSeedDerived in Renderer.swift): offset = field
+// translation in metres (each component in [-28, 28)), wind =
+// the literal (cos, sin) of the seed's wind heading (45°
+// steps — the same literal Float constants both sides), and
+// seeded = 0 reproducing the legacy v4.2 field bit-exactly.
+struct WeatherFieldParams {
+    float2 offset;
+    float2 wind;
+    uint seeded;
+    uint pad;
+};
+
 kernel void weatherFieldKernel(
     texture2d<float, access::write> field [[texture(0)]],
+    constant WeatherFieldParams& fp [[buffer(0)]],
     uint2 pixel [[thread_position_in_grid]])
 {
     uint w = field.get_width();
@@ -238,10 +254,32 @@ kernel void weatherFieldKernel(
     if (pixel.x >= w || pixel.y >= h) return;
     float2 uv = (float2(pixel) + 0.5f) / float2(float(w), float(h));
     float2 xz = (uv - 0.5f) * 64.0f;
-    float pot = wpuddlePotential(xz * (1.0f / 1.15f));
-    float wetPool = wfbm2(xz * 1.3f + float2(4.7f, 9.1f));
-    float drift = wfbm2(xz * 0.5f + float2(9.17f, 27.3f));
-    float broad = wfbm2(xz * 0.32f + float2(17.31f, 3.97f));
+    // v4.3: EVERY channel is evaluated at the seed-shifted
+    // point; the puddle / wet / broad formulas themselves are
+    // unchanged (offset only).
+    float2 sp = xz + fp.offset;
+    float pot = wpuddlePotential(sp * (1.0f / 1.15f));
+    float wetPool = wfbm2(sp * 1.3f + float2(4.7f, 9.1f));
+    float drift;
+    if (fp.seeded != 0u) {
+        // Multi-scale, wind-anisotropic drift (v4.3), in
+        // lockstep with wgfDrift in Renderer.swift: rotate the
+        // shifted point by the wind heading, then broad
+        // (stretched along the wind -> elongated drifts) +
+        // lumps + fine detail. The bake writes the RAW value;
+        // the window fade is applied at sample time, exactly
+        // as the legacy channel was.
+        float2 q = float2(fp.wind.x * sp.x - fp.wind.y * sp.y,
+                          fp.wind.y * sp.x + fp.wind.x * sp.y);
+        float driftBroad = wfbm2(float2(q.x * 0.30f, q.y * 0.52f)
+                                 + float2(9.17f, 27.3f));
+        float lumps = wfbm2(q * 0.95f + float2(31.7f, 5.3f));
+        float fine = wnoise2(q * 2.7f + float2(13.1f, 41.9f));
+        drift = 0.58f * driftBroad + 0.30f * lumps + 0.12f * fine;
+    } else {
+        drift = wfbm2(sp * 0.5f + float2(9.17f, 27.3f));
+    }
+    float broad = wfbm2(sp * 0.32f + float2(17.31f, 3.97f));
     field.write(float4(pot, wetPool, drift, broad), pixel);
 }
 
@@ -591,6 +629,14 @@ kernel void pathTraceKernel(
         // drift gradient (or softened toward the face, as v3).
         if (snowCover > 0.001f) {
             snowCover *= (1.0f - puddle); // no snow inside puddles
+        }
+        // v4.3: per-object snow exposure — Material.pad.x is a
+        // Float bit pattern carrying this object's accumulated
+        // share of the ambient snow (spawned objects start at
+        // 0 = bare; long-standing objects reach 1 = full).
+        {
+            float snowScale = as_type<float>(mat.pad.x);
+            snowCover *= snowScale;
         }
         if (snowCover > 0.001f) {
             albedo = mix(albedo, float3(0.88f, 0.91f, 0.97f), snowCover * 0.92f);
@@ -979,6 +1025,15 @@ kernel void guideKernel(
             float depth = u.snowLevel * mix(0.3f, 1.7f, drift);
             snowCover = smoothstep(0.45f, 0.75f, depth) * upFace;
             snowCover *= (1.0f - puddle); // no snow inside puddles
+        }
+        // v4.3: per-object snow exposure, mirroring the trace
+        // kernel — Material.pad.x is a Float bit pattern with
+        // this object's accumulated share of the ambient snow,
+        // applied after the puddle suppression above (and to
+        // the no-field default snowCover as well).
+        {
+            float snowScale = as_type<float>(mat.pad.x);
+            snowCover *= snowScale;
         }
         // Snow cover kills the gloss again in the trace kernel.
         glossEff *= 1.0f - snowCover;

@@ -117,6 +117,18 @@ struct PrecipUniforms {
     var precipPad: Float = 0
 }
 
+/// v4.3: parameters for the weather-field bake kernel — the
+/// seed-derived field offset (metres), the wind heading as a
+/// literal (cos, sin) pair, and whether a non-zero seed is in
+/// play (seed 0 = the legacy v4.2 field, bit-exact). Mirror of
+/// WeatherFieldParams in Shaders.metal.
+struct WeatherFieldParams {
+    var offset = SIMD2<Float>(0, 0)
+    var wind = SIMD2<Float>(1, 0)
+    var seeded: UInt32 = 0
+    var pad: UInt32 = 0
+}
+
 struct TonemapParams {
     var samples: UInt32 = 0
     var exposure: Float = 1.15
@@ -142,6 +154,16 @@ struct LineUniforms {
 /// nil, exactly like a hit on unpickable geometry.
 private let dynNilObjectSentinel = UUID(uuidString: "00000000-0000-0000-0000-000000000000")!
 
+/// v4.3: the reserved dynamic-layer key of the player figure
+/// (see setPlayerFigure). Fixed so the figure's slice, dirty
+/// tracking and material slot are stable across pose swaps.
+private let playerFigureKey = UUID(uuidString: "00000000-0000-0000-0000-0000000000F1")!
+
+/// v4.3: one player footprint stamp in snow (world XZ,
+/// metres) — the struct is Renderer.SnowFootprint (nested,
+/// like DynEntry); a top-level typealias at the bottom of
+/// Renderer.swift keeps the unqualified name working too.
+
 typealias CameraBasis = (origin: SIMD3<Float>, forward: SIMD3<Float>, right: SIMD3<Float>, up: SIMD3<Float>)
 
 final class Renderer {
@@ -154,6 +176,18 @@ final class Renderer {
         var matrix: float4x4
         var material: GPUMaterial
         var objectID: UUID?
+    }
+
+    /// v4.3: one player footprint stamp in snow (world XZ,
+    /// metres). The session appends these as the player walks;
+    /// the weather-geometry pass compresses the snowfield
+    /// under each stamp deterministically at rebuild time —
+    /// nothing is stored in the scene itself.
+    struct SnowFootprint {
+        var x: Float
+        var z: Float
+        var radius: Float = 0.16
+        var compress: Float = 0.55
     }
 
     /// One renderer for the whole app (building the procedural
@@ -222,6 +256,12 @@ final class Renderer {
     private var cpuDynTriObject: [UUID] = []
     private var dynEntries: [DynEntry] = []
     private var particleSoupsStored: [(mesh: MeshData, material: GPUMaterial)] = []
+    /// v4.3: the player figure's reserved dynamic entry, kept
+    /// SEPARATE from dynEntries so setDynamicEntries (the
+    /// session's promoted/clone list) can never remove it.
+    /// Every dynamic-layer composition appends it LAST (after
+    /// the particle soups) in geometry and the material table.
+    private var playerFigureEntry: DynEntry?
     private var dynDirtyKeys: Set<UUID> = []
     private struct DynSlice {
         var vertexStart: Int = 0
@@ -380,6 +420,42 @@ final class Renderer {
     /// while the shading levels above stay continuous.
     var weatherGeoWet: Float = 0
     var weatherGeoSnow: Float = 0
+    /// v4.3: per-project weather-field seed. 0 reproduces the
+    /// v4.2 field exactly; any other value re-derives the field
+    /// offset + wind heading (see weatherSeedDerived) and
+    /// RE-BAKES the field texture immediately, so the texture
+    /// and the CPU mirrors below — which derive from the same
+    /// seed at call time — can never disagree. The session
+    /// observes the change through the existing rebuild flow
+    /// (accumulation is reset here; it calls rebuild() after
+    /// setting the seed, and the geometry pass re-derives from
+    /// the new seed).
+    var weatherSeed: UInt32 = 0 {
+        didSet {
+            guard weatherSeed != oldValue else { return }
+            bakeWeatherField()
+            resetAccumulation()
+        }
+    }
+    /// v4.3: user-set maximum snow depth (metres, UI range
+    /// 0.05…2, default 0.3 = the v3.4/v4.2 fixed cap).
+    var weatherMaxDepth: Float = 0.3
+    /// v4.3: ambient ABSOLUTE snow accumulation A (metres at
+    /// the normalised drift factor). Snow progress is
+    /// p = A / weatherMaxDepth; the displaced height is
+    /// cover(p) × min(d/1.35, 1) × max(maxDepth, A) — see
+    /// wgfSnowHeight.
+    var weatherSnowAmount: Float = 0
+    /// v4.3: per-object accumulated snow A_obj (metres), keyed
+    /// by scene object id. Objects absent from the map use the
+    /// ambient `weatherSnowAmount`. New/spawned objects start
+    /// at 0 in the session's map, so they land bare and bury
+    /// gradually instead of appearing pre-covered.
+    var objectSnowAmounts: [UUID: Float] = [:]
+    /// v4.3: player footprint stamps in snow, newest last
+    /// (the session caps the list). Consumed by the imprint
+    /// pass in appendWeatherGeometry at rebuild time.
+    var snowFootprints: [SnowFootprint] = []
     /// True when the last geometry rebuild emitted water sheets —
     /// the material table then carries the sheet material last,
     /// and updateMaterialsOnly must reproduce it exactly.
@@ -533,14 +609,60 @@ final class Renderer {
         bakeWeatherField()
     }
 
+    /// v4.3: seed derivation (SplitMix32 from `weatherSeed`),
+    /// shared by the bake and every CPU field mirror so both
+    /// sides see the SAME field. Seed 0 is special-cased to
+    /// the legacy field: offset (0,0), wind (1,0), seeded =
+    /// false — the bake kernel and wgfDrift then run their
+    /// original v4.2 formulas bit-exactly. For seed != 0, two
+    /// SplitMix32 outputs in [0,1) map to a field offset with
+    /// each component in [-28, 28) metres, and the wind index
+    /// (seed >> 8) % 8 picks a heading in 45° steps from a
+    /// LITERAL (cos, sin) table — the same literal Float
+    /// constants are written out in Shaders.metal's bake, so
+    /// no transcendental function is ever evaluated on either
+    /// side.
+    private func weatherSeedDerived()
+        -> (offset: SIMD2<Float>, wind: SIMD2<Float>, seeded: Bool) {
+        guard weatherSeed != 0 else {
+            return (SIMD2<Float>(0, 0), SIMD2<Float>(1, 0), false)
+        }
+        var state = weatherSeed
+        func nextUnit() -> Float {
+            state = state &+ 0x9e3779b9
+            var z = state
+            z = (z ^ (z >> 16)) &* 0x21f0aaad
+            z = (z ^ (z >> 15)) &* 0x735a2d97
+            z = z ^ (z >> 15)
+            return Float(z >> 8) * (1.0 / 16777216.0)
+        }
+        let offset = SIMD2<Float>(-28 + 56 * nextUnit(),
+                                  -28 + 56 * nextUnit())
+        let table: [SIMD2<Float>] = [
+            SIMD2<Float>(1, 0),
+            SIMD2<Float>(0.70710678, 0.70710678),
+            SIMD2<Float>(0, 1),
+            SIMD2<Float>(-0.70710678, 0.70710678),
+            SIMD2<Float>(-1, 0),
+            SIMD2<Float>(-0.70710678, -0.70710678),
+            SIMD2<Float>(0, -1),
+            SIMD2<Float>(0.70710678, -0.70710678),
+        ]
+        let wind = table[Int((weatherSeed >> 8) % 8)]
+        return (offset, wind, true)
+    }
+
     /// One-shot bake of the level-independent weather field
     /// (v3.3): 2048x2048 RGBA16F over a 64 m world window —
     /// R puddle metaball potential, G wet pooling, B snow
     /// drift, A broad pooling. Wet/snow levels are thresholds
     /// applied analytically in the trace kernel, so the bake
-    /// never needs refreshing when build-up changes. If the
-    /// bake is unavailable, a 1x1 neutral texture stands in
-    /// (global wet/snow shading still works; no puddles).
+    /// never needs refreshing when build-up changes. v4.3:
+    /// RE-RUNNABLE — it bakes with the CURRENT `weatherSeed`'s
+    /// derived parameters, and `weatherSeed`'s didSet calls it
+    /// whenever the seed changes. If the bake is unavailable,
+    /// a 1x1 neutral texture stands in (global wet/snow
+    /// shading still works; no puddles).
     private func bakeWeatherField() {
         let size = 2048
         let desc = MTLTextureDescriptor.texture2DDescriptor(
@@ -552,6 +674,12 @@ final class Renderer {
            let enc = cmd.makeComputeCommandEncoder() {
             enc.setComputePipelineState(fieldPipeline)
             enc.setTexture(tex, index: 0)
+            let derived = weatherSeedDerived()
+            var params = WeatherFieldParams()
+            params.offset = derived.offset
+            params.wind = derived.wind
+            params.seeded = derived.seeded ? 1 : 0
+            enc.setBytes(&params, length: MemoryLayout<WeatherFieldParams>.stride, index: 0)
             dispatch(enc, pipeline: fieldPipeline, width: size, height: size)
             enc.endEncoding()
             cmd.commit()
@@ -839,21 +967,34 @@ final class Renderer {
         // deterministic index — right after the last object
         // material — so updateMaterialsOnly can reproduce the
         // exact same material table without the geometry.
-        var included: [(obj: SceneObject, world: MeshData)] = []
+        // v4.3: the LOCAL mesh is kept alongside the baked
+        // world mesh — the snow-imprint pass needs each
+        // object's local AABB + inverse transform.
+        var included: [(obj: SceneObject, local: MeshData, world: MeshData)] = []
         for obj in scene.objects {
             guard let local = includedLocalMesh(for: obj, meshes: meshes) else { continue }
-            included.append((obj, local.baked(by: obj.transform.matrix)))
+            included.append((obj, local, local.baked(by: obj.transform.matrix)))
         }
         let sheetMatIndex = UInt32(included.count)
         let weatherGeoActive = weatherGeoWet > 0.001 || weatherGeoSnow > 0.001
+            || weatherSnowAmount > 0.001
+            || objectSnowAmounts.values.contains { $0 > 0.001 }
+        // v4.3: snow intruders for this rebuild (see the
+        // imprint section below) — every included static
+        // object, every dynamic entry, and the player figure.
+        // Deterministic from transforms + mesh bounds; rebuilt
+        // fresh here, nothing is stored between rebuilds.
+        let snowIntruders = buildSnowIntruders(included: included)
         var triBudget = 220_000
         var sheetEmitted = false
-        for (obj, world) in included {
+        for (obj, _, world) in included {
             let matIndex = UInt32(materials.count)
             materials.append(gpuMaterialForObject(obj))
             objectOrder.append(obj.id)
             if weatherGeoActive {
                 appendWeatherGeometry(world: world, objectID: obj.id,
+                                      snowAmount: objectSnowAmounts[obj.id] ?? weatherSnowAmount,
+                                      intruders: snowIntruders,
                                       matIndex: matIndex, sheetIndex: sheetMatIndex,
                                       positions: &positions, normals: &normals,
                                       uvs: &uvArr, colors: &colArr,
@@ -996,6 +1137,7 @@ final class Renderer {
         if dynTriCount > 0 {
             let dynHasEmissive = dynEntries.contains { ($0.material.flags & 1) != 0 }
                 || particleSoupsStored.contains { ($0.material.flags & 1) != 0 }
+                || ((playerFigureEntry?.material.flags ?? 0) & 1) != 0
             let skipDynScan = !dynHasEmissive && dynEmissiveTriCount == 0
             if !skipDynScan {
                 for dt in 0..<dynTriCount {
@@ -1157,6 +1299,26 @@ final class Renderer {
         g.tint = SIMD4<Float>(m.tint.simd, Float(m.textureScale))
         g.texIndex = texIdx
         g.flags = flags
+        // v4.3: pad.x carries this object's snow-exposure
+        // factor as a Float bit pattern (the trace + guide
+        // kernels reinterpret Material.pad.x and multiply
+        // their snow cover by it): the object's own progress
+        // p_obj over the ambient progress p_amb, clamped 0…1,
+        // so a freshly spawned object (A_obj = 0) shades bare
+        // while long-standing objects are fully covered. When
+        // the ambient amount is ~0 the factor is 1 (nothing
+        // to expose against; also guards the division).
+        let aObj = objectSnowAmounts[obj.id] ?? weatherSnowAmount
+        var factor: Float = 1
+        if weatherSnowAmount > 0.0001 {
+            let md = max(weatherMaxDepth, 0.0001)
+            let pAmb = min(1, weatherSnowAmount / md)
+            let pObj = min(1, max(aObj, 0) / md)
+            if pAmb > 0.0001 {
+                factor = min(1, max(0, pObj / pAmb))
+            }
+        }
+        g.pad = SIMD2<UInt32>(factor.bitPattern, 0)
         return g
     }
 
@@ -1174,6 +1336,13 @@ final class Renderer {
         g.tint = SIMD4<Float>(1, 1, 1, 1)
         g.texIndex = 0
         g.flags = 16
+        // v4.3: pad.x = 1.0 (0x3F800000) — the sheet material is
+        // built outside gpuMaterialForObject, and GPUMaterial's
+        // default pad (0,0) would decode as exposure factor 0.
+        // (Sheets skip the weather block in the kernels anyway;
+        // this keeps the audit rule absolute: every material in
+        // the table carries an explicit exposure factor.)
+        g.pad = SIMD2<UInt32>(0x3F800000, 0)
         return g
     }
 
@@ -1267,23 +1436,50 @@ final class Renderer {
     }
 
     /// Drift field (baked texture B channel), window-faded.
+    /// v4.3: for a non-zero seed the sample point is first
+    /// shifted by the seed offset, then ROTATED by the seed's
+    /// wind heading, and the channel becomes multi-scale and
+    /// wind-anisotropic — the exact operations, constants and
+    /// order of the bake kernel in Shaders.metal. The fade is
+    /// still evaluated at the UNshifted (x, z): it models the
+    /// texture window at the lookup position, exactly as the
+    /// trace kernel mixes the baked sample toward neutral.
+    /// Seed 0 keeps the original single-scale formula.
     private func wgfDrift(_ x: Float, _ z: Float) -> Float {
         if abs(x) > 40 || abs(z) > 40 { return 0.5 }
-        let raw = wgfFbm(x * 0.5 + 9.17, z * 0.5 + 27.3)
+        let derived = weatherSeedDerived()
+        let ex = x + derived.offset.x, ez = z + derived.offset.y
+        let raw: Float
+        if derived.seeded {
+            // q = R(θ)·(xz + offset), θ from the literal table.
+            let qx = derived.wind.x * ex - derived.wind.y * ez
+            let qz = derived.wind.y * ex + derived.wind.x * ez
+            let broad = wgfFbm(qx * 0.30 + 9.17, qz * 0.52 + 27.3)
+            let lumps = wgfFbm(qx * 0.95 + 31.7, qz * 0.95 + 5.3)
+            let fine = wgfNoise(qx * 2.7 + 13.1, qz * 2.7 + 41.9)
+            raw = 0.58 * broad + 0.30 * lumps + 0.12 * fine
+        } else {
+            raw = wgfFbm(ex * 0.5 + 9.17, ez * 0.5 + 27.3)
+        }
         return 0.5 + (raw - 0.5) * wgfFade(x, z)
     }
 
     /// Broad pooling field (baked texture A channel), faded.
+    /// v4.3: seed offset only — the formula is unchanged.
     private func wgfBroad(_ x: Float, _ z: Float) -> Float {
         if abs(x) > 40 || abs(z) > 40 { return 0.489 }
-        let raw = wgfFbm(x * 0.32 + 17.31, z * 0.32 + 3.97)
+        let derived = weatherSeedDerived()
+        let ex = x + derived.offset.x, ez = z + derived.offset.y
+        let raw = wgfFbm(ex * 0.32 + 17.31, ez * 0.32 + 3.97)
         return 0.489 + (raw - 0.489) * wgfFade(x, z)
     }
 
     /// Metaball puddle potential (baked texture R channel), faded.
+    /// v4.3: seed offset only — the formula is unchanged.
     private func wgfPotential(_ x: Float, _ z: Float) -> Float {
         if abs(x) > 40 || abs(z) > 40 { return 0 }
-        let px = x / 1.15, py = z / 1.15
+        let derived = weatherSeedDerived()
+        let px = (x + derived.offset.x) / 1.15, py = (z + derived.offset.y) / 1.15
         let wx = wgfFbm(px * 0.16 + 3.1, py * 0.16 + 7.7)
         let wy = wgfFbm(px * 0.16 + 11.9, py * 0.16 + 1.3)
         let qx = px + (wx - 0.5), qy = py + (wy - 0.5)
@@ -1313,18 +1509,37 @@ final class Renderer {
         return sum * wgfFade(x, z)
     }
 
-    /// Snow depth (metres) the geometry carries at (x, z) for a
-    /// quantised level: drift-shaped, and zero exactly where the
-    /// shader's snow coverage is zero, so the silhouette and the
-    /// whitening agree.
-    private func wgfSnowHeight(_ x: Float, _ z: Float, level: Float) -> Float {
-        let d = level * (0.3 + 1.4 * wgfDrift(x, z))
+    /// Snow depth (metres) the geometry carries at (x, z) for
+    /// an ABSOLUTE accumulation A (v4.3, replacing the fixed
+    /// 0.30 m cap + quantised level): progress p = A / maxDepth
+    /// (uncapped), pc = min(p, 1); drifted depth
+    /// d = pc × (0.3 + 1.4 × drift); height =
+    /// cover(d) × min(d / 1.35, 1) × max(maxDepth, A) — the
+    /// last factor keeps already-deep snow continuous when the
+    /// user lowers the max-depth setting (no bulldozing).
+    /// Zero exactly where the coverage is zero, so the
+    /// silhouette and the shader whitening agree. At
+    /// A = level × 0.3 with maxDepth 0.3 this reduces exactly
+    /// to the v3.4 formula.
+    private func wgfSnowHeight(_ x: Float, _ z: Float, amount A: Float) -> Float {
+        let a = max(A, 0)
+        let pc = min(a / max(weatherMaxDepth, 0.0001), 1)
+        let d = pc * (0.3 + 1.4 * wgfDrift(x, z))
         let cover = wgfSmooth(0.45, 0.75, d)
-        return 0.30 * cover * min(d / 1.35, 1)
+        return cover * min(d / 1.35, 1) * max(max(weatherMaxDepth, 0), a)
     }
 
-    private func wgfSnowCover(_ x: Float, _ z: Float, level: Float) -> Float {
-        wgfSmooth(0.45, 0.75, level * (0.3 + 1.4 * wgfDrift(x, z)))
+    private func wgfSnowCover(_ x: Float, _ z: Float, amount A: Float) -> Float {
+        let a = max(A, 0)
+        let pc = min(a / max(weatherMaxDepth, 0.0001), 1)
+        return wgfSmooth(0.45, 0.75, pc * (0.3 + 1.4 * wgfDrift(x, z)))
+    }
+
+    /// v4.3: the snow depth (metres) at a world XZ under the
+    /// AMBIENT accumulation — the session uses this to place
+    /// player footprints on the snow surface in Play.
+    func snowDepthAt(x: Float, z: Float) -> Float {
+        wgfSnowHeight(x, z, amount: weatherSnowAmount)
     }
 
     /// The trace kernel's puddle mask, mirrored: (mask, depth01)
@@ -1344,9 +1559,198 @@ final class Renderer {
         return (m, wgfClamp((pot - thr) / 0.5, 0, 1))
     }
 
+    // MARK: Snow imprints (v4.3: objects crush the snowfield)
+    //
+    // An intruder is anything resting in the snow: an included
+    // static object, a dynamic entry (promoted objects and
+    // spawned clones), or the player figure. Its footprint is
+    // its LOCAL XZ bounds — a circle for sphere primitives
+    // (centre = local XZ centre, radius = local XZ half-extent
+    // x), an OBB rect otherwise — tested per lattice vertex by
+    // transforming the vertex into the intruder's local space
+    // with the inverse matrix. Where the intruder's world
+    // bottom reaches into the snow, the field height is
+    // compressed toward (bottom − 0.02 m) with a soft inner
+    // lip and a 0.30 m outer falloff, and a raised rim ring
+    // (up to 0.45 × the local field height, peaking ~0.12 m
+    // out, gone by 0.45 m) rings the contact. Everything is
+    // derived from transforms at rebuild time — drag troughs
+    // appear for free because a drag rebuilds at the object's
+    // live transform, and nothing sculpted is ever stored.
+
+    private struct SnowIntruder {
+        /// Scene object id for static intruders (the host
+        /// excludes ITSELF by this id); nil for dynamic
+        /// entries and the player figure, which are never
+        /// static hosts and so intrude on every host.
+        var staticID: UUID?
+        var inverse: float4x4
+        /// World-space bottom of the intruder (min y).
+        var bottomY: Float
+        /// World AABB (unexpanded; the test expands by 0.5 m).
+        var worldMin: SIMD3<Float>
+        var worldMax: SIMD3<Float>
+        /// Local XZ centre of the footprint.
+        var centre: SIMD2<Float>
+        /// Local XZ half extents (rect; x also = circle radius).
+        var half: SIMD2<Float>
+        var isCircle: Bool
+    }
+
+    private func makeSnowIntruder(staticID: UUID?, local: MeshData,
+                                  matrix: float4x4, world: MeshData?,
+                                  isCircle: Bool) -> SnowIntruder? {
+        guard local.vertexCount > 0 else { return nil }
+        let lb = local.bounds
+        let wMin: SIMD3<Float>
+        let wMax: SIMD3<Float>
+        if let world {
+            let wb = world.bounds
+            wMin = wb.min; wMax = wb.max
+        } else {
+            // Dynamic entries / the figure: exact world bounds
+            // from the entry mesh's own positions × its matrix.
+            var lo = SIMD3<Float>(Float.greatestFiniteMagnitude,
+                                  Float.greatestFiniteMagnitude,
+                                  Float.greatestFiniteMagnitude)
+            var hi = -lo
+            for i in 0..<local.vertexCount {
+                let p = SIMD3<Float>(local.positions[3 * i],
+                                     local.positions[3 * i + 1],
+                                     local.positions[3 * i + 2])
+                let wp = (matrix * SIMD4<Float>(p, 1)).xyz
+                lo = simd_min(lo, wp); hi = simd_max(hi, wp)
+            }
+            wMin = lo; wMax = hi
+        }
+        return SnowIntruder(
+            staticID: staticID,
+            inverse: matrix.inverse,
+            bottomY: wMin.y,
+            worldMin: wMin, worldMax: wMax,
+            centre: SIMD2<Float>((lb.min.x + lb.max.x) / 2,
+                                 (lb.min.z + lb.max.z) / 2),
+            half: SIMD2<Float>(max((lb.max.x - lb.min.x) / 2, 0.001),
+                               max((lb.max.z - lb.min.z) / 2, 0.001)),
+            isCircle: isCircle)
+    }
+
+    /// Gather this rebuild's intruders: static objects (with
+    /// their baked world meshes), dynamic entries, and the
+    /// player figure.
+    private func buildSnowIntruders(
+        included: [(obj: SceneObject, local: MeshData, world: MeshData)]
+    ) -> [SnowIntruder] {
+        var out: [SnowIntruder] = []
+        out.reserveCapacity(included.count + dynEntries.count + 1)
+        for (obj, local, world) in included {
+            if let intr = makeSnowIntruder(
+                staticID: obj.id, local: local,
+                matrix: obj.transform.matrix, world: world,
+                isCircle: obj.primitiveKind == "sphere") {
+                out.append(intr)
+            }
+        }
+        for entry in dynEntries {
+            if let intr = makeSnowIntruder(
+                staticID: nil, local: entry.mesh,
+                matrix: entry.matrix, world: nil, isCircle: false) {
+                out.append(intr)
+            }
+        }
+        if let fig = playerFigureEntry {
+            if let intr = makeSnowIntruder(
+                staticID: nil, local: fig.mesh,
+                matrix: fig.matrix, world: nil, isCircle: false) {
+                out.append(intr)
+            }
+        }
+        return out
+    }
+
+    /// The snow height at one point AFTER imprints: `fieldH`
+    /// is the un-imprinted field height AT THIS POINT (the
+    /// caller evaluates wgfSnowHeight per tap, so the gradient
+    /// taps follow the imprint exactly like the centre vertex).
+    /// `hostY` is the host surface's world y at the vertex and
+    /// `hostID` the host object (its own intruder is skipped).
+    /// Intruders apply sequentially — each sees the previous
+    /// result as its input height and re-tests contact against
+    /// its own bottom. Footprint stamps apply last,
+    /// multiplicatively, with no rim.
+    private func imprintedSnowHeight(x: Float, z: Float, hostY: Float,
+                                     hostID: UUID, fieldH: Float,
+                                     intruders: [SnowIntruder]) -> Float {
+        var h = fieldH
+        if h <= 0 { return h }
+        let fieldH0 = fieldH
+        for intr in intruders {
+            if let sid = intr.staticID, sid == hostID { continue }
+            // Broad reject: outside the world AABB + 0.5 m.
+            if x < intr.worldMin.x - 0.5 || x > intr.worldMax.x + 0.5
+                || z < intr.worldMin.z - 0.5 || z > intr.worldMax.z + 0.5 {
+                continue
+            }
+            let lp = intr.inverse * SIMD4<Float>(x, hostY, z, 1)
+            let lx = lp.x - intr.centre.x
+            let lz = lp.z - intr.centre.y
+            var outsideDist: Float
+            var inside = false
+            var insideDepth: Float = 0
+            if intr.isCircle {
+                let distC = sqrtf(lx * lx + lz * lz)
+                outsideDist = distC - intr.half.x
+                inside = outsideDist < 0
+                insideDepth = -outsideDist
+            } else {
+                let qx = abs(lx) - intr.half.x
+                let qz = abs(lz) - intr.half.y
+                let ox = max(qx, 0), oz = max(qz, 0)
+                outsideDist = sqrtf(ox * ox + oz * oz)
+                inside = qx < 0 && qz < 0
+                if inside { insideDepth = min(-qx, -qz) }
+            }
+            // Contact: the intruder's bottom must reach the
+            // (current) snow top. Airborne objects don't dent.
+            let snowTop = hostY + h
+            guard intr.bottomY < snowTop + 0.001 else { continue }
+            let hC = wgfClamp(intr.bottomY - 0.02 - hostY, 0, h)
+            guard hC < h else { continue } // no compression → no rim either
+            // Blend: soft inner lip inside, 0.30 m falloff outside.
+            let w: Float
+            if inside {
+                w = wgfSmooth(0, 0.10, insideDepth)
+            } else {
+                w = 1 - wgfSmooth(0, 0.30, outsideDist)
+            }
+            if w > 0 { h = h + (hC - h) * w }
+            // Rim: displaced snow piles up just outside the
+            // footprint — peak ~0.12 m out, gone by 0.45 m.
+            if !inside, outsideDist > 0, outsideDist < 0.45 {
+                let d = outsideDist
+                let bump = wgfSmooth(0, 0.12, d) * (1 - wgfSmooth(0.12, 0.45, d))
+                h += fieldH0 * 0.45 * bump
+            }
+        }
+        // Footprint stamps (player steps): multiplicative
+        // compression, no rim.
+        for stamp in snowFootprints {
+            let dx = x - stamp.x, dz = z - stamp.z
+            let d = sqrtf(dx * dx + dz * dz)
+            if d >= stamp.radius + 0.10 { continue }
+            let infl = 1 - wgfSmooth(stamp.radius * 0.55,
+                                     stamp.radius + 0.08, d)
+            if infl > 0 {
+                h = h * (1 - 0.6 * wgfClamp(stamp.compress, 0, 1) * infl)
+            }
+        }
+        return h
+    }
+
     /// Append one object's world mesh with weather geometry
     /// applied (see the section comment above).
     private func appendWeatherGeometry(world: MeshData, objectID: UUID,
+                                       snowAmount: Float, intruders: [SnowIntruder],
                                        matIndex: UInt32, sheetIndex: UInt32,
                                        positions: inout [Float], normals: inout [Float],
                                        uvs: inout [Float], colors: inout [Float],
@@ -1355,6 +1759,12 @@ final class Renderer {
                                        budget: inout Int, sheetEmitted: inout Bool) {
         let wet = weatherGeoWet
         let snow = weatherGeoSnow
+        // v4.3: weatherGeoSnow remains the session's quantised
+        // on/off GATE for geometry snow; the actual depth now
+        // comes from this object's absolute accumulation
+        // (snowAmount = A_obj). The amount itself also opens
+        // the gate so a rebuild driven by amounts alone works.
+        let snowActive = snow > 0.001 || snowAmount > 0.001
 
         func wPos(_ idx: UInt32) -> SIMD3<Float> {
             let i = Int(idx) * 3
@@ -1408,8 +1818,8 @@ final class Renderer {
                 var maxH: Float = 0
                 var maxM: Float = 0
                 for q in [p0, p1, p2, (p0 + p1 + p2) / 3] {
-                    if snow > 0.001 {
-                        maxH = max(maxH, wgfSnowHeight(q.x, q.z, level: snow))
+                    if snowActive {
+                        maxH = max(maxH, wgfSnowHeight(q.x, q.z, amount: snowAmount))
                     }
                     if wet > 0.001 {
                         maxM = max(maxM, wgfPuddle(q.x, q.z, y: q.y,
@@ -1445,17 +1855,45 @@ final class Renderer {
                     if nl > 1e-6 { nrm /= nl }
                     var disp = pos
                     var snowC: Float = 0
-                    if snow > 0.001 {
-                        snowC = wgfSnowCover(pos.x, pos.z, level: snow)
+                    if snowActive {
+                        snowC = wgfSnowCover(pos.x, pos.z, amount: snowAmount)
                         let edgeFade = wgfSmooth(0, 0.18, min(wa, min(wb, wc)))
-                        let h = wgfSnowHeight(pos.x, pos.z, level: snow) * edgeFade
+                        // v4.3: the imprint helper adjusts the
+                        // field height at the centre vertex AND
+                        // at the ±e gradient taps (each tap
+                        // passes its own field height, with the
+                        // centre's hostY + host id), so troughs,
+                        // rims and footprints shade with normals
+                        // that follow the crush. The barycentric
+                        // edge fade still pins original borders
+                        // to zero after the imprint.
+                        let rawH = wgfSnowHeight(pos.x, pos.z, amount: snowAmount)
+                        let h = imprintedSnowHeight(
+                            x: pos.x, z: pos.z, hostY: pos.y, hostID: objectID,
+                            fieldH: rawH, intruders: intruders) * edgeFade
                         if h > 0.0005 {
                             disp.y += h
                             let e: Float = 0.05
-                            let gx = (wgfSnowHeight(pos.x + e, pos.z, level: snow)
-                                      - wgfSnowHeight(pos.x - e, pos.z, level: snow)) / (2 * e)
-                            let gz = (wgfSnowHeight(pos.x, pos.z + e, level: snow)
-                                      - wgfSnowHeight(pos.x, pos.z - e, level: snow)) / (2 * e)
+                            let gx = (imprintedSnowHeight(
+                                        x: pos.x + e, z: pos.z, hostY: pos.y,
+                                        hostID: objectID,
+                                        fieldH: wgfSnowHeight(pos.x + e, pos.z, amount: snowAmount),
+                                        intruders: intruders)
+                                      - imprintedSnowHeight(
+                                        x: pos.x - e, z: pos.z, hostY: pos.y,
+                                        hostID: objectID,
+                                        fieldH: wgfSnowHeight(pos.x - e, pos.z, amount: snowAmount),
+                                        intruders: intruders)) / (2 * e)
+                            let gz = (imprintedSnowHeight(
+                                        x: pos.x, z: pos.z + e, hostY: pos.y,
+                                        hostID: objectID,
+                                        fieldH: wgfSnowHeight(pos.x, pos.z + e, amount: snowAmount),
+                                        intruders: intruders)
+                                      - imprintedSnowHeight(
+                                        x: pos.x, z: pos.z - e, hostY: pos.y,
+                                        hostID: objectID,
+                                        fieldH: wgfSnowHeight(pos.x, pos.z - e, amount: snowAmount),
+                                        intruders: intruders)) / (2 * e)
                             let sn = simd_normalize(SIMD3<Float>(-gx, 1, -gz))
                             let blend = min(h / 0.03, 1)
                             nrm = simd_normalize(nrm * (1 - blend) + sn * blend)
@@ -1580,7 +2018,8 @@ final class Renderer {
     // material table is contractual everywhere:
     //   [static object materials…, sheetMaterial if emitted,
     //    dynamic entry materials in entry order,
-    //    particle soup materials in soup order]
+    //    particle soup materials in soup order,
+    //    the player figure's material last (v4.3)]
     // Dynamic/particle materials are renderer state — static
     // rebuilds and material-only updates APPEND them, so they
     // survive static rebuilds. Total dynamic budget: 90,000
@@ -1610,6 +2049,9 @@ final class Renderer {
         if sceneHasSheetMaterial { mats.append(sheetMaterial()) }
         for entry in dynEntries { mats.append(entry.material) }
         for soup in particleSoupsStored { mats.append(soup.material) }
+        // v4.3: the player figure's material is ALWAYS last —
+        // the same order composeDynamic bakes its triangles in.
+        if let fig = playerFigureEntry { mats.append(fig.material) }
         return mats
     }
 
@@ -1687,6 +2129,68 @@ final class Renderer {
         dynEntries.removeAll { $0.key == key }
         dynDirtyKeys.remove(key)
         composeDynamic(structureChanged: true)
+    }
+
+    // MARK: Player figure (v4.3)
+    //
+    // The figure is a reserved DynEntry under playerFigureKey,
+    // stored separately from dynEntries (so setDynamicEntries
+    // can never remove it) and composed LAST, after the
+    // particle soups, in geometry and the material table.
+    // Its material is plain white with flags 0 — the mesh's
+    // vertex colours carry the look — and pad.x = 1.0 so it
+    // never loses snow shading. objectID is nil: pick() maps
+    // its triangles through the unpickable sentinel.
+
+    /// Install, replace, or (with mesh = nil) remove the
+    /// player figure. A first install (or a mesh whose vertex
+    /// count no longer matches the baked slice — outside the
+    /// PlayerModel constant-count contract, kept as a safety
+    /// net) composes the dynamic layer; a same-count pose
+    /// swap only marks the figure's slice dirty and
+    /// flushDynamic() re-bakes its vertices at the next draw.
+    func setPlayerFigure(mesh: MeshData?, matrix: float4x4) {
+        guard let mesh else {
+            if playerFigureEntry != nil {
+                playerFigureEntry = nil
+                dynDirtyKeys.remove(playerFigureKey)
+                composeDynamic(structureChanged: true)
+            }
+            return
+        }
+        if var existing = playerFigureEntry {
+            existing.mesh = mesh
+            existing.matrix = matrix
+            playerFigureEntry = existing
+            if let slice = dynSlices[playerFigureKey],
+               slice.vertexCount == mesh.vertexCount, !slice.remapped {
+                dynDirtyKeys.insert(playerFigureKey)
+            } else {
+                composeDynamic(structureChanged: true)
+            }
+        } else {
+            var mat = GPUMaterial()
+            mat.baseColor = SIMD4<Float>(1, 1, 1, 0)
+            mat.emissive = SIMD4<Float>(0, 0, 0, 0)
+            mat.glassParams = SIMD4<Float>(0, 0, 1.5, 0)
+            mat.tint = SIMD4<Float>(1, 1, 1, 1)
+            mat.texIndex = 0
+            mat.flags = 0
+            mat.pad = SIMD2<UInt32>(0x3F800000, 0) // exposure 1.0
+            playerFigureEntry = DynEntry(key: playerFigureKey, mesh: mesh,
+                                         matrix: matrix, material: mat,
+                                         objectID: nil)
+            composeDynamic(structureChanged: true)
+        }
+    }
+
+    /// Cheap figure move: update the matrix only and mark the
+    /// slice dirty — the re-bake happens in flushDynamic() at
+    /// the top of draw(), exactly like updateDynamicMatrix.
+    func setPlayerFigureMatrix(_ m: float4x4) {
+        guard playerFigureEntry != nil else { return }
+        playerFigureEntry?.matrix = m
+        dynDirtyKeys.insert(playerFigureKey)
     }
 
     /// Particle soups (at most 8 kept), appended after the
@@ -1807,6 +2311,17 @@ final class Renderer {
             _ = appendSoup(world: soup.mesh,
                            matOffset: dynEntries.count + j, objectID: nil)
         }
+        // v4.3: the player figure composes LAST (after the
+        // particle soups) — the one consistent order used by
+        // fullMaterialTable, the pick mapping and the emissive
+        // scan. objectID nil → the sentinel → unpickable.
+        if !capped, let fig = playerFigureEntry {
+            let world = fig.mesh.baked(by: fig.matrix)
+            slices[fig.key] = appendSoup(
+                world: world,
+                matOffset: dynEntries.count + particleSoupsStored.count,
+                objectID: nil)
+        }
 
         cpuDynPositions = positions
         cpuDynNormals = normals
@@ -1848,7 +2363,11 @@ final class Renderer {
         dynDirtyKeys.removeAll()
         var anyBaked = false
         for key in dirty {
-            guard let pair = dynEntries.first(where: { $0.key == key }),
+            // v4.3: the player figure flushes through the same
+            // path — its key resolves to the reserved entry
+            // when it is not a session dynamic entry.
+            guard let pair = dynEntries.first(where: { $0.key == key })
+                    ?? (key == playerFigureKey ? playerFigureEntry : nil),
                   let slice = dynSlices[key], slice.vertexCount > 0 else { continue }
             let world = pair.local.baked(by: pair.matrix)
             guard world.vertexCount == slice.vertexCount, !slice.remapped else { continue }
@@ -2863,6 +3382,7 @@ final class Renderer {
 /// the editor session uses for its entry mirror.
 typealias DynEntry = Renderer.DynEntry
 typealias DynamicEntry = Renderer.DynEntry
+typealias SnowFootprint = Renderer.SnowFootprint
 
 extension Renderer.DynEntry {
     /// The entry's local-space mesh (alias of the stored

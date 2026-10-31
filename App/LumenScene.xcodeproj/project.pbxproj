@@ -25,6 +25,7 @@
 		DE57C0DE00000000000000B3 = {isa = PBXBuildFile; fileRef = DE57C0DE00000000000000A3; };
 		DE57C0DE00000000000000B4 = {isa = PBXBuildFile; fileRef = DE57C0DE00000000000000A4; };
 		DE57C0DE00000000000000B5 = {isa = PBXBuildFile; fileRef = DE57C0DE00000000000000A5; };
+		DE57C0DE00000000000000B6 = {isa = PBXBuildFile; fileRef = DE57C0DE00000000000000A6; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -45,6 +46,7 @@
 		DE57C0DE00000000000000A3 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameNodes.swift; sourceTree = "<group>"; };
 		DE57C0DE00000000000000A4 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameRuntime.swift; sourceTree = "<group>"; };
 		DE57C0DE00000000000000A5 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NodeEditorView.swift; sourceTree = "<group>"; };
+		DE57C0DE00000000000000A6 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerModel.swift; sourceTree = "<group>"; };
 		35F7358B8C0EA9A13451AFD1 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LumenScene.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A7E6938D864437149217D339 = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		17CD06A31553B02130CC0006 = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -98,6 +100,7 @@
 				DE57C0DE00000000000000A3,
 				DE57C0DE00000000000000A4,
 				DE57C0DE00000000000000A5,
+				DE57C0DE00000000000000A6,
 				A7E6938D864437149217D339,
 			);
 			path = LumenScene;
@@ -188,6 +191,7 @@
 				DE57C0DE00000000000000B3,
 				DE57C0DE00000000000000B4,
 				DE57C0DE00000000000000B5,
+				DE57C0DE00000000000000B6,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -30,6 +30,7 @@ struct EditorView: View {
 
     @State private var showImport = false
     @State private var showNodes = false
+    @State private var showSnowSettings = false
     @State private var shareItem: ShareItem?
     /// v4.2: the top bar switches to its compact row (icon-only
     /// back button, Weather folded into the More menu, narrower
@@ -64,6 +65,7 @@ struct EditorView: View {
         .onKeyPress(phases: .all) { press in handleKey(press) }
         .sheet(isPresented: $showImport) { importSheet }
         .sheet(isPresented: $showNodes) { NodeEditorView(session: session) }
+        .sheet(isPresented: $showSnowSettings) { snowSettingsSheet }
         .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
     }
 
@@ -295,10 +297,74 @@ struct EditorView: View {
             Text("Rain").tag(1)
             Text("Snow").tag(2)
         }
+        Button("Snow settings…") { showSnowSettings = true }
         if session.project.scene.weather.wetness > 0.01
             || session.project.scene.weather.snow > 0.01 {
             Divider()
             Button("Clear ground build-up") { session.clearWeatherBuildup() }
+        }
+    }
+
+    /// v4.3: binding for the Max Snow Depth slider — writes go
+    /// through the session's explicit settings call (A preserved,
+    /// renderer depth + geometry rescheduled there).
+    private var maxSnowDepthBinding: Binding<Double> {
+        Binding(
+            get: { session.project.scene.weather.maxDepth },
+            set: { session.setMaxSnowDepth($0) })
+    }
+
+    /// v4.3: the Snow settings sheet (from the Weather menu):
+    /// the user-set Max Snow Depth, the per-project snow pattern
+    /// seed with a re-roll, and the live depth readout.
+    private var snowSettingsSheet: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    HStack {
+                        Text("Max Snow Depth")
+                        Spacer()
+                        Text(String(format: "%.2f m", session.project.scene.weather.maxDepth))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Slider(value: maxSnowDepthBinding, in: 0.05...2.0, step: 0.05)
+                    Text("Snow keeps falling until it reaches this depth. Lowering it lets deep snow settle down gradually — it isn't removed instantly.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("Depth")
+                }
+                Section {
+                    HStack {
+                        Text("Pattern")
+                        Spacer()
+                        Text(session.project.scene.weather.seed == 0
+                             ? "Pattern #0 (Classic)"
+                             : "Pattern #\(session.project.scene.weather.seed)")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    Button("Re-roll pattern") { session.rerollSnowSeed() }
+                } header: {
+                    Text("Snow Pattern")
+                }
+                Section {
+                    Text(String(format: "Snow now: %.2f m of %.2f m max (%d%%)",
+                                session.liveSnowAmount,
+                                session.project.scene.weather.maxDepth,
+                                Int((session.liveSnowProgress * 100).rounded())))
+                        .monospacedDigit()
+                } header: {
+                    Text("Right Now")
+                }
+            }
+            .navigationTitle("Snow Settings")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showSnowSettings = false }
+                }
+            }
         }
     }
 
@@ -397,6 +463,17 @@ struct EditorView: View {
                 || session.project.scene.weather.wetness > 0.02
                 || session.project.scene.weather.snow > 0.02 {
                 Text(weatherCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, session.liveSnowAmount > 0.005 ? 2 : 8)
+            }
+            // v4.3: the absolute depth under the cover percent —
+            // "Snow depth: 0.18 m of 0.30 m max".
+            if session.liveSnowAmount > 0.005 {
+                Text(String(format: "Snow depth: %.2f m of %.2f m max",
+                            session.liveSnowAmount,
+                            session.project.scene.weather.maxDepth))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
