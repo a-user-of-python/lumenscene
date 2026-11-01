@@ -10,8 +10,11 @@ name: Repro (snow accumulation)
 # accumulation-start sequence completed). CRASH = the app died
 # before REPRO-DONE and a real DiagnosticReports crash report
 # was collected (exception type / termination reason / last
-# REPRO-MARKER are in summary.txt). APP-TIMEOUT = the driver's
-# own watchdog fired (sequence stalled, no crash). Only
+# REPRO-MARKER are in summary.txt). HANG = the app was still
+# alive at the per-run timeout with markers progressing and NO
+# crash report (stall / waitUntilCompleted-fence signature —
+# distinct from a trap). APP-TIMEOUT = the driver's own
+# watchdog fired (sequence stalled, no crash). Only
 # HARNESS-ERROR / NO-VERDICT fail this job — an app crash is a
 # successful repro, not a harness failure.
 
@@ -96,16 +99,22 @@ jobs:
               os.path.expanduser(
                   f"~/Library/Developer/CoreSimulator/Devices/{UDID}/data/Library/Logs/DiagnosticReports"),
           ]
+          # Order: default first, then the freeze interleave
+          # variants, then scene variants, then single toggles
+          # in bisect order (simtick, syncas, noscoped,
+          # copyreads, norefit).
           RUNS = [
               ("default", []),
+              ("freeze", ["-LSVariant", "freeze"]),
+              ("freeze2", ["-LSVariant", "freeze2"]),
               ("plane", ["-LSVariant", "plane"]),
               ("scaled", ["-LSVariant", "scaled"]),
               ("bigplane", ["-LSVariant", "bigplane"]),
               ("toggle-simtick", ["-LSToggle", "simtick"]),
               ("toggle-syncas", ["-LSToggle", "syncas"]),
               ("toggle-noscoped", ["-LSToggle", "noscoped"]),
-              ("toggle-norefit", ["-LSToggle", "norefit"]),
               ("toggle-copyreads", ["-LSToggle", "copyreads"]),
+              ("toggle-norefit", ["-LSToggle", "norefit"]),
           ]
           PER_RUN_TIMEOUT = 240
 
@@ -172,11 +181,18 @@ jobs:
                   crash_info = f" exception=[{exc}] termination=[{term}] report={os.path.basename(dest)}"
                   with open(log_path, "a") as lf:
                       lf.write(f"\n--- crash report top frames ({os.path.basename(src)}) ---\n{frames}\n")
+              elif timed_out and markers:
+                  # The app started, pumped markers, produced NO
+                  # crash report, and was still alive when the
+                  # per-run timeout killed it: a HANG (stall /
+                  # fence-wait signature), not a trap and not a
+                  # harness failure.
+                  result = "HANG (alive at timeout, no crash report — stall/fence-wait signature)"
+              elif timed_out:
+                  result = "HARNESS-ERROR (simctl launch timed out with no driver output)"
+                  harness_failed = True
               elif "REPRO-TIMEOUT" in output:
                   result = "APP-TIMEOUT (driver watchdog; no crash report)"
-              elif timed_out:
-                  result = "HARNESS-ERROR (simctl launch timed out with no driver verdict)"
-                  harness_failed = True
               elif "REPRO-START" not in output and "REPRO-MARKER" not in output:
                   result = "HARNESS-ERROR (app produced no repro output; launch failure?)"
                   harness_failed = True

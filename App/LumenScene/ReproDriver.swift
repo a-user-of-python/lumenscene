@@ -39,6 +39,21 @@
 //   scaled   — the demo plus a box with transform scale 0 on X
 //              and a box with transform scale 50 on all axes.
 //   bigplane — the demo floor plane scaled ×12 on X/Z (~120 m).
+//   freeze   — accumulate hands-off: once A >= 0.002 (before
+//              the first sheet rebuild), the REAL idle freeze
+//              engages via the session's own bookkeeping (the
+//              driver shortens idleFreezeSeconds — the same
+//              preference the More-menu picker writes — and
+//              withholds input; frameTick's engage check does
+//              the rest), ~30 frozen frames pump, the real wake
+//              path runs (noteUserInput -> wakeFromIdleFreeze),
+//              then accumulation continues through the first
+//              sheet rebuild + sim ticks.
+//   freeze2  — like freeze, but armed the moment a rebuild is
+//              STAGED (async AS build in flight), so the engage
+//              races the frame-boundary swap: the session's
+//              protected-operation check defers the engage to
+//              the first clear frame after the swap.
 
 import Foundation
 import MetalKit
@@ -116,9 +131,11 @@ enum ReproDriver {
         print("REPRO-START variant=\(variant) toggles=\(ReproToggles.active.sorted().joined(separator: ","))")
         fflush(stdout)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            let run = ReproRun()
-            activeRun = run
-            run.start()
+            MainActor.assumeIsolated {
+                let run = ReproRun()
+                activeRun = run
+                run.start()
+            }
         }
     }
 
@@ -149,10 +166,14 @@ enum ReproDriver {
     }
 }
 
-/// One repro run. Lives on the main queue; the pump is a
-/// self-rescheduling asyncAfter chain so the runloop keeps
-/// spinning between frames (Metal completion handlers and the
-/// renderer's main-queue weather-step updates depend on it).
+/// One repro run. Lives on the main actor (EditorSession is
+/// @MainActor-isolated; the pump is a self-rescheduling
+/// asyncAfter chain on the main queue so the runloop keeps
+/// spinning between frames — Metal completion handlers and
+/// the renderer's main-queue weather-step updates depend on
+/// it). The DispatchQueue hops re-enter via assumeIsolated,
+/// which is exact: asyncAfter on .main runs on the main actor.
+@MainActor
 final class ReproRun {
     private var session: EditorSession?
     private var renderer: Renderer?
@@ -167,6 +188,33 @@ final class ReproRun {
     private var simTickFrames = 0
     private var framesAfterSwap = 0
     private var finished = false
+
+    // Freeze-interleave state (variants freeze / freeze2).
+    private enum Phase { case accumulate, armingFreeze, frozen, resume }
+    private var phase: Phase = .accumulate
+    private var frozenPumps = 0
+    private var armingPumps = 0
+    private var freezeDone = false
+    private var stagedSeen = false
+
+    private var isFreezeVariant: Bool {
+        ReproDriver.variant == "freeze" || ReproDriver.variant == "freeze2"
+    }
+
+    /// Freeze trigger, evaluated in the accumulate phase.
+    /// freeze: accumulation under way but no sheet rebuild yet
+    /// (the hands-off watcher crossing the 60 s boundary
+    /// mid-accumulation, compressed). freeze2: a rebuild has
+    /// just been staged — freeze tries to engage at the swap
+    /// boundary.
+    private func freezeTriggerMet() -> Bool {
+        guard isFreezeVariant, !freezeDone else { return false }
+        if ReproDriver.variant == "freeze" {
+            return crossedA && (session?.liveSnowAmount ?? 0) >= 0.002
+                && !sawSheetAfterWeatherOn
+        }
+        return stagedSeen
+    }
 
     func start() {
         guard let renderer = Renderer.shared else {
@@ -212,12 +260,66 @@ final class ReproRun {
 
     private func pump() {
         guard !finished, let session, let renderer, let view else { return }
+
+        // --- Freeze-variant phase transitions (before input) ---
+        if phase == .accumulate, freezeTriggerMet() {
+            // Arm the REAL idle freeze through the session's own
+            // bookkeeping: shorten the idle delay (the same
+            // renderer preference the More-menu picker writes)
+            // and stop reporting input. frameTick's own engage
+            // check (idle time + protected-operation gate) does
+            // the rest — no stub, no state surgery.
+            session.idleFreezeSeconds = 0.25
+            phase = .armingFreeze
+            armingPumps = 0
+            ReproDriver.marker("freeze-arm A=\(session.liveSnowAmount) step=\(renderer.weatherStep)")
+        }
+        if phase == .frozen {
+            frozenPumps += 1
+            if frozenPumps >= 30 {
+                // The real wake path: every input funnel in the
+                // app goes through noteUserInput, which wakes a
+                // frozen session via wakeFromIdleFreeze.
+                ReproDriver.marker("wake-before frozen=\(session.isIdleFrozen)")
+                session.noteUserInput()
+                session.idleFreezeSeconds = 60
+                freezeDone = true
+                phase = .resume
+                ReproDriver.marker("wake-after frozen=\(session.isIdleFrozen)")
+            }
+        }
+
         // Synthetic presence: a live user driving frames keeps
         // the idle freeze from engaging; the repro does the
-        // same through the real input funnel.
-        session.noteUserInput()
+        // same through the real input funnel — EXCEPT while
+        // arming/frozen, where withholding input is the point.
+        if phase != .armingFreeze && phase != .frozen {
+            session.noteUserInput()
+        }
         session.frameTick(view: view)
         pumpCount += 1
+
+        if phase == .armingFreeze {
+            armingPumps += 1
+            if session.isIdleFrozen {
+                phase = .frozen
+                frozenPumps = 0
+                ReproDriver.marker("freeze-engaged step=\(renderer.weatherStep)")
+            } else if armingPumps > 240 {
+                // The engage never landed (a protected operation
+                // never cleared?) — a named driver verdict, not
+                // a silent stall.
+                finished = true
+                print("REPRO-TIMEOUT reason=freeze-arm-stalled pumps=\(pumpCount) step=\(renderer.weatherStep) buildInFlight=\(renderer.staticBuildInFlight)")
+                fflush(stdout)
+                NSLog("REPRO-TIMEOUT freeze-arm-stalled")
+                exit(2)
+            }
+        }
+        if weatherOn, renderer.staticBuildInFlight, !stagedSeen {
+            stagedSeen = true
+            ReproDriver.marker("as-staged step=\(renderer.weatherStep)")
+        }
 
         // Observe the renderer's own step trail (the same tag
         // the app persists for post-crash diagnosis).
@@ -251,9 +353,12 @@ final class ReproRun {
         // its staged AS swapped in, and the sim ticked (or was
         // deliberately disabled by the simtick toggle, in which
         // case 90 post-swap frames stand in for tick evidence).
+        // Freeze variants additionally require the full
+        // engage -> frozen frames -> wake cycle to have run.
         let simSatisfied = ReproToggles.simTick ? framesAfterSwap >= 90
                                                 : simTickFrames >= 5
-        if crossedA, sawSheetAfterWeatherOn, sawSwapAfterWeatherOn, simSatisfied {
+        let freezeSatisfied = !isFreezeVariant || freezeDone
+        if crossedA, sawSheetAfterWeatherOn, sawSwapAfterWeatherOn, simSatisfied, freezeSatisfied {
             finished = true
             ReproDriver.marker("settle A=\(a) pumps=\(pumpCount) simTicks=\(simTickFrames)")
             print("REPRO-DONE")
@@ -272,7 +377,7 @@ final class ReproRun {
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(33)) { [weak self] in
-            self?.pump()
+            MainActor.assumeIsolated { self?.pump() }
         }
     }
 }
