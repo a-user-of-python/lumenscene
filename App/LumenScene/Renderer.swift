@@ -3640,6 +3640,34 @@ final class Renderer {
             }
             if worst < 0.0005 { simSettled = true; simStepsLastFrame = 0; return }
         }
+        // v4.10.3 (THE snow crash): the per-kind activity
+        // decision is made BEFORE any Metal object exists.
+        // v4.8–v4.10.2 created the command buffer and its
+        // compute encoder first and let the !active branch
+        // below return past them; the orphaned encoder was
+        // released without endEncoding, Metal asserted
+        // ("Command encoder released without endEncoding")
+        // and the process aborted. That branch is guaranteed
+        // at accumulation start (the first sheet build fires
+        // while every ceiling is still 0, so neither kind is
+        // active), which is why the app died the moment snow
+        // started accumulating. No return path may ever again
+        // sit between an encoder's creation and its
+        // endEncoding.
+        let snowCreates = simSnowBaseRate > 0 && simSnowCeilMax > 0
+        let waterBaseRate = simRaining ? simWaterBase : 0
+        let waterCreates = simRaining && waterBaseRate > 0 && simWaterCeilMax > 0
+        if snowCreates { simSnowContent = true }
+        if waterCreates { simWaterContent = true }
+        let snowActive = simSnowContent || snowCreates
+        let waterActive = simWaterContent || waterCreates
+        if !snowActive && !waterActive {
+            // Neither field can change this frame; the source/
+            // sink dispatch would be the identity on both kinds
+            // as well, so the whole tick encodes nothing.
+            simStepsLastFrame = 0
+            return
+        }
         let sub = 1.0 / 30.0
         let steps = min(4, max(1, Int((rawDt / sub).rounded())))
         simStepsLastFrame = steps
@@ -3668,20 +3696,9 @@ final class Renderer {
         // ceiling somewhere). Sinks, compaction, drying and
         // drainage never create content, so they need no
         // activity of their own: on zero content they are the
-        // identity too (max(0, 0 - sink*dt) == 0).
-        let snowCreates = params.snowBase > 0 && simSnowCeilMax > 0
-        let waterCreates = simRaining && params.waterBase > 0 && simWaterCeilMax > 0
-        if snowCreates { simSnowContent = true }
-        if waterCreates { simWaterContent = true }
-        let snowActive = simSnowContent || snowCreates
-        let waterActive = simWaterContent || waterCreates
-        if !snowActive && !waterActive {
-            // Neither field can change this frame; the source/
-            // sink dispatch would be the identity on both kinds
-            // as well, so the whole tick encodes nothing.
-            simStepsLastFrame = 0
-            return
-        }
+        // identity too (max(0, 0 - sink*dt) == 0). The decision
+        // itself is computed above, before the command buffer
+        // exists (v4.10.3 — see the note there).
         noteWeatherStep("tick:dispatch")
         let threads = MTLSize(width: simVX * simVZ, height: 1, depth: 1)
         func bindSim(_ e: MTLComputeCommandEncoder) {
