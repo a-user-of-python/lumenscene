@@ -4051,6 +4051,35 @@ final class Renderer {
             }
             prevPlowIntruders = snap
         }
+        // v4.10.4 (round 2): the SHAPED mask. A vertex is
+        // shaped when its target depth differs from the pure
+        // closed-form ceiling for its support — i.e. an
+        // intruder imprint / banking / footprint shaped it —
+        // or when the plow layer wrote a delta into it this
+        // build. Only shaped vertices may receive an edit
+        // transfer in (c2a): everywhere else the GPU sim's own
+        // state is authoritative (the v4.8 design intent —
+        // transfers fire "only where an intruder, a footprint,
+        // or the plow layer is actively shaping the snow").
+        // Round 1 left the gate at |target - ceiling| > eps,
+        // which the (c1b) repose relaxation makes true at
+        // nearly every steep vertex, so the relaxed CPU target
+        // was re-injected across the whole field at every
+        // rebuild and the sim never owned the surface.
+        var shapedMask = [Bool](repeating: false, count: vx * vz)
+        if snowPossible {
+            for idx in verts.indices where verts[idx].support != nil {
+                if layerApplied[idx] { shapedMask[idx] = true; continue }
+                let s = verts[idx].support!
+                let taper = wgfSmooth(0.55, 0.75, s.interpNY)
+                let pure = wgfSnowHeight(x: ox + Float(idx % vx) * cs,
+                                         z: oz + Float(idx / vx) * cs,
+                                         amount: s.amount) * taper
+                if abs(verts[idx].snowH - pure) > 0.0005 {
+                    shapedMask[idx] = true
+                }
+            }
+        }
         // (c1b) v4.10.4: PINNED columns + REPOSE RELAXATION of
         // the TARGET — the v4.6 shaping, restored to BEFORE the
         // sim sync (it sat in (c2), after the sync, and ran 0
@@ -4288,7 +4317,8 @@ final class Renderer {
                     let waterArr = simRead(waterBuf, count: n)
                     var editedCopy = false
                     for idx in verts.indices where hasS[idx] {
-                        if abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
+                        if (ReproToggles.noGate || shapedMask[idx]),
+                           abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
                             let tv = tSnow[idx]
                             if idx < snowArr.count {
                                 snowArr[idx] = tv.isFinite ? tv : 0
@@ -4318,8 +4348,12 @@ final class Renderer {
                 for idx in verts.indices where hasS[idx] {
                     // Edit transfer: only where intruders /
                     // footprints / plow shape the column
-                    // (target != pure ceiling).
-                    if abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
+                    // (target != pure ceiling) — v4.10.4
+                    // round 2: gated on the shaped mask, not
+                    // on the raw target/ceiling difference
+                    // (see the mask's comment above (c1b)).
+                    if (ReproToggles.noGate || shapedMask[idx]),
+                       abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
                         // v4.10.2: a non-finite target must
                         // not be written into the sim either —
                         // the flow kernel's diffusion would

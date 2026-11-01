@@ -125,6 +125,11 @@ enum ReproToggles {
     /// simWrite) instead of the v4.9 zero-copy contents()
     /// pointer reads.
     static var copyReads: Bool { active.contains("copyreads") }
+    /// v4.10.4 round 2: disable the shaped-mask gate on the
+    /// (c2a) edit transfers (round-1 behaviour: any vertex
+    /// whose target differs from its ceiling is overwritten
+    /// with the CPU target at every rebuild).
+    static var noGate: Bool { active.contains("nogate") }
 }
 
 enum ReproDriver {
@@ -294,6 +299,8 @@ final class ReproRun {
         var violCount = 0
         var violMax: Float = 0
         var maxSlopeDeg: Float = 0
+        var smoothMaxDeg: Float = 0
+        var smoothRMSDeg: Float = 0
         var spikeCount = 0
         var spikeMax: Float = 0
         var vol: Float = 0
@@ -328,6 +335,33 @@ final class ReproRun {
                     }
                 }
             }
+            // Same-support smoothness (v4.10.4 round 2): the
+            // honest broad-field roughness number — surface
+            // slope over adjacent pairs whose SUPPORT heights
+            // agree (no object edge / skirt step between
+            // them) and which both carry snow. maxSlope above
+            // conflates support steps with snow roughness.
+            var smoothPairs = 0
+            var smoothSqSum: Double = 0
+            for j in 0..<s.vz {
+                for i in 0..<s.vx {
+                    let a = j * s.vx + i
+                    func pair(_ b: Int) {
+                        if abs(clean(s.support[a]) - clean(s.support[b])) > 0.05 { return }
+                        if clean(s.snow[a]) <= 0 || clean(s.snow[b]) <= 0 { return }
+                        let d = abs(surf[b] - surf[a]) / s.cs
+                        let deg = Float(atan(Double(d))) * 180 / Float.pi
+                        if deg > smoothMaxDeg { smoothMaxDeg = deg }
+                        smoothSqSum += Double(deg) * Double(deg)
+                        smoothPairs += 1
+                    }
+                    if i + 1 < s.vx { pair(a + 1) }
+                    if j + 1 < s.vz { pair(a + s.vx) }
+                }
+            }
+            if smoothPairs > 0 {
+                smoothRMSDeg = Float(sqrt(smoothSqSum / Double(smoothPairs)))
+            }
             // Spike: surface minus the median of its 3x3
             // neighbourhood (all 9 values, centre included),
             // interior vertices only.
@@ -350,8 +384,9 @@ final class ReproRun {
             }
         }
         var line = "REPRO-METRIC \(label)"
-            + String(format: " maxH=%.4f violCount=%d violMax=%.4f maxSlope=%.2f spikeCount=%d spikeMax=%.4f vol=%.4f maxPlowPos=%.4f minPlowNeg=%.4f",
+            + String(format: " maxH=%.4f violCount=%d violMax=%.4f maxSlope=%.2f smoothMax=%.2f smoothRMS=%.2f spikeCount=%d spikeMax=%.4f vol=%.4f maxPlowPos=%.4f minPlowNeg=%.4f",
                      maxH, violCount, violMax, maxSlopeDeg,
+                     smoothMaxDeg, smoothRMSDeg,
                      spikeCount, spikeMax, vol,
                      s.plowMaxPos, s.plowMinNeg)
         // Spawn section (deepspawn only): box-top / ring /
@@ -416,6 +451,37 @@ final class ReproRun {
         print(line)
         fflush(stdout)
         NSLog("%@", line)
+        // v4.10.4 round 2: field maps for the deep variants at
+        // establishment end and at the final checkpoint —
+        // ceiling and sim snow depth, every 2nd vertex,
+        // one char per vertex (0-9a-z over the given range),
+        // rows north (max z) first. Lets a human SEE whether
+        // roughness lives in the ceiling landscape itself,
+        // in the sim state, or only near the box.
+        if (ReproDriver.variant == "deeprest" || ReproDriver.variant == "deepdrag"),
+           label == "pre" || label == "rest-30s" || label == "settled-20s",
+           s.initialised, n > 0, s.snow.count >= n, s.ceiling.count >= n {
+            let chars = Array("0123456789abcdefghijklmnopqrstuvwxyz")
+            func dump(_ name: String, _ field: [Float], _ range: Float) {
+                print("REPRO-MAP \(label) \(name) range=\(range)")
+                var j = s.vz - 1
+                while j >= 0 {
+                    var row = ""
+                    var i = 0
+                    while i < s.vx {
+                        let v = clean(field[j * s.vx + i])
+                        let q = max(0, min(35, Int(v / range * 36)))
+                        row.append(chars[q])
+                        i += 2
+                    }
+                    print("REPRO-MAP \(row)")
+                    j -= 2
+                }
+                fflush(stdout)
+            }
+            dump("ceil", s.ceiling, 2.2)
+            dump("snow", s.snow, 3.5)
+        }
     }
 
     private func finishDeep() {

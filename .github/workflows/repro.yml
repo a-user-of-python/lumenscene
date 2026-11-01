@@ -115,6 +115,8 @@ jobs:
               ("deepspawn", ["-LSVariant", "deepspawn"]),
               ("deepdrag-simtickoff", ["-LSVariant", "deepdrag", "-LSToggle", "simtick"]),
               ("deepdrag-noscoped", ["-LSVariant", "deepdrag", "-LSToggle", "noscoped"]),
+              ("deeprest-nogate", ["-LSVariant", "deeprest", "-LSToggle", "nogate"]),
+              ("deepdrag-nogate", ["-LSVariant", "deepdrag", "-LSToggle", "nogate"]),
               ("toggle-simtick", ["-LSToggle", "simtick"]),
               ("toggle-syncas", ["-LSToggle", "syncas"]),
               ("toggle-noscoped", ["-LSToggle", "noscoped"]),
