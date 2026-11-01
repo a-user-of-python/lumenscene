@@ -374,8 +374,19 @@ jobs:
           subprocess.run(["xcrun", "simctl", "boot", udid], capture_output=True)
           subprocess.run(["xcrun", "simctl", "bootstatus", udid, "-b"],
                          capture_output=True, timeout=600)
-          subprocess.run(["xcrun", "simctl", "install", udid, APP],
-                         capture_output=True)
+          inst = subprocess.run(["xcrun", "simctl", "install", udid, APP],
+                                capture_output=True, text=True)
+          if inst.returncode != 0:
+              note(f"GATE-CHECK iphone: INSTALL FAILED rc={inst.returncode} "
+                   f"stderr={inst.stderr.strip()[:300]}")
+              with open(os.path.join(LOGDIR, "gate-check.txt"), "w") as f:
+                  f.write("\n".join(lines) + "\n")
+              sys.exit(1)
+          cont = subprocess.run(["xcrun", "simctl", "get_app_container",
+                                 udid, BUNDLE, "data"],
+                                capture_output=True, text=True)
+          note("GATE-CHECK iphone: app container "
+               + ("present" if cont.returncode == 0 else "MISSING"))
           out = launch_capture(udid)
           with open(os.path.join(LOGDIR, "gate-iphone.log"), "w") as f:
               f.write(out)
@@ -386,6 +397,11 @@ jobs:
           ipad = os.environ.get("IPAD_UDID", "")
           ipad_ok = None
           if ipad:
+              cont2 = subprocess.run(["xcrun", "simctl", "get_app_container",
+                                      ipad, BUNDLE, "data"],
+                                     capture_output=True, text=True)
+              note("GATE-CHECK ipad: app container "
+                   + ("present" if cont2.returncode == 0 else "MISSING"))
               out2 = launch_capture(ipad)
               with open(os.path.join(LOGDIR, "gate-ipad.log"), "w") as f:
                   f.write(out2)

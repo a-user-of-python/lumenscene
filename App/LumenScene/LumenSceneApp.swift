@@ -10,6 +10,16 @@ struct LumenSceneApp: App {
         // LS-REPRO: inert unless launched with `-LSRepro`
         // (see ReproDriver.swift).
         ReproDriver.bootstrapIfNeeded()
+        // Gate proof marker, emitted at bootstrap like the
+        // repro driver's own markers: a headless console
+        // launch may never present a window, so the notice
+        // view's onAppear is not a reliable signal there.
+        // On iPad this never prints.
+        if DeviceGate.isPhone {
+            print("GATE-MARKER ipad-required idiom=phone")
+            fflush(stdout)
+            NSLog("GATE-MARKER ipad-required idiom=phone")
+        }
     }
 
     var body: some SwiftUI.Scene {
@@ -60,10 +70,10 @@ struct IPadRequiredView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .preferredColorScheme(.dark)
         .onAppear {
-            // Proof marker for the simulator gate check in
-            // repro.yml (one line at launch; the iPad path
-            // never prints it).
+            // Same marker as the bootstrap emission (the
+            // view-level signal for interactive launches).
             print("GATE-MARKER ipad-required idiom=phone")
+            fflush(stdout)
             NSLog("GATE-MARKER ipad-required idiom=phone")
         }
     }
