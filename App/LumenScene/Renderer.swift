@@ -3528,15 +3528,19 @@ final class Renderer {
     // waitForSimTick discipline the sheet readback uses) so
     // the copies are not racing a GPU tick. When the sim is
     // not initialised the arrays are empty and `initialised`
-    // is false.
+    // is false. `swapped` mirrors `staticEverSwapped` (set by
+    // swapStatic): the frame-boundary swap witness — the AS
+    // itself can be nil where ray tracing is unsupported, so
+    // this flag, not hasGeometry, proves a swap occurred.
     func reproSimSnapshot() -> (snow: [Float], support: [Float],
                                 ceiling: [Float],
                                 vx: Int, vz: Int, cs: Float,
                                 ox: Float, oz: Float,
                                 plowMaxPos: Float, plowMinNeg: Float,
-                                initialised: Bool) {
+                                initialised: Bool, swapped: Bool) {
         guard simInitialised else {
-            return ([], [], [], simVX, simVZ, simCS, simOX, simOZ, 0, 0, false)
+            return ([], [], [], simVX, simVZ, simCS, simOX, simOZ, 0, 0, false,
+                    staticEverSwapped)
         }
         waitForSimTick()
         var plowMaxPos: Float = 0
@@ -3549,7 +3553,7 @@ final class Renderer {
                 simRead(simSupportBuf, count: simVX * simVZ),
                 simRead(simSnowCeilBuf, count: simVX * simVZ),
                 simVX, simVZ, simCS, simOX, simOZ,
-                plowMaxPos, plowMinNeg, true)
+                plowMaxPos, plowMinNeg, true, staticEverSwapped)
     }
 
     /// Drop all sim state (Clear build-up / Re-roll): the next

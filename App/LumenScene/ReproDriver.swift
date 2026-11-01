@@ -423,11 +423,12 @@ final class ReproRun {
 
     /// Deep-variant phase machine, called once per pump AFTER
     /// the latch updates (so sawTickTag / simTickFrames reflect
-    /// this pump). Establishment = a static build has swapped
-    /// in (renderer.hasGeometry: an AS is live) AND the sim is
-    /// initialised (reproSimSnapshot().initialised — only a
-    /// sheet build's simSync initialises it, so this IS the
-    /// first-sheet evidence) AND the sim has ticked 5 times.
+    /// this pump). Establishment = a staged static build has
+    /// swapped in (reproSimSnapshot().swapped, i.e.
+    /// staticEverSwapped) AND the sim is initialised
+    /// (reproSimSnapshot().initialised — only a sheet build's
+    /// simSync initialises it, so this IS the first-sheet
+    /// evidence) AND the sim has ticked 5 times.
     /// NOTE (run 41336002939): the generic settle's sampled
     /// `rebuild:swap` tag latch can NEVER fire for these
     /// variants — with A pre-seeded the sim initialises at
@@ -444,8 +445,17 @@ final class ReproRun {
         let now = CACurrentMediaTime()
         switch deepPhase {
         case .establishing:
-            guard let renderer, renderer.hasGeometry,
-                  renderer.reproSimSnapshot().initialised,
+            // Swap witness is the snapshot's `swapped`
+            // (staticEverSwapped), NOT hasGeometry: in the
+            // simulator ray tracing is unsupported, the staged
+            // build's AS is nil, swapStatic still runs and
+            // sets the flag — but accel stays nil forever
+            // (run 41338778095 sat in .establishing on
+            // hasGeometry for the full watchdog, simTicks
+            // 5489, exactly as the tag latch had before it).
+            guard let renderer else { return }
+            let snap = renderer.reproSimSnapshot()
+            guard snap.initialised, snap.swapped,
                   sawTickTag, simTickFrames >= 5 else { return }
             if ReproDriver.variant == "deepspawn" {
                 emitMetric("pre-spawn")
