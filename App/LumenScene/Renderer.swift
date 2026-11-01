@@ -1353,6 +1353,10 @@ final class Renderer {
         let fpHash = fingerprintHash(fp)
         let canScope = weatherGeoActive && cachedPrefix?.fingerprint == fp
             && !scopedDisabled.contains(fpHash)
+            // LS-REPRO TOGGLE `noscoped`: never take the v4.9
+            // sheet-only scoped path — always build the full
+            // static prefix. Default OFF = shipped behaviour.
+            && !ReproToggles.noScoped
         let verifyScope = canScope && !scopedVerified.contains(fpHash)
         let useScoped = canScope && !verifyScope
         if useScoped, let cache = cachedPrefix {
@@ -3550,6 +3554,10 @@ final class Renderer {
     /// sink, and the flow settle scan (every 0.5 s, CPU scan of
     /// the shared buffers) reports max slope excess < 0.5 mm.
     func tickWeatherSim(now: CFTimeInterval) {
+        // LS-REPRO TOGGLE `simtick`: skip GPU sim stepping
+        // entirely — the depth buffers keep the sheet build's
+        // initial condition. Default OFF = shipped behaviour.
+        if ReproToggles.simTick { simStepsLastFrame = 0; return }
         guard simInitialised, let src = simSourcePipeline, let flow = simFlowPipeline,
               let snowB = simSnowBuf, let waterB = simWaterBuf,
               let supB = simSupportBuf, let ceilB = simSnowCeilBuf,
@@ -3592,11 +3600,24 @@ final class Renderer {
             let snowPtr = snowB.contents().bindMemory(to: Float.self, capacity: count)
             let supPtr = supB.contents().bindMemory(to: Float.self, capacity: count)
             let waterPtr = waterB.contents().bindMemory(to: Float.self, capacity: count)
+            // LS-REPRO TOGGLE `copyreads`: when on, the scan
+            // reads explicit simRead copies of the buffers
+            // instead of the v4.9 zero-copy contents() pointers
+            // (the accessors below are the scan's only read
+            // path; the tick's length guard above guarantees
+            // the copies hold `count` values). Default OFF =
+            // shipped behaviour.
+            let snowCopy: [Float]? = ReproToggles.copyReads ? simRead(snowB, count: count) : nil
+            let supCopy: [Float]? = ReproToggles.copyReads ? simRead(supB, count: count) : nil
+            let waterCopy: [Float]? = ReproToggles.copyReads ? simRead(waterB, count: count) : nil
+            func snowAt(_ i: Int) -> Float { snowCopy.map { $0[i] } ?? snowPtr[i] }
+            func supAt(_ i: Int) -> Float { supCopy.map { $0[i] } ?? supPtr[i] }
+            func waterAt(_ i: Int) -> Float { waterCopy.map { $0[i] } ?? waterPtr[i] }
             var maxSnow: Float = 0
             var maxWater: Float = 0
             for idx in 0..<count {
-                if snowPtr[idx] > maxSnow { maxSnow = snowPtr[idx] }
-                if waterPtr[idx] > maxWater { maxWater = waterPtr[idx] }
+                if snowAt(idx) > maxSnow { maxSnow = snowAt(idx) }
+                if waterAt(idx) > maxWater { maxWater = waterAt(idx) }
             }
             simSnowContent = maxSnow > 0
             simWaterContent = maxWater > 0
@@ -3605,14 +3626,14 @@ final class Renderer {
             for j in 0..<simVZ {
                 for i in 0..<simVX {
                     let a = j * simVX + i
-                    if snowPtr[a] <= 0 { continue }
+                    if snowAt(a) <= 0 { continue }
                     if i + 1 < simVX {
-                        let d = abs((supPtr[a] + snowPtr[a]) - (supPtr[a + 1] + snowPtr[a + 1]))
-                        if supPtr[a + 1] != 0 || snowPtr[a + 1] > 0 { worst = max(worst, d - maxStep) }
+                        let d = abs((supAt(a) + snowAt(a)) - (supAt(a + 1) + snowAt(a + 1)))
+                        if supAt(a + 1) != 0 || snowAt(a + 1) > 0 { worst = max(worst, d - maxStep) }
                     }
                     if j + 1 < simVZ {
                         let b = a + simVX
-                        let d = abs((supPtr[a] + snowPtr[a]) - (supPtr[b] + snowPtr[b]))
+                        let d = abs((supAt(a) + snowAt(a)) - (supAt(b) + snowAt(b)))
                         worst = max(worst, d - maxStep)
                     }
                 }
@@ -4021,6 +4042,42 @@ final class Renderer {
                 // per sheet build before; zero copies now, and
                 // edit transfers write only the edited vertices,
                 // in place, with the identical values).
+                // LS-REPRO TOGGLE `copyreads`: when on, the
+                // edit transfers + readback below run on
+                // explicit simRead copies (written back with
+                // simWrite) instead of the v4.9 zero-copy
+                // contents() pointers — same values, same
+                // finite-guard, copy path only. Default OFF =
+                // shipped behaviour (the else branch, verbatim).
+                if ReproToggles.copyReads {
+                    var snowArr = simRead(snowBuf, count: n)
+                    let waterArr = simRead(waterBuf, count: n)
+                    var editedCopy = false
+                    for idx in verts.indices where hasS[idx] {
+                        if abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
+                            let tv = tSnow[idx]
+                            if idx < snowArr.count {
+                                snowArr[idx] = tv.isFinite ? tv : 0
+                            }
+                            if !tv.isFinite { noteNanClamp() }
+                            editedCopy = true
+                        }
+                    }
+                    if editedCopy {
+                        simSnowContent = true
+                        simWrite(snowBuf, snowArr)
+                    }
+                    for idx in verts.indices where hasS[idx] {
+                        let sv: Float = idx < snowArr.count ? snowArr[idx] : 0
+                        let wv: Float = idx < waterArr.count ? waterArr[idx] : 0
+                        let s = sv.isFinite ? sv : 0
+                        let w = wv.isFinite ? wv : 0
+                        if s != sv || w != wv { noteNanClamp() }
+                        verts[idx].snowH = s
+                        verts[idx].topY = supY[idx] + s
+                        verts[idx].waterD = w
+                    }
+                } else {
                 let snowPtr = snowBuf.contents().bindMemory(to: Float.self, capacity: n)
                 let waterPtr = waterBuf.contents().bindMemory(to: Float.self, capacity: n)
                 var edited = false
@@ -4061,6 +4118,7 @@ final class Renderer {
                     verts[idx].topY = supY[idx] + s
                     verts[idx].waterD = w
                 }
+                } // LS-REPRO TOGGLE `copyreads`: end of the zero-copy branch.
                 flushNanClampCount()
             }
         }
@@ -4555,6 +4613,30 @@ final class Renderer {
     /// queue beyond (current, pending, deferred).
     private func stageStaticBuild(_ prepared: PreparedStatic) {
         var prepared = prepared
+        // LS-REPRO TOGGLE `syncas`: force the synchronous static
+        // AS build path (the pre-v4.9 behaviour) — build this
+        // stage now, wait for it, and swap it in immediately,
+        // bypassing the async staged build + frame-boundary
+        // swap. Any in-flight stage is completed and dropped
+        // unswapped (its scene is older than this stage).
+        // Default OFF = shipped behaviour.
+        if ReproToggles.syncAS {
+            if let p = pendingStatic { p.cmd?.waitUntilCompleted(); pendingStatic = nil }
+            deferredStatic = nil
+            let (structure, cmd, failed) = makeStaticAS(posBuffer: prepared.posBuffer,
+                                                        idxBuffer: prepared.idxBuffer,
+                                                        triCount: prepared.triCount)
+            prepared.accel = structure
+            prepared.cmd = cmd
+            prepared.buildFailed = failed
+            cmd?.waitUntilCompleted()
+            if staticStageFailed(prepared) {
+                noteWeatherStep("rebuild:stageError")
+                return
+            }
+            swapStatic(prepared)
+            return
+        }
         if !staticEverSwapped, pendingStatic == nil, deferredStatic == nil {
             let (structure, cmd, failed) = makeStaticAS(posBuffer: prepared.posBuffer,
                                                         idxBuffer: prepared.idxBuffer,
@@ -5231,7 +5313,10 @@ final class Renderer {
                     }
                 }
             }
-            if !refitDynamicAccelerationStructure() {
+            // LS-REPRO TOGGLE `norefit`: skip the in-place
+            // refit and always take the full dynamic AS build.
+            // Default OFF = shipped behaviour.
+            if ReproToggles.noRefit || !refitDynamicAccelerationStructure() {
                 // Refit unavailable (no AS, allocation failure):
                 // the v4.8 full build remains as the fallback.
                 buildDynamicAccelerationStructure()

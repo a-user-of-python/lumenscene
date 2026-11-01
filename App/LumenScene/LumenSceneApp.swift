@@ -5,6 +5,12 @@ import SwiftUI
 
 @main
 struct LumenSceneApp: App {
+    init() {
+        // LS-REPRO: inert unless launched with `-LSRepro`
+        // (see ReproDriver.swift).
+        ReproDriver.bootstrapIfNeeded()
+    }
+
     var body: some SwiftUI.Scene {
         WindowGroup {
             RootView()

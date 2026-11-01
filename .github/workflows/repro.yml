@@ -1,0 +1,214 @@
+name: Repro (snow accumulation)
+
+# LS-REPRO harness (Lane A, v4.10.3): builds LumenScene for the
+# iOS Simulator, boots a simulator, and launches the app with
+# -LSRepro (see App/LumenScene/ReproDriver.swift) across the
+# variant/toggle matrix, capturing console output + crash
+# reports per run into the `repro-logs` artifact.
+#
+# Reading a run: PASS = the app printed REPRO-DONE (the full
+# accumulation-start sequence completed). CRASH = the app died
+# before REPRO-DONE and a real DiagnosticReports crash report
+# was collected (exception type / termination reason / last
+# REPRO-MARKER are in summary.txt). APP-TIMEOUT = the driver's
+# own watchdog fired (sequence stalled, no crash). Only
+# HARNESS-ERROR / NO-VERDICT fail this job — an app crash is a
+# successful repro, not a harness failure.
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  repro:
+    name: Simulator repro
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick and boot a simulator
+        id: sim
+        run: |
+          python3 - <<'EOF'
+          import json, os, subprocess, sys
+          out = subprocess.run(["xcrun", "simctl", "list", "devices", "available", "--json"],
+                               capture_output=True, text=True, check=True).stdout
+          devices = json.loads(out)["devices"]
+          def runtime_key(k):
+              # "...SimRuntime.iOS-26-1" -> (26, 1); others sort low.
+              try:
+                  tail = k.rsplit("iOS-", 1)[1]
+                  return tuple(int(p) for p in tail.split("-"))
+              except Exception:
+                  return (0,)
+          picked = None
+          for runtime in sorted(devices, key=runtime_key, reverse=True):
+              cands = [d for d in devices[runtime] if d.get("isAvailable", True)]
+              for prefix in ("iPad", "iPhone"):
+                  match = [d for d in cands if d["name"].startswith(prefix)]
+                  if match:
+                      picked = match[0]
+                      break
+              if picked:
+                  break
+          if not picked:
+              sys.exit("HARNESS-ERROR: no available iOS simulator device")
+          print(f"Picked {picked['name']} ({picked['udid']})")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"udid={picked['udid']}\n")
+          subprocess.run(["xcrun", "simctl", "boot", picked["udid"]],
+                         capture_output=True, text=True)
+          r = subprocess.run(["xcrun", "simctl", "bootstatus", picked["udid"], "-b"],
+                             capture_output=True, text=True, timeout=600)
+          print(r.stdout[-2000:], r.stderr[-2000:])
+          EOF
+
+      - name: Build app for the simulator (Release, unsigned)
+        run: |
+          xcodebuild -project App/LumenScene.xcodeproj \
+            -scheme LumenScene \
+            -sdk iphonesimulator \
+            -configuration Release \
+            -derivedDataPath build/simdd \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Install app
+        run: |
+          APP="build/simdd/Build/Products/Release-iphonesimulator/LumenScene.app"
+          test -d "$APP"
+          xcrun simctl install "${{ steps.sim.outputs.udid }}" "$APP"
+
+      - name: Run repro matrix
+        env:
+          SIM_UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          cat > "$RUNNER_TEMP/repro_runner.py" <<'PYEOF'
+          import glob, os, re, subprocess, sys, time
+
+          UDID = os.environ["SIM_UDID"]
+          BUNDLE = "com.user.lumenscene"
+          LOGDIR = os.path.join(os.getcwd(), "repro-logs")
+          os.makedirs(LOGDIR, exist_ok=True)
+          CRASH_DIRS = [
+              os.path.expanduser("~/Library/Logs/DiagnosticReports"),
+              os.path.expanduser(
+                  f"~/Library/Developer/CoreSimulator/Devices/{UDID}/data/Library/Logs/DiagnosticReports"),
+          ]
+          RUNS = [
+              ("default", []),
+              ("plane", ["-LSVariant", "plane"]),
+              ("scaled", ["-LSVariant", "scaled"]),
+              ("bigplane", ["-LSVariant", "bigplane"]),
+              ("toggle-simtick", ["-LSToggle", "simtick"]),
+              ("toggle-syncas", ["-LSToggle", "syncas"]),
+              ("toggle-noscoped", ["-LSToggle", "noscoped"]),
+              ("toggle-norefit", ["-LSToggle", "norefit"]),
+              ("toggle-copyreads", ["-LSToggle", "copyreads"]),
+          ]
+          PER_RUN_TIMEOUT = 240
+
+          def crash_reports():
+              found = {}
+              for d in CRASH_DIRS:
+                  for p in glob.glob(os.path.join(d, "*")):
+                      if os.path.isfile(p):
+                          found[p] = os.path.getmtime(p)
+              return found
+
+          def parse_crash(path):
+              try:
+                  text = open(path, errors="replace").read()
+              except OSError:
+                  return ("?", "?", "")
+              exc = re.search(r"Exception Type:\s*(.+)", text)
+              term = re.search(r"Termination Reason:\s*(.+)", text)
+              frames = ""
+              m = re.search(r"Thread \d+ Crashed:.*?(?:\n\n|\Z)", text, re.S)
+              if m:
+                  frames = "\n".join(m.group(0).splitlines()[:14])
+              return (exc.group(1).strip() if exc else "?",
+                      term.group(1).strip() if term else "?",
+                      frames)
+
+          summary = []
+          harness_failed = False
+          for name, extra in RUNS:
+              subprocess.run(["xcrun", "simctl", "terminate", UDID, BUNDLE],
+                             capture_output=True)
+              before = crash_reports()
+              log_path = os.path.join(LOGDIR, f"{name}.log")
+              cmd = ["xcrun", "simctl", "launch", "--console", UDID, BUNDLE,
+                     "-LSRepro"] + extra
+              print(f"=== RUN {name}: {' '.join(cmd)}", flush=True)
+              timed_out = False
+              rc = None
+              with open(log_path, "wb") as lf:
+                  try:
+                      proc = subprocess.run(cmd, stdout=lf,
+                                            stderr=subprocess.STDOUT,
+                                            timeout=PER_RUN_TIMEOUT)
+                      rc = proc.returncode
+                  except subprocess.TimeoutExpired:
+                      timed_out = True
+              time.sleep(2)  # let any crash report flush to disk
+              output = open(log_path, errors="replace").read()
+              markers = [l for l in output.splitlines() if "REPRO-MARKER" in l]
+              last_marker = markers[-1].strip() if markers else "(none)"
+              new_reports = [p for p, mt in crash_reports().items()
+                             if p not in before or before.get(p) != mt]
+              lum_reports = [p for p in new_reports
+                             if "LumenScene" in os.path.basename(p)]
+              crash_info = ""
+              if "REPRO-DONE" in output:
+                  result = "PASS"
+              elif lum_reports:
+                  result = "CRASH"
+                  src = sorted(lum_reports)[-1]
+                  dest = os.path.join(LOGDIR, f"crash-{name}-{os.path.basename(src)}")
+                  subprocess.run(["cp", src, dest])
+                  exc, term, frames = parse_crash(src)
+                  crash_info = f" exception=[{exc}] termination=[{term}] report={os.path.basename(dest)}"
+                  with open(log_path, "a") as lf:
+                      lf.write(f"\n--- crash report top frames ({os.path.basename(src)}) ---\n{frames}\n")
+              elif "REPRO-TIMEOUT" in output:
+                  result = "APP-TIMEOUT (driver watchdog; no crash report)"
+              elif timed_out:
+                  result = "HARNESS-ERROR (simctl launch timed out with no driver verdict)"
+                  harness_failed = True
+              elif "REPRO-START" not in output and "REPRO-MARKER" not in output:
+                  result = "HARNESS-ERROR (app produced no repro output; launch failure?)"
+                  harness_failed = True
+              else:
+                  result = "NO-VERDICT (exited without REPRO-DONE and no crash report)"
+                  harness_failed = True
+              line = f"{name}: {result} exit={rc} lastMarker=[{last_marker}]{crash_info}"
+              print(line, flush=True)
+              if result == "CRASH":
+                  print(f"::error title=Repro crash in {name}::{crash_info} lastMarker=[{last_marker}]")
+              summary.append(line)
+              subprocess.run(["xcrun", "simctl", "terminate", UDID, BUNDLE],
+                             capture_output=True)
+
+          with open(os.path.join(LOGDIR, "summary.txt"), "w") as f:
+              f.write("LumenScene snow-accumulation repro — per-run results\n")
+              f.write("PASS = REPRO-DONE reached. CRASH = died before REPRO-DONE "
+                      "with a real crash report.\n\n")
+              f.write("\n".join(summary) + "\n")
+          print("\n".join(summary))
+          sys.exit(1 if harness_failed else 0)
+          PYEOF
+          python3 "$RUNNER_TEMP/repro_runner.py"
+
+      - name: Show repro summary
+        if: always()
+        run: cat repro-logs/summary.txt || true
+
+      - name: Upload repro logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-logs
+          path: repro-logs/
+          if-no-files-found: warn
