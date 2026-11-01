@@ -422,17 +422,31 @@ final class ReproRun {
     }
 
     /// Deep-variant phase machine, called once per pump AFTER
-    /// the latch updates (so sawSwapAfterWeatherOn / sawTickTag
-    /// / simTickFrames reflect this pump). Establishment = the
-    /// first sheet rebuild's staged AS swapped in (a swap
-    /// observed at A >= first step, as in the generic settle)
-    /// AND the sim initialised and ticked (tick: tag + ticks).
+    /// the latch updates (so sawTickTag / simTickFrames reflect
+    /// this pump). Establishment = a static build has swapped
+    /// in (renderer.hasGeometry: an AS is live) AND the sim is
+    /// initialised (reproSimSnapshot().initialised — only a
+    /// sheet build's simSync initialises it, so this IS the
+    /// first-sheet evidence) AND the sim has ticked 5 times.
+    /// NOTE (run 41336002939): the generic settle's sampled
+    /// `rebuild:swap` tag latch can NEVER fire for these
+    /// variants — with A pre-seeded the sim initialises at
+    /// session init, so every draw runs swapStaticIfReady
+    /// (tag rebuild:swap) and then tickWeatherSim (tag
+    /// tick:entry) inside the SAME draw, and the tick tag
+    /// always wins the post-frameTick sample. deeprest and
+    /// deepdrag both sat in .establishing for the full 200 s
+    /// watchdog with simTicks > 5000 and A = 2.0 and no swap
+    /// tag ever sampled; the direct checks above are the fix
+    /// (driver-only — no app code involved).
     private func handleDeep() {
         guard let session else { return }
         let now = CACurrentMediaTime()
         switch deepPhase {
         case .establishing:
-            guard sawSwapAfterWeatherOn, sawTickTag, simTickFrames >= 5 else { return }
+            guard let renderer, renderer.hasGeometry,
+                  renderer.reproSimSnapshot().initialised,
+                  sawTickTag, simTickFrames >= 5 else { return }
             if ReproDriver.variant == "deepspawn" {
                 emitMetric("pre-spawn")
                 // The REAL editor Add path: addPrimitive
