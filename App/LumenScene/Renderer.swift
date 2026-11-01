@@ -4072,8 +4072,8 @@ final class Renderer {
                 if layerApplied[idx] { shapedMask[idx] = true; continue }
                 let s = verts[idx].support!
                 let taper = wgfSmooth(0.55, 0.75, s.interpNY)
-                let pure = wgfSnowHeight(x: ox + Float(idx % vx) * cs,
-                                         z: oz + Float(idx / vx) * cs,
+                let pure = wgfSnowHeight(ox + Float(idx % vx) * cs,
+                                         oz + Float(idx / vx) * cs,
                                          amount: s.amount) * taper
                 if abs(verts[idx].snowH - pure) > 0.0005 {
                     shapedMask[idx] = true
