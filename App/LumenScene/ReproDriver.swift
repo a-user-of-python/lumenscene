@@ -67,6 +67,21 @@
 //              REPRO-DONE. Metrics are computed from the
 //              renderer's LS-REPRO sim snapshot (see
 //              Renderer.reproSimSnapshot).
+//   deepspawn — v4.10.4: same pre-seeded deep scene as
+//              deeprest/deepdrag but plane ONLY at start.
+//              Once the field is established, a fresh 1x1x1
+//              box is placed through the REAL Add path
+//              (EditorSession.addPrimitive — exposure 0,
+//              renderer map sync, rebuild) at (0, 0.5, 0):
+//              makeProject sets the camera target to
+//              (0, 1, 0), which is where addPrimitive drops
+//              new objects. Metrics at placement
+//              ("spawn-0", first metric after the add
+//              rebuild) and at +5/+15/+30 s of continued
+//              snowfall carry a spawn section: box-top snow
+//              max/mean, ring (plane within 0.4 m outside the
+//              footprint) mean/min/max, and field (plane
+//              > 1 m from the footprint) mean/max.
 
 import Foundation
 import MetalKit
@@ -190,6 +205,20 @@ enum ReproDriver {
             p.scene.weather.maxDepth = 2.0
             p.scene.weather.snowAmount = 1.80
             p.scene.weather.snow = 0.9
+        case "deepspawn":
+            // Same deep pre-seed, but NO box at start — it is
+            // spawned mid-run via addPrimitive (see the
+            // variant list). Camera target (0, 1, 0) makes
+            // addPrimitive land the box at (0, 0.5, 0): it
+            // places at target X/Z with the box's resting Y.
+            var plane = SceneObject.primitive("plane", name: "Repro bare plane")
+            plane.params = ["w": 8, "d": 8]
+            plane.transform.position = [0, 0, 0]
+            p.scene.objects = [plane]
+            p.scene.weather.maxDepth = 2.0
+            p.scene.weather.snowAmount = 1.80
+            p.scene.weather.snow = 0.9
+            p.scene.camera.target = [0, 1, 0]
         default:
             break
         }
@@ -234,16 +263,21 @@ final class ReproRun {
         ReproDriver.variant == "freeze" || ReproDriver.variant == "freeze2"
     }
 
-    // Deep-snow state (variants deeprest / deepdrag, v4.10.4).
-    private enum DeepPhase { case establishing, resting, dragging, settling }
+    // Deep-snow state (variants deeprest / deepdrag /
+    // deepspawn, v4.10.4).
+    private enum DeepPhase { case establishing, resting, dragging, settling, spawnWait }
     private var deepPhase: DeepPhase = .establishing
     private var deepPhaseSince: CFTimeInterval = 0
     private var dragStartX: Double = -2.5
     private var dragX: Double = -2.5
     private var dragMidEmitted = false
+    private var spawnCheckpointIdx = 0
+    private let spawnCheckpoints: [(delay: CFTimeInterval, label: String)] =
+        [(5, "spawn+5s"), (15, "spawn+15s"), (30, "spawn+30s")]
 
     private var isDeepVariant: Bool {
         ReproDriver.variant == "deeprest" || ReproDriver.variant == "deepdrag"
+            || ReproDriver.variant == "deepspawn"
     }
 
     /// LS-REPRO metrics: computed from the renderer's sim
@@ -313,11 +347,67 @@ final class ReproRun {
                 }
             }
         }
-        let line = "REPRO-METRIC \(label)"
+        var line = "REPRO-METRIC \(label)"
             + String(format: " maxH=%.4f violCount=%d violMax=%.4f maxSlope=%.2f spikeCount=%d spikeMax=%.4f vol=%.4f maxPlowPos=%.4f minPlowNeg=%.4f",
                      maxH, violCount, violMax, maxSlopeDeg,
                      spikeCount, spikeMax, vol,
                      s.plowMaxPos, s.plowMinNeg)
+        // Spawn section (deepspawn only): box-top / ring /
+        // field snow stats from the same snapshot. Box-top =
+        // vertices with support Y ~ 1.0 inside the box
+        // footprint; ring = plane-supported vertices (support
+        // Y ~ 0) whose XZ distance to the footprint rectangle
+        // is in (0, 0.4 m]; field = plane-supported vertices
+        // more than 1 m from the footprint. All counts are 0
+        // and all stats 0 before the box exists (pre-spawn).
+        if ReproDriver.variant == "deepspawn" {
+            var topMax: Float = 0, topSum: Float = 0, topCount = 0
+            var ringSum: Float = 0, ringMin: Float = 0, ringMax: Float = 0, ringCount = 0
+            var fieldSum: Float = 0, fieldMax: Float = 0, fieldCount = 0
+            if s.initialised, n > 0, s.snow.count >= n, s.support.count >= n,
+               let box = session?.project.scene.objects.first(where: { $0.primitiveKind == "box" }) {
+                let cx = Float(box.transform.position[0])
+                let cz = Float(box.transform.position[2])
+                for j in 0..<s.vz {
+                    for i in 0..<s.vx {
+                        let idx = j * s.vx + i
+                        let x = s.ox + Float(i) * s.cs
+                        let z = s.oz + Float(j) * s.cs
+                        let sup = clean(s.support[idx])
+                        let snow = clean(s.snow[idx])
+                        let dx = max(abs(x - cx) - 0.5, 0)
+                        let dz = max(abs(z - cz) - 0.5, 0)
+                        let rectDist = sqrtf(dx * dx + dz * dz)
+                        let inside = abs(x - cx) <= 0.5 && abs(z - cz) <= 0.5
+                        if inside, abs(sup - 1.0) < 0.05 {
+                            topCount += 1
+                            topSum += snow
+                            if snow > topMax { topMax = snow }
+                        } else if abs(sup) < 0.05 {
+                            if rectDist > 0.001, rectDist <= 0.4 {
+                                if ringCount == 0 || snow < ringMin { ringMin = snow }
+                                if snow > ringMax { ringMax = snow }
+                                ringCount += 1
+                                ringSum += snow
+                            } else if rectDist > 1.0 {
+                                fieldCount += 1
+                                fieldSum += snow
+                                if snow > fieldMax { fieldMax = snow }
+                            }
+                        }
+                    }
+                }
+            }
+            let topMean: Float = topCount > 0 ? topSum / Float(topCount) : 0
+            let ringMean: Float = ringCount > 0 ? ringSum / Float(ringCount) : 0
+            let fieldMean: Float = fieldCount > 0 ? fieldSum / Float(fieldCount) : 0
+            let ratio: Float = fieldMean > 0 ? topMean / fieldMean : 0
+            line += String(format: " spawnTopMax=%.4f spawnTopMean=%.4f spawnTopCount=%d ringMean=%.4f ringMin=%.4f ringMax=%.4f ringCount=%d fieldMean=%.4f fieldMax=%.4f fieldCount=%d topFieldRatio=%.4f A=%.4f",
+                           topMax, topMean, topCount,
+                           ringMean, ringMin, ringMax, ringCount,
+                           fieldMean, fieldMax, fieldCount,
+                           ratio, session?.liveSnowAmount ?? 0)
+        }
         print(line)
         fflush(stdout)
         NSLog("%@", line)
@@ -343,6 +433,33 @@ final class ReproRun {
         switch deepPhase {
         case .establishing:
             guard sawSwapAfterWeatherOn, sawTickTag, simTickFrames >= 5 else { return }
+            if ReproDriver.variant == "deepspawn" {
+                emitMetric("pre-spawn")
+                // The REAL editor Add path: addPrimitive
+                // registers the new object at exposure 0,
+                // syncs the renderer's exposure map BEFORE
+                // its rebuild, selects it and rebuilds —
+                // exactly what the Add button does. Placement
+                // is the camera target's X/Z (set to (0, 1, 0)
+                // in makeProject) with the box's resting Y,
+                // i.e. (0, 0.5, 0); the marker records where
+                // it actually landed.
+                session.addPrimitive("box")
+                if let box = session.project.scene.objects.first(where: { $0.primitiveKind == "box" }) {
+                    let p = box.transform.position
+                    ReproDriver.marker("spawn-placed pos=[\(p[0]), \(p[1]), \(p[2])] A=\(session.liveSnowAmount)")
+                } else {
+                    ReproDriver.marker("spawn-placed MISSING-BOX A=\(session.liveSnowAmount)")
+                }
+                // First metric after the add rebuild (the
+                // rebuild inside addPrimitive is synchronous:
+                // the sheet pass + sim sync have already run).
+                emitMetric("spawn-0")
+                spawnCheckpointIdx = 0
+                deepPhaseSince = now
+                deepPhase = .spawnWait
+                return
+            }
             emitMetric("pre")
             deepPhaseSince = now
             if ReproDriver.variant == "deepdrag" {
@@ -392,6 +509,16 @@ final class ReproRun {
             if now - deepPhaseSince >= 20 {
                 emitMetric("settled-20s")
                 finishDeep()
+            }
+        case .spawnWait:
+            guard spawnCheckpointIdx < spawnCheckpoints.count else { finishDeep(); return }
+            let cp = spawnCheckpoints[spawnCheckpointIdx]
+            if now - deepPhaseSince >= cp.delay {
+                emitMetric(cp.label)
+                spawnCheckpointIdx += 1
+                if spawnCheckpointIdx >= spawnCheckpoints.count {
+                    finishDeep()
+                }
             }
         }
     }
