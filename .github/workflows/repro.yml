@@ -110,6 +110,8 @@ jobs:
               ("plane", ["-LSVariant", "plane"]),
               ("scaled", ["-LSVariant", "scaled"]),
               ("bigplane", ["-LSVariant", "bigplane"]),
+              ("deeprest", ["-LSVariant", "deeprest"]),
+              ("deepdrag", ["-LSVariant", "deepdrag"]),
               ("toggle-simtick", ["-LSToggle", "simtick"]),
               ("toggle-syncas", ["-LSToggle", "syncas"]),
               ("toggle-noscoped", ["-LSToggle", "noscoped"]),

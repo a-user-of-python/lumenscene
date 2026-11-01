@@ -3515,6 +3515,43 @@ final class Renderer {
         simRead(simWaterBuf, count: simVX * simVZ)
     }
 
+    // LS-REPRO: metrics snapshot for the repro driver
+    // (v4.10.4 deep-snow variants). INERT in normal use — no
+    // call site outside ReproDriver, and a normal launch never
+    // calls it. Returns the CURRENT sim snow-depth array, the
+    // support array and the per-vertex deposition-ceiling
+    // array (all one Float per lattice vertex, row-major
+    // vz rows x vx columns), the lattice parameters, and the
+    // plow layer's stored-delta extrema (max positive / min
+    // negative raw `d` in `snowPlow`; 0 when that side is
+    // empty). Fences on the last sim tick first (the same
+    // waitForSimTick discipline the sheet readback uses) so
+    // the copies are not racing a GPU tick. When the sim is
+    // not initialised the arrays are empty and `initialised`
+    // is false.
+    func reproSimSnapshot() -> (snow: [Float], support: [Float],
+                                ceiling: [Float],
+                                vx: Int, vz: Int, cs: Float,
+                                ox: Float, oz: Float,
+                                plowMaxPos: Float, plowMinNeg: Float,
+                                initialised: Bool) {
+        guard simInitialised else {
+            return ([], [], [], simVX, simVZ, simCS, simOX, simOZ, 0, 0, false)
+        }
+        waitForSimTick()
+        var plowMaxPos: Float = 0
+        var plowMinNeg: Float = 0
+        for cell in snowPlow.values {
+            if cell.d > plowMaxPos { plowMaxPos = cell.d }
+            if cell.d < plowMinNeg { plowMinNeg = cell.d }
+        }
+        return (simCurrentSnow(),
+                simRead(simSupportBuf, count: simVX * simVZ),
+                simRead(simSnowCeilBuf, count: simVX * simVZ),
+                simVX, simVZ, simCS, simOX, simOZ,
+                plowMaxPos, plowMinNeg, true)
+    }
+
     /// Drop all sim state (Clear build-up / Re-roll): the next
     /// sheet build re-initialises from the then-current target.
     func resetWeatherSim() {

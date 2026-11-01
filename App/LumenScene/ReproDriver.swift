@@ -54,6 +54,19 @@
 //              races the frame-boundary swap: the session's
 //              protected-operation check defers the engage to
 //              the first clear frame after the swap.
+//   deeprest — v4.10.4: bare 8x8 plane + one 1x1x1 box, deep
+//              snow pre-seeded (maxDepth 2.0, A = 1.80, level
+//              0.9). No drag: once the deep field is established
+//              (first sheet swap + sim initialised) emit
+//              REPRO-METRIC "pre", pump ~30 s more (snowfall
+//              still on), emit "rest-30s", then REPRO-DONE.
+//   deepdrag — same scene/pre-seed as deeprest. After "pre",
+//              drag the box +X ~0.011 m/pump for ~3.3 m total,
+//              emit "mid-drag" halfway and "post-drag" at the
+//              end, pump 20 s more, emit "settled-20s", then
+//              REPRO-DONE. Metrics are computed from the
+//              renderer's LS-REPRO sim snapshot (see
+//              Renderer.reproSimSnapshot).
 
 import Foundation
 import MetalKit
@@ -159,6 +172,24 @@ enum ReproDriver {
             if let i = p.scene.objects.firstIndex(where: { $0.primitiveKind == "plane" }) {
                 p.scene.objects[i].transform.scale = [12, 1, 12]
             }
+        case "deeprest", "deepdrag":
+            // v4.10.4 deep-snow scene: a BARE plane + one box,
+            // nothing else from the demo. Weather is pre-seeded
+            // BEFORE EditorSession init, so the session seeds
+            // buildupSnow from snowAmount (1.80 m) and every
+            // object's exposure defaults to the ambient amount
+            // (absent snowExposure = fully caught up): the
+            // field starts deep, exactly as authored.
+            var plane = SceneObject.primitive("plane", name: "Repro bare plane")
+            plane.params = ["w": 8, "d": 8]
+            plane.transform.position = [0, 0, 0]
+            var box = SceneObject.primitive("box", name: "Repro drag box")
+            box.params = ["w": 1, "h": 1, "d": 1]
+            box.transform.position = [-2.5, 0.5, 0]
+            p.scene.objects = [plane, box]
+            p.scene.weather.maxDepth = 2.0
+            p.scene.weather.snowAmount = 1.80
+            p.scene.weather.snow = 0.9
         default:
             break
         }
@@ -201,6 +232,168 @@ final class ReproRun {
 
     private var isFreezeVariant: Bool {
         ReproDriver.variant == "freeze" || ReproDriver.variant == "freeze2"
+    }
+
+    // Deep-snow state (variants deeprest / deepdrag, v4.10.4).
+    private enum DeepPhase { case establishing, resting, dragging, settling }
+    private var deepPhase: DeepPhase = .establishing
+    private var deepPhaseSince: CFTimeInterval = 0
+    private var dragStartX: Double = -2.5
+    private var dragX: Double = -2.5
+    private var dragMidEmitted = false
+
+    private var isDeepVariant: Bool {
+        ReproDriver.variant == "deeprest" || ReproDriver.variant == "deepdrag"
+    }
+
+    /// LS-REPRO metrics: computed from the renderer's sim
+    /// snapshot. Surface height = support + snow at each
+    /// lattice vertex. Emits exactly one REPRO-METRIC line.
+    private func emitMetric(_ label: String) {
+        guard let renderer else { return }
+        let s = renderer.reproSimSnapshot()
+        let n = s.vx * s.vz
+        func clean(_ v: Float) -> Float { v.isFinite ? v : 0 }
+        var maxH: Float = 0
+        var violCount = 0
+        var violMax: Float = 0
+        var maxSlopeDeg: Float = 0
+        var spikeCount = 0
+        var spikeMax: Float = 0
+        var vol: Float = 0
+        if s.initialised, n > 0, s.snow.count >= n,
+           s.support.count >= n, s.ceiling.count >= n, s.cs > 0 {
+            var surf = [Float](repeating: 0, count: n)
+            for i in 0..<n {
+                let snow = clean(s.snow[i])
+                surf[i] = clean(s.support[i]) + snow
+                vol += snow
+                if surf[i] > maxH { maxH = surf[i] }
+                let excess = snow - clean(s.ceiling[i])
+                if excess > 0.05 {
+                    violCount += 1
+                    if excess > violMax { violMax = excess }
+                }
+            }
+            vol *= s.cs * s.cs
+            // Max slope between adjacent surface vertices.
+            for j in 0..<s.vz {
+                for i in 0..<s.vx {
+                    let a = j * s.vx + i
+                    if i + 1 < s.vx {
+                        let d = abs(surf[a + 1] - surf[a]) / s.cs
+                        let deg = Float(atan(Double(d))) * 180 / Float.pi
+                        if deg > maxSlopeDeg { maxSlopeDeg = deg }
+                    }
+                    if j + 1 < s.vz {
+                        let d = abs(surf[a + s.vx] - surf[a]) / s.cs
+                        let deg = Float(atan(Double(d))) * 180 / Float.pi
+                        if deg > maxSlopeDeg { maxSlopeDeg = deg }
+                    }
+                }
+            }
+            // Spike: surface minus the median of its 3x3
+            // neighbourhood (all 9 values, centre included),
+            // interior vertices only.
+            if s.vx >= 3, s.vz >= 3 {
+                for j in 1..<(s.vz - 1) {
+                    for i in 1..<(s.vx - 1) {
+                        var vals: [Float] = []
+                        vals.reserveCapacity(9)
+                        for dj in -1...1 {
+                            for di in -1...1 {
+                                vals.append(surf[(j + dj) * s.vx + (i + di)])
+                            }
+                        }
+                        vals.sort()
+                        let diff = surf[j * s.vx + i] - vals[4]
+                        if diff > spikeMax { spikeMax = diff }
+                        if diff > 0.30 { spikeCount += 1 }
+                    }
+                }
+            }
+        }
+        let line = "REPRO-METRIC \(label)"
+            + String(format: " maxH=%.4f violCount=%d violMax=%.4f maxSlope=%.2f spikeCount=%d spikeMax=%.4f vol=%.4f maxPlowPos=%.4f minPlowNeg=%.4f",
+                     maxH, violCount, violMax, maxSlopeDeg,
+                     spikeCount, spikeMax, vol,
+                     s.plowMaxPos, s.plowMinNeg)
+        print(line)
+        fflush(stdout)
+        NSLog("%@", line)
+    }
+
+    private func finishDeep() {
+        finished = true
+        print("REPRO-DONE")
+        fflush(stdout)
+        NSLog("REPRO-DONE")
+        exit(0)
+    }
+
+    /// Deep-variant phase machine, called once per pump AFTER
+    /// the latch updates (so sawSwapAfterWeatherOn / sawTickTag
+    /// / simTickFrames reflect this pump). Establishment = the
+    /// first sheet rebuild's staged AS swapped in (a swap
+    /// observed at A >= first step, as in the generic settle)
+    /// AND the sim initialised and ticked (tick: tag + ticks).
+    private func handleDeep() {
+        guard let session else { return }
+        let now = CACurrentMediaTime()
+        switch deepPhase {
+        case .establishing:
+            guard sawSwapAfterWeatherOn, sawTickTag, simTickFrames >= 5 else { return }
+            emitMetric("pre")
+            deepPhaseSince = now
+            if ReproDriver.variant == "deepdrag" {
+                if let idx = session.project.scene.objects.firstIndex(where: { $0.primitiveKind == "box" }) {
+                    dragStartX = session.project.scene.objects[idx].transform.position[0]
+                    dragX = dragStartX
+                }
+                dragMidEmitted = false
+                deepPhase = .dragging
+                ReproDriver.marker("deep-drag-start x=\(dragStartX)")
+            } else {
+                deepPhase = .resting
+                ReproDriver.marker("deep-rest-start")
+            }
+        case .resting:
+            if now - deepPhaseSince >= 30 {
+                emitMetric("rest-30s")
+                finishDeep()
+            }
+        case .dragging:
+            // Scripted drag: exactly the two effects
+            // EditorSession.dragObjectTo has — it writes
+            // position[0]/[2] (here only [0]: the motion is
+            // pure +X, so [2] is unchanged) and then calls
+            // scheduleRebuild(geometry: true). The ray math
+            // that derives the position from a pointer NDC is
+            // the only part skipped.
+            guard let idx = session.project.scene.objects.firstIndex(where: { $0.primitiveKind == "box" }) else {
+                deepPhase = .settling
+                deepPhaseSince = now
+                return
+            }
+            dragX = min(dragX + 0.011, dragStartX + 3.3)
+            session.project.scene.objects[idx].transform.position[0] = dragX
+            session.scheduleRebuild(geometry: true)
+            if !dragMidEmitted, dragX >= dragStartX + 1.65 {
+                dragMidEmitted = true
+                emitMetric("mid-drag")
+            }
+            if dragX >= dragStartX + 3.3 - 1e-9 {
+                emitMetric("post-drag")
+                deepPhase = .settling
+                deepPhaseSince = now
+                ReproDriver.marker("deep-drag-end x=\(dragX)")
+            }
+        case .settling:
+            if now - deepPhaseSince >= 20 {
+                emitMetric("settled-20s")
+                finishDeep()
+            }
+        }
     }
 
     /// Freeze trigger, evaluated in the accumulate phase.
@@ -381,10 +574,18 @@ final class ReproRun {
         // for tick evidence). Freeze variants additionally
         // require the full engage -> frozen frames -> wake
         // cycle to have run.
+        // Deep variants run their own phase machine and finish
+        // from it (REPRO-DONE there); the generic settle below
+        // would otherwise end them at establishment.
+        if isDeepVariant {
+            handleDeep()
+            if finished { return }
+        }
+
         let simSatisfied = ReproToggles.simTick ? framesAfterSwap >= 90
                                                 : (sawTickTag && simTickFrames >= 5)
         let freezeSatisfied = !isFreezeVariant || freezeDone
-        if crossedA, firstStepCrossed, sawSwapAfterWeatherOn, simSatisfied, freezeSatisfied {
+        if !isDeepVariant, crossedA, firstStepCrossed, sawSwapAfterWeatherOn, simSatisfied, freezeSatisfied {
             finished = true
             ReproDriver.marker("settle A=\(a) pumps=\(pumpCount) simTicks=\(simTickFrames)")
             print("REPRO-DONE")
@@ -394,7 +595,11 @@ final class ReproRun {
         }
 
         // Watchdog: a harness outcome, never a crash signal.
-        if CACurrentMediaTime() - startedAt > 100 {
+        // Deep variants are long by design (30 s rest / ~3.3 m
+        // drag + 20 s settle), so they get a 200 s watchdog
+        // (the workflow's per-run timeout is 240 s).
+        let watchdogLimit: CFTimeInterval = isDeepVariant ? 200 : 100
+        if CACurrentMediaTime() - startedAt > watchdogLimit {
             finished = true
             print("REPRO-TIMEOUT pumps=\(pumpCount) A=\(a) step=\(tag) crossedA=\(crossedA) sheet=\(sawSheetAfterWeatherOn) swap=\(sawSwapAfterWeatherOn) simTicks=\(simTickFrames)")
             fflush(stdout)
