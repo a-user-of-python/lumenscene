@@ -4035,7 +4035,31 @@ final class Renderer {
                             // pinning test in (c2).
                             layerDelta[idx] = d
                             layerApplied[idx] = true
-                            verts[idx].snowH = max(0, verts[idx].snowH + d)
+                            // v4.10.4 (round 3): a deposit may
+                            // not stack a column more than
+                            // 0.6 m above its own pre-layer
+                            // depth. The recorder conserves
+                            // volume exactly, but its front
+                            // band concentrates the standing
+                            // bow wave into the cells at the
+                            // mover's face, and a deposit cell
+                            // flanked by the pinned trench and
+                            // the mover's wall is relaxation-
+                            // isolated (pinned neighbours are
+                            // skipped, support steps are
+                            // skipped), so the raw stack reached
+                            // the sim unshaped: single-cell
+                            // deltas of +3.5 m, a settled wall
+                            // ~3.3 m tall in the deepdrag repro
+                            // (cap 2.0). The cap bounds the
+                            // APPLIED total only — the stored
+                            // layer is untouched, so the target
+                            // stays a fixed point (no ratchet),
+                            // and berms still stand up to
+                            // 0.6 m proud of the field.
+                            let preLayer = verts[idx].snowH
+                            verts[idx].snowH = min(max(0, preLayer + d),
+                                                   preLayer + 0.6)
                             verts[idx].topY = s.y + verts[idx].snowH
                         }
                     }
@@ -4050,35 +4074,6 @@ final class Renderer {
                 snap[plowIdentityKey(intr)] = plowSnapshot(intr)
             }
             prevPlowIntruders = snap
-        }
-        // v4.10.4 (round 2): the SHAPED mask. A vertex is
-        // shaped when its target depth differs from the pure
-        // closed-form ceiling for its support — i.e. an
-        // intruder imprint / banking / footprint shaped it —
-        // or when the plow layer wrote a delta into it this
-        // build. Only shaped vertices may receive an edit
-        // transfer in (c2a): everywhere else the GPU sim's own
-        // state is authoritative (the v4.8 design intent —
-        // transfers fire "only where an intruder, a footprint,
-        // or the plow layer is actively shaping the snow").
-        // Round 1 left the gate at |target - ceiling| > eps,
-        // which the (c1b) repose relaxation makes true at
-        // nearly every steep vertex, so the relaxed CPU target
-        // was re-injected across the whole field at every
-        // rebuild and the sim never owned the surface.
-        var shapedMask = [Bool](repeating: false, count: vx * vz)
-        if snowPossible {
-            for idx in verts.indices where verts[idx].support != nil {
-                if layerApplied[idx] { shapedMask[idx] = true; continue }
-                let s = verts[idx].support!
-                let taper = wgfSmooth(0.55, 0.75, s.interpNY)
-                let pure = wgfSnowHeight(ox + Float(idx % vx) * cs,
-                                         oz + Float(idx / vx) * cs,
-                                         amount: s.amount) * taper
-                if abs(verts[idx].snowH - pure) > 0.0005 {
-                    shapedMask[idx] = true
-                }
-            }
         }
         // (c1b) v4.10.4: PINNED columns + REPOSE RELAXATION of
         // the TARGET — the v4.6 shaping, restored to BEFORE the
@@ -4317,8 +4312,7 @@ final class Renderer {
                     let waterArr = simRead(waterBuf, count: n)
                     var editedCopy = false
                     for idx in verts.indices where hasS[idx] {
-                        if (ReproToggles.noGate || shapedMask[idx]),
-                           abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
+                        if abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
                             let tv = tSnow[idx]
                             if idx < snowArr.count {
                                 snowArr[idx] = tv.isFinite ? tv : 0
@@ -4348,12 +4342,8 @@ final class Renderer {
                 for idx in verts.indices where hasS[idx] {
                     // Edit transfer: only where intruders /
                     // footprints / plow shape the column
-                    // (target != pure ceiling) — v4.10.4
-                    // round 2: gated on the shaped mask, not
-                    // on the raw target/ceiling difference
-                    // (see the mask's comment above (c1b)).
-                    if (ReproToggles.noGate || shapedMask[idx]),
-                       abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
+                    // (target != pure ceiling).
+                    if abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
                         // v4.10.2: a non-finite target must
                         // not be written into the sim either —
                         // the flow kernel's diffusion would

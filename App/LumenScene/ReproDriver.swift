@@ -125,10 +125,12 @@ enum ReproToggles {
     /// simWrite) instead of the v4.9 zero-copy contents()
     /// pointer reads.
     static var copyReads: Bool { active.contains("copyreads") }
-    /// v4.10.4 round 2: disable the shaped-mask gate on the
-    /// (c2a) edit transfers (round-1 behaviour: any vertex
-    /// whose target differs from its ceiling is overwritten
-    /// with the CPU target at every rebuild).
+    /// v4.10.4 round 2 experiment (gate reverted in round 3
+    /// after the gated/nogate repro comparison showed the
+    /// gate neutral at rest and harmful to drag volume
+    /// conservation): when the gate existed, this disabled
+    /// it. Now unreferenced by Renderer; kept registered so
+    /// old run scripts still parse.
     static var noGate: Bool { active.contains("nogate") }
 }
 
