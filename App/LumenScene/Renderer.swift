@@ -636,6 +636,41 @@ final class Renderer {
     /// v4.7: puddle freeze fraction 0...1, written every tick.
     var weatherFreeze: Float = 0
 
+    // MARK: - v4.10.1 accumulation-path step instrumentation
+    //
+    // Sean's device crash (2026-11-01): "as soon as snow started
+    // accumulating the app crashed" on the v4.10 build — the
+    // accumulation path (sheet build + GPU sim) had never been
+    // device-verified since the sim shipped in v4.8, and a
+    // whole-path static audit pinned no single trap for clean
+    // geometry, so the path is hardened (v4.10.1) AND tagged:
+    // every accumulation-path step writes its name here on
+    // entry. The tag is (a) readable live via `weatherStep`
+    // (the coordinator wires footer display), and (b) persisted
+    // to UserDefaults on CHANGE only — after a crash, the
+    // persisted value names the last step the path reached.
+    // Allocation-light by design: call sites pass string
+    // literals, and the UserDefaults write fires only when the
+    // tag actually changes.
+    private(set) var weatherStep: String = "idle"
+    func noteWeatherStep(_ tag: String) {
+        guard tag != weatherStep else { return }
+        weatherStep = tag
+        UserDefaults.standard.set(tag, forKey: "lumenscene.weatherStep")
+    }
+
+    /// v4.10.1 hardening: floor-divide a world coordinate into a
+    /// cell index WITHOUT the Int(Float) trap — a non-finite or
+    /// out-of-range quotient (degenerate imported mesh, extreme
+    /// transform) clamps to a bounded index instead of trapping.
+    /// Identical to Int((v / cell).rounded(.down)) for every
+    /// finite, in-range input, which covers all real scenes.
+    private func cellIndexFloor(_ v: Float, _ cell: Float) -> Int {
+        let f = (v / cell).rounded(.down)
+        guard f.isFinite else { return 0 }
+        return Int(min(max(f, -1_000_000), 1_000_000))
+    }
+
     // MARK: - v4.8 weather simulation state
     //
     // Snow and water depths are PERSISTENT SIMULATION STATE in
@@ -1239,6 +1274,7 @@ final class Renderer {
     /// Full geometry rebuild, or — when `geometry` is false — a
     /// material-only update if the object set is unchanged.
     func rebuild(scene: Scene, meshes: [UUID: MeshData], geometry: Bool) {
+        noteWeatherStep("rebuild:entry")
         if !geometry, updateMaterialsOnly(scene: scene, meshes: meshes) {
             return
         }
@@ -1396,6 +1432,7 @@ final class Renderer {
         prepared.colBuffer = makeBuffer(colArr)
         prepared.idxBuffer = makeBuffer(indices)
         prepared.triMatBuffer = makeBuffer(triMats)
+        noteWeatherStep("rebuild:stageAS")
         stageStaticBuild(prepared)
     }
 
@@ -2450,8 +2487,8 @@ final class Renderer {
     /// relaxation smooths the sum every rebuild.
     private func plowDeltaAt(x: Float, z: Float) -> Float {
         if snowPlow.isEmpty { return 0 }
-        let gx = Int((x / 0.20).rounded(.down))
-        let gz = Int((z / 0.20).rounded(.down))
+        let gx = cellIndexFloor(x, 0.20)
+        let gz = cellIndexFloor(z, 0.20)
         guard let c = snowPlow[Renderer.snowPlowKey(gx, gz)] else { return 0 }
         let fadeA = max(0, min(1, 1 - abs(weatherSnowAmount - c.a) / 0.25))
         let fadeS = max(0, min(1, 1 - (snowfallTotal - c.s) / 0.25))
@@ -2463,8 +2500,8 @@ final class Renderer {
     /// (raw delta, stamped at aNow so its fade is 1). Cells
     /// under 2 mm are removed — the layer stays sparse.
     private func setPlowCell(x: Float, z: Float, value: Float, aNow: Float) {
-        let key = Renderer.snowPlowKey(Int((x / 0.20).rounded(.down)),
-                                       Int((z / 0.20).rounded(.down)))
+        let key = Renderer.snowPlowKey(cellIndexFloor(x, 0.20),
+                                       cellIndexFloor(z, 0.20))
         if abs(value) < 0.002 {
             snowPlow.removeValue(forKey: key)
         } else {
@@ -2477,8 +2514,8 @@ final class Renderer {
     /// (depositing never resurrects weathered snow).
     private func addPlowCell(x: Float, z: Float, increment: Float, aNow: Float) {
         if increment == 0 { return }
-        let key = Renderer.snowPlowKey(Int((x / 0.20).rounded(.down)),
-                                       Int((z / 0.20).rounded(.down)))
+        let key = Renderer.snowPlowKey(cellIndexFloor(x, 0.20),
+                                       cellIndexFloor(z, 0.20))
         let fadedOld = snowPlow[key].map { cell -> Float in
             let fadeA = max(0, min(1, 1 - abs(aNow - cell.a) / 0.25))
             let fadeS = max(0, min(1, 1 - (snowfallTotal - cell.s) / 0.25))
@@ -2647,10 +2684,10 @@ final class Renderer {
             } else {
                 for p in hullPts { wMin = simd_min(wMin, p); wMax = simd_max(wMax, p) }
             }
-            let gi0 = max(0, Int(((wMin.x - ox) / cs).rounded(.down)) - 1)
-            let gi1 = min(nx, Int(((wMax.x - ox) / cs).rounded(.down)) + 1)
-            let gj0 = max(0, Int(((wMin.y - oz) / cs).rounded(.down)) - 1)
-            let gj1 = min(nz, Int(((wMax.y - oz) / cs).rounded(.down)) + 1)
+            let gi0 = max(0, cellIndexFloor(wMin.x - ox, cs) - 1)
+            let gi1 = min(nx, cellIndexFloor(wMax.x - ox, cs) + 1)
+            let gj0 = max(0, cellIndexFloor(wMin.y - oz, cs) - 1)
+            let gj1 = min(nz, cellIndexFloor(wMax.y - oz, cs) + 1)
             guard gi1 > gi0, gj1 > gj0 else { continue }
             // The plow depth (snow height over the support)
             // the underside leaves behind: same −0.02 resting
@@ -3117,6 +3154,17 @@ final class Renderer {
                 let ib = world.indices[3 * t + 1]
                 let ic = world.indices[3 * t + 2]
                 let p0 = wPos(ia), p1 = wPos(ib), p2 = wPos(ic)
+                // v4.10.1 hardening: a non-finite vertex (singular
+                // transform, degenerate imported mesh) must not
+                // reach the cell-index conversions below — the
+                // old code trapped on Int(NaN / huge) the first
+                // time the weather sheet indexed this triangle,
+                // i.e. exactly when accumulation started, while
+                // the dry scene rendered fine.
+                guard p0.x.isFinite, p0.y.isFinite, p0.z.isFinite,
+                      p1.x.isFinite, p1.y.isFinite, p1.z.isFinite,
+                      p2.x.isFinite, p2.y.isFinite, p2.z.isFinite
+                else { continue }
                 let cr = simd_cross(p1 - p0, p2 - p0)
                 let cl = simd_length(cr)
                 if cl < 1e-12 { continue }
@@ -3126,10 +3174,20 @@ final class Renderer {
                                          n0: wNrm(ia), n1: wNrm(ib), n2: wNrm(ic),
                                          flatNY: flatNY, hostID: obj.id,
                                          amount: amount)
-                let gx0 = Int((min(p0.x, min(p1.x, p2.x)) / 0.5).rounded(.down))
-                let gx1 = Int((max(p0.x, max(p1.x, p2.x)) / 0.5).rounded(.down))
-                let gz0 = Int((min(p0.z, min(p1.z, p2.z)) / 0.5).rounded(.down))
-                let gz1 = Int((max(p0.z, max(p1.z, p2.z)) / 0.5).rounded(.down))
+                // v4.10.1 hardening: clamp registration to the
+                // weather field's domain (±40 m — sheetExtent
+                // clips the lattice to the same window, and no
+                // sampler ever queries outside it, so nothing
+                // in-domain changes). The old unclamped range
+                // made a scene-spanning triangle register in
+                // every 0.5 m cell it crossed: an extreme mesh
+                // meant an unbounded loop (hang / OOM) on the
+                // first accumulation rebuild.
+                let gx0 = max(-81, cellIndexFloor(min(p0.x, min(p1.x, p2.x)), 0.5))
+                let gx1 = min(81, cellIndexFloor(max(p0.x, max(p1.x, p2.x)), 0.5))
+                let gz0 = max(-81, cellIndexFloor(min(p0.z, min(p1.z, p2.z)), 0.5))
+                let gz1 = min(81, cellIndexFloor(max(p0.z, max(p1.z, p2.z)), 0.5))
+                if gx1 < gx0 || gz1 < gz0 { continue }
                 for gx in gx0...gx1 {
                     for gz in gz0...gz1 {
                         grid[supportKey(gx, gz), default: []].append(tri)
@@ -3145,8 +3203,8 @@ final class Renderer {
     /// barycentric), the highest interpolated surface wins.
     private func sampleSupport(_ grid: [Int64: [SnowSupportTri]],
                                x: Float, z: Float) -> SnowSupport? {
-        let gx = Int((x / 0.5).rounded(.down))
-        let gz = Int((z / 0.5).rounded(.down))
+        let gx = cellIndexFloor(x, 0.5)
+        let gz = cellIndexFloor(z, 0.5)
         guard let cand = grid[supportKey(gx, gz)] else { return nil }
         var best: SnowSupport? = nil
         for tri in cand {
@@ -3160,10 +3218,17 @@ final class Renderer {
             let wc = 1 - wa - wb
             if wa < -1e-5 || wb < -1e-5 || wc < -1e-5 { continue }
             let y = tri.p0.y * wa + tri.p1.y * wb + tri.p2.y * wc
+            // v4.10.1 hardening: never let a non-finite height
+            // win the support — it would poison the sheet's
+            // vertices, the sim lattice signature, and the AS
+            // built over the sheet. A NaN shading normal (zero-
+            // length normal baked from a degenerate mesh) falls
+            // back to the triangle's flat normal Y.
+            guard y.isFinite else { continue }
             if let b = best, y <= b.y { continue }
             let ny = tri.n0.y * wa + tri.n1.y * wb + tri.n2.y * wc
             best = SnowSupport(y: y, flatNY: tri.flatNY,
-                               interpNY: wgfClamp(ny, 0, 1),
+                               interpNY: ny.isFinite ? wgfClamp(ny, 0, 1) : tri.flatNY,
                                hostID: tri.hostID, amount: tri.amount)
         }
         return best
@@ -3223,13 +3288,22 @@ final class Renderer {
     }
     private func simRead(_ buf: MTLBuffer?, count: Int) -> [Float] {
         guard let buf, count > 0 else { return [] }
-        let ptr = buf.contents().bindMemory(to: Float.self, capacity: count)
-        return Array(UnsafeBufferPointer(start: ptr, count: count))
+        // v4.10.1 hardening: never read past the allocation —
+        // the count is clamped to the buffer's real length, so
+        // a stale lattice count can never over-read shared
+        // memory (the v4.9 zero-copy paths assume length ==
+        // count * 4; this makes the assumption an invariant).
+        let n = min(count, buf.length / 4)
+        guard n > 0 else { return [] }
+        let ptr = buf.contents().bindMemory(to: Float.self, capacity: n)
+        return Array(UnsafeBufferPointer(start: ptr, count: n))
     }
     private func simWrite(_ buf: MTLBuffer?, _ values: [Float]) {
         guard let buf else { return }
-        let ptr = buf.contents().bindMemory(to: Float.self, capacity: values.count)
-        for i in values.indices { ptr[i] = values[i] }
+        let n = min(values.count, buf.length / 4)
+        guard n > 0 else { return }
+        let ptr = buf.contents().bindMemory(to: Float.self, capacity: n)
+        for i in 0..<n { ptr[i] = values[i] }
     }
 
     /// Bilinear sample of a previous lattice field at world XZ
@@ -3273,7 +3347,13 @@ final class Renderer {
         // Support signature: quantised support heights + pattern.
         var hash = 0
         for i in 0..<count {
-            hash = hash &* 31 &+ (hasSup[i] ? Int(supportY[i] * 200) &+ 7 : -13)
+            // v4.10.1 hardening: Int(supportY * 200) trapped on
+            // a non-finite / extreme support height. The value
+            // is only an identity signature for the lattice, so
+            // clamping it changes nothing but the trap.
+            let q = supportY[i].isFinite
+                ? Int(min(max(supportY[i] * 200, -1_000_000), 1_000_000)) : -999_999
+            hash = hash &* 31 &+ (hasSup[i] ? q &+ 7 : -13)
         }
         // Per-host centroids of the new lattice.
         var centroids: [UUID: SIMD2<Float>] = [:]
@@ -3408,6 +3488,18 @@ final class Renderer {
               let rateB = simSnowRateBuf, let wCeilB = simWaterCeilBuf,
               let wRateB = simWaterRateBuf, let hasB = simHasBuf,
               let pinB = simPinnedBuf else { return }
+        noteWeatherStep("tick:entry")
+        // v4.10.1 hardening: the shared buffers must actually
+        // hold the lattice the counts describe — if any buffer
+        // is short (allocation edge), the tick steps nothing
+        // rather than binding/reading past its length.
+        let latticeCount = simVX * simVZ
+        guard latticeCount > 0,
+              snowB.length >= latticeCount * 4, waterB.length >= latticeCount * 4,
+              supB.length >= latticeCount * 4, ceilB.length >= latticeCount * 4,
+              rateB.length >= latticeCount * 4, wCeilB.length >= latticeCount * 4,
+              wRateB.length >= latticeCount * 4, hasB.length >= latticeCount * 4,
+              pinB.length >= latticeCount * 4 else { return }
         if simLastTick == 0 { simLastTick = now; return }
         let rawDt = now - simLastTick
         simLastTick = now
@@ -3422,6 +3514,7 @@ final class Renderer {
         // bytes copied now). It also refreshes the per-kind
         // content flags (item 4) from the same read.
         if !inputsActive, now - simLastSettleScan >= 0.5 {
+            noteWeatherStep("tick:settleScan")
             simLastSettleScan = now
             let count = simVX * simVZ
             let snowPtr = snowB.contents().bindMemory(to: Float.self, capacity: count)
@@ -3496,6 +3589,7 @@ final class Renderer {
             simStepsLastFrame = 0
             return
         }
+        noteWeatherStep("tick:dispatch")
         let threads = MTLSize(width: simVX * simVZ, height: 1, depth: 1)
         func bindSim(_ e: MTLComputeCommandEncoder) {
             e.setBuffer(snowB, offset: 0, index: 0)
@@ -3561,6 +3655,7 @@ final class Renderer {
         triObjects: inout [UUID],
         budget: inout Int,
         sheetEmitted: inout Bool, snowEmitted: inout Bool) {
+        noteWeatherStep("sheet:entry")
         let wet = weatherGeoWet
         let snowPossible = weatherGeoSnow > 0.001 || weatherSnowAmount > 0.001
             || objectSnowAmounts.values.contains { $0 > 0.001 }
@@ -3625,6 +3720,7 @@ final class Renderer {
         // dilation below bridges some of them) — the plow
         // recorder's candidates are lattice vertices, and it
         // reuses these exact values instead of re-sampling.
+        noteWeatherStep("sheet:support")
         var rawSupports = [SnowSupport?](repeating: nil, count: vx * vz)
         for j in 0..<vz {
             for i in 0..<vx {
@@ -3633,6 +3729,7 @@ final class Renderer {
                 rawSupports[vIdx(i, j)] = s
             }
         }
+        noteWeatherStep("sheet:dilation")
         // (b) Dilation: a vertex with support on BOTH sides
         // of an axis is a sub-cell gap in the support (a
         // narrow slot between triangles), not a real edge —
@@ -3668,6 +3765,7 @@ final class Renderer {
             if filled.isEmpty { break }
             for (idx, s) in filled { verts[idx].support = s }
         }
+        noteWeatherStep("sheet:columns")
         // (c) Column heights, normals, puddle data.
         for j in 0..<vz {
             for i in 0..<vx {
@@ -3718,6 +3816,7 @@ final class Renderer {
         // When the layer is empty and nothing moved, both
         // steps are exact no-ops and the sheet is v4.5's.
         if snowPossible {
+            noteWeatherStep("sheet:plowRecord")
             var baseH = [Float](repeating: 0, count: vx * vz)
             var supportY = [Float](repeating: 0, count: vx * vz)
             var hasSupport = [Bool](repeating: false, count: vx * vz)
@@ -3734,6 +3833,7 @@ final class Renderer {
                           hasSupport: hasSupport,
                           latticeSupports: rawSupports)
             if !snowPlow.isEmpty {
+                noteWeatherStep("sheet:plowLayer")
                 for j in 0..<vz {
                     for i in 0..<vx {
                         let idx = vIdx(i, j)
@@ -3779,6 +3879,7 @@ final class Renderer {
         // rounding, melt) is what renders. The CPU relaxation
         // in (c2) is skipped while the sim is live: the GPU
         // flow kernel owns repose now.
+        noteWeatherStep("sheet:simSync")
         var v48SimActive = false
         do {
             let n = vx * vz
@@ -3809,14 +3910,20 @@ final class Renderer {
                 tSnow[idx] = v.snowH
                 tWater[idx] = wCeil[idx] * min(1, wet * 1.2)
             }
+            noteWeatherStep("sheet:simSyncLattice")
             simSyncLattice(ox: ox, oz: oz, cs: cs, vx: vx, vz: vz,
                            supportY: supY, hasSup: hasS, hostIDs: hosts,
                            snowCeil: ceilA, driftFac: driftA,
                            waterCeil: wCeil, waterRate: wRate,
                            targetSnow: tSnow, targetWater: tWater,
                            forceInit: false)
+            // v4.10.1 hardening: the readback below binds the
+            // buffers at capacity n — require the allocations to
+            // actually hold n floats before touching them.
             if simInitialised, simVX * simVZ == n,
-               let snowBuf = simSnowBuf, let waterBuf = simWaterBuf {
+               let snowBuf = simSnowBuf, let waterBuf = simWaterBuf,
+               snowBuf.length >= n * 4, waterBuf.length >= n * 4 {
+                noteWeatherStep("sheet:simReadback")
                 v48SimActive = true
                 // v4.9 (2a): read/write the sim state through
                 // the shared buffers' contents() pointers — the
@@ -3877,6 +3984,7 @@ final class Renderer {
         // 1.56 m field (a smooth hollow; volume is conserved,
         // so it does not fill flat). Footprint stamps (soft,
         // unpinned) get their rims softened the same way.
+        noteWeatherStep("sheet:pinRelax")
         var pinned = [Bool](repeating: false, count: vx * vz)
         if snowPossible {
             for j in 0..<vz {
@@ -3996,6 +4104,7 @@ final class Renderer {
             // state → same rendered surface, every rebuild:
             // the trail is a true fixed point.
         }
+        noteWeatherStep("sheet:normals")
         // (c3) v4.5: normals from the RELAXED lattice —
         // central differences of verts.topY (one-sided where a
         // neighbour has no support). This replaces v4.4's
@@ -4096,6 +4205,7 @@ final class Renderer {
         }
 
         if anySnow {
+            noteWeatherStep("sheet:emitSnow")
             // Snow cells: a quad where all four corners are
             // supported, a single triangle where exactly
             // three are (support edges lose at most a
@@ -4210,6 +4320,7 @@ final class Renderer {
             }
         }
         if anySheet {
+            noteWeatherStep("sheet:emitWater")
             // Puddle water sheets from the same lattice:
             // vertices ride the sheet's own offsets (pool
             // centre up to ~13 mm by depth, rim vertices
@@ -4913,6 +5024,14 @@ final class Renderer {
             for (slice, world) in baked {
                 let start = slice.vertexStart * 3
                 let count = slice.vertexCount * 3
+                // v4.10.1 hardening: the CPU-mirror write above
+                // bounds-checks start + count; the GPU write now
+                // checks the same range against the persistent
+                // buffers' capacity before touching the pointers
+                // (a stale slice could otherwise write past the
+                // allocation while its AS refit is in flight).
+                guard start >= 0, count >= 0,
+                      start + count <= dynVertCapacity * 3 else { continue }
                 world.positions.withUnsafeBufferPointer { src in
                     if let s = src.baseAddress {
                         (posPtr + start).update(from: s, count: count)

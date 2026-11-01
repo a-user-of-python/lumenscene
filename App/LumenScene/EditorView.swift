@@ -499,39 +499,56 @@ struct EditorView: View {
             return counts
         }()
         return VStack(spacing: 0) {
-            HStack {
+            // v4.10.1: the header is TWO lines, not one. The
+            // v4.8 one-line row (heading + Multi pill + Add
+            // menu, every piece fixedSize) had a total intrinsic
+            // width past the panel's 264 pt, and because the
+            // panel VStack centres an over-wide child the row
+            // overflowed BOTH edges on device — "Objects"
+            // clipped to "bjects" at the left, the pills
+            // spilling under the viewport at the right. Split:
+            // the heading gets line 1 alone; Multi and Add
+            // share line 2 with the Spacer between them, so the
+            // widest line's fixed demand is the two controls
+            // (~150 pt of the 244 pt inside the 10 pt padding)
+            // and the heading's is ~65 pt — either line fits
+            // with room to spare at larger text sizes too, and
+            // no text was shrunk to get there.
+            VStack(alignment: .leading, spacing: 8) {
                 Text("Objects").font(.headline).lineLimit(1).fixedSize(horizontal: true, vertical: false)
-                Spacer()
-                // v4.6: Multi Select tool toggle. On: taps (tree
-                // or viewport) add/remove objects from the set;
-                // off: the set clears (switching tools clears).
-                Button {
-                    session.multiSelectMode.toggle()
-                } label: {
-                    Label("Multi", systemImage: session.multiSelectMode
-                          ? "checklist.checked" : "checklist")
-                        .labelStyle(.titleAndIcon)
-                        .lineLimit(1)
+                HStack(spacing: 8) {
+                    // v4.6: Multi Select tool toggle. On: taps (tree
+                    // or viewport) add/remove objects from the set;
+                    // off: the set clears (switching tools clears).
+                    Button {
+                        session.multiSelectMode.toggle()
+                    } label: {
+                        Label("Multi", systemImage: session.multiSelectMode
+                              ? "checklist.checked" : "checklist")
+                            .labelStyle(.titleAndIcon)
+                            .lineLimit(1)
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(session.multiSelectMode ? .accentColor : .secondary)
+                    .help("Multi Select: tap several objects to select them together")
+                    Spacer()
+                    Menu {
+                        Button("Box") { session.addPrimitive("box") }
+                        Button("Sphere") { session.addPrimitive("sphere") }
+                        Button("Cylinder") { session.addPrimitive("cylinder") }
+                        Button("Plane") { session.addPrimitive("plane") }
+                        Divider()
+                        Button("Trigger Area") { session.addArea() }
+                        Divider()
+                        Button("Import Model…") { showImport = true }
+                    } label: {
+                        Label("Add", systemImage: "plus")
+                            .lineLimit(1)
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
                 }
-                .fixedSize(horizontal: true, vertical: false)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .tint(session.multiSelectMode ? .accentColor : .secondary)
-                .help("Multi Select: tap several objects to select them together")
-                Menu {
-                    Button("Box") { session.addPrimitive("box") }
-                    Button("Sphere") { session.addPrimitive("sphere") }
-                    Button("Cylinder") { session.addPrimitive("cylinder") }
-                    Button("Plane") { session.addPrimitive("plane") }
-                    Divider()
-                    Button("Trigger Area") { session.addArea() }
-                    Divider()
-                    Button("Import Model…") { showImport = true }
-                } label: {
-                    Label("Add", systemImage: "plus")
-                        .lineLimit(1)
-                }
-                .fixedSize(horizontal: true, vertical: false)
             }
             .padding(10)
             List(selection: treeSelectionBinding) {
@@ -579,7 +596,11 @@ struct EditorView: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             if session.project.scene.areas.isEmpty {
-                Text("No trigger areas. Areas group objects for node logic and streaming.")
+                // v4.10.1: plainer wording with a concrete
+                // example (Sean: "what are areas") — the node
+                // names are the real catalog titles (Player
+                // Enters Area event, Chase Player action).
+                Text("No areas yet. Areas are invisible zones that group objects: put one over a doorway, and a Player Enters Area node can start a Chase Player node when you walk in.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 10)
@@ -935,6 +956,17 @@ struct TreeFooterView: View {
             // is set — e.g. "−4.5 °C — puddles freezing".
             if let temperatureText = footer.temperatureText {
                 Text(temperatureText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 8)
+            }
+            // v4.10.1: post-crash diagnostic — the weather
+            // step the previous session last reached, shown
+            // until this session runs weather itself.
+            if let diagText = footer.diagText {
+                Text(diagText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

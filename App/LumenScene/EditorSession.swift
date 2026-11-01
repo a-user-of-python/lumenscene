@@ -34,16 +34,21 @@ final class FooterDisplay: ObservableObject {
     @Published private(set) var snowDepthText: String? = nil
     /// Temperature status line; nil = not shown.
     @Published private(set) var temperatureText: String? = nil
+    /// v4.10.1: post-crash diagnostic line ("Last step: …"),
+    /// the weather-accumulation step the previous session
+    /// last reached; nil = not shown.
+    @Published private(set) var diagText: String? = nil
 
     /// Change-only writes: an unchanged string never fires
     /// objectWillChange, so a footer observing this object
     /// re-evaluates only when a displayed line really changes.
     func update(hint: String, weather: String?, snowDepth: String?,
-                temperature: String?) {
+                temperature: String?, diag: String? = nil) {
         if hintText != hint { hintText = hint }
         if weatherText != weather { weatherText = weather }
         if snowDepthText != snowDepth { snowDepthText = snowDepth }
         if temperatureText != temperature { temperatureText = temperature }
+        if diagText != diag { diagText = diag }
     }
 }
 
@@ -96,6 +101,18 @@ final class EditorSession: ObservableObject {
     /// directly; the session writes it change-only via
     /// refreshFooter().
     let footer = FooterDisplay()
+
+    /// v4.10.1: the weather-accumulation step the PREVIOUS
+    /// session last reached, read back from the renderer's
+    /// persisted tag at init. Shown in the footer ("Last
+    /// step: …") until this session's weather path writes a
+    /// step of its own — so after a crash, the relaunch names
+    /// the step the crash interrupted. "idle" (no weather ran,
+    /// or a healthy last step) shows nothing.
+    private var previousSessionStep: String? = {
+        let t = UserDefaults.standard.string(forKey: "lumenscene.weatherStep")
+        return (t != nil && t != "idle") ? t : nil
+    }()
 
     let renderer: Renderer
     /// v4.0: the node-graph game runtime. Inert in edit mode;
@@ -188,6 +205,18 @@ final class EditorSession: ObservableObject {
             ? String(format: "Snow depth: %.2f m of %.2f m max",
                      liveSnowAmount, w.maxDepth)
             : nil
+        // v4.10.1: the previous session's last weather step
+        // stays readable in the footer until this session's
+        // own weather path writes a step (the renderer's tag
+        // leaves "idle"), at which point the readout clears.
+        var diag: String? = nil
+        if let prev = previousSessionStep {
+            if renderer.weatherStep == "idle" {
+                diag = "Last step: \(prev)"
+            } else {
+                previousSessionStep = nil
+            }
+        }
         footer.update(
             hint: isIdleFrozen
                 ? "Scene frozen — tap, press a key, or move to resume."
@@ -196,7 +225,8 @@ final class EditorSession: ObservableObject {
                 : "Tap an object in the view to select it."),
             weather: showWeather ? parts.joined(separator: " · ") : nil,
             snowDepth: snowDepth,
-            temperature: temperatureStatusText)
+            temperature: temperatureStatusText,
+            diag: diag)
     }
 
     private struct Snapshot: Codable { var objects: [SceneObject] }
@@ -331,7 +361,13 @@ final class EditorSession: ObservableObject {
     /// now counts; the renderer's weatherGeoSnow is the clamped
     /// progress step derived from it.
     private var snowAmountStep: Int {
-        snowMaxDepth > 0 ? Int((buildupSnow / snowStepMetres).rounded()) : 0
+        // v4.10.1 hardening: Int() traps on a non-finite or
+        // out-of-range quotient (a persisted snowAmount is a
+        // plain Double in the project file). Clamp instead;
+        // identical for every value the rates can produce.
+        guard snowMaxDepth > 0, buildupSnow.isFinite else { return 0 }
+        let q = (buildupSnow / snowStepMetres).rounded()
+        return q.isFinite ? Int(min(max(q, -1_000_000), 1_000_000)) : 0
     }
     /// Renderer-facing quantised progress (0...24).
     private var snowProgressStep: Int { Int((snowProgressClamped * 24).rounded()) }
@@ -2052,7 +2088,13 @@ final class EditorSession: ObservableObject {
     /// v4.3: the quantised exposure step of one A-value, in
     /// maxDepth/24 units (the same quantum as the geometry steps).
     private func exposureStep(for amount: Float) -> Int {
-        snowMaxDepth > 0 ? Int((Double(amount) / snowStepMetres).rounded()) : 0
+        // v4.10.1 hardening: a persisted per-object exposure
+        // decodes through Float, so a corrupt value can arrive
+        // non-finite; Int() would trap on it (this runs at
+        // session init via bakedExposureSteps). Clamp instead.
+        guard snowMaxDepth > 0, amount.isFinite else { return 0 }
+        let q = (Double(amount) / snowStepMetres).rounded()
+        return q.isFinite ? Int(min(max(q, -1_000_000), 1_000_000)) : 0
     }
 
     /// v4.3: scene objects with no exposure entry join at their
@@ -2079,7 +2121,12 @@ final class EditorSession: ObservableObject {
     /// restores, every entry clamps down to A.
     private func clampExposuresToAmbient() {
         let cap = Float(buildupSnow)
-        for key in snowExposureA.keys where (snowExposureA[key] ?? 0) > cap {
+        // v4.10.1 hardening: iterate a SNAPSHOT of the keys —
+        // writing values back into the same dictionary while
+        // its Keys view is being iterated is mutation during
+        // enumeration (the frameTick growth loop and the
+        // clear-buildup loop follow the same discipline).
+        for key in Array(snowExposureA.keys) where (snowExposureA[key] ?? 0) > cap {
             snowExposureA[key] = cap
         }
     }
@@ -2242,7 +2289,7 @@ final class EditorSession: ObservableObject {
         project.scene.weather.snowAmount = 0
         // v4.3: every object's caught snow goes with the ground's,
         // and any footprints vanish.
-        for key in snowExposureA.keys { snowExposureA[key] = 0 }
+        for key in Array(snowExposureA.keys) { snowExposureA[key] = 0 } // v4.10.1: snapshot (see clampExposuresToAmbient)
         bakedExposureSteps = snowExposureA.mapValues { _ in 0 }
         clearSnowStamps()
         // v4.6: cleared build-up takes the plow layer with it —
@@ -2591,7 +2638,7 @@ final class EditorSession: ObservableObject {
             if dA > 0, effMode == 2 {
                 let cap = Float(buildupSnow)
                 let delta = Float(dA)
-                for key in snowExposureA.keys {
+                for key in Array(snowExposureA.keys) { // v4.10.1: snapshot (see clampExposuresToAmbient)
                     let v = snowExposureA[key] ?? 0
                     if v < cap { snowExposureA[key] = min(cap, v + delta) }
                 }
@@ -2685,6 +2732,7 @@ final class EditorSession: ObservableObject {
             lastGeoRebuildAt = now
             renderer.weatherGeoWet = Float(stepWet) / 24
             renderer.weatherGeoSnow = Float(snowProgressStep) / 24
+            renderer.noteWeatherStep("session:geoTrigger")
             renderer.rebuild(scene: project.scene, meshes: meshes)
             // v4.3: dynamic entries (promoted objects + clones)
             // aren't in the static rebuild — refresh their
