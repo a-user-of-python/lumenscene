@@ -3470,13 +3470,32 @@ final class Renderer {
                     dx = nc.x - oc.x; dz = nc.y - oc.y
                     if abs(dx) < 0.001 && abs(dz) < 0.001 { dx = 0; dz = 0 }
                 }
-                if let v = simSampleBilinear(oldSnow, ox: oldOX, oz: oldOZ, cs: oldCS,
-                                             vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
-                    snow[i] = v
+                // v4.10.4: a vertex whose host is NEW to the
+                // lattice (no entry in simPrevCentroids) keeps
+                // its targetSnow/targetWater — do NOT sample
+                // the old field for it. Snow travels with hosts
+                // that existed; a new host starts from its own
+                // exposure-seeded target. (Pre-fix, a freshly
+                // placed box's top inherited the ground snow
+                // that happened to lie at the same XZ — up to
+                // the full field depth — and, its target being
+                // ~its ceiling, no edit transfer ever cleaned
+                // it up.) Vertices with no host, or a host the
+                // lattice already knew, sample exactly as
+                // before.
+                var hostIsNew = false
+                if let h = hostIDs[i], simPrevCentroids[h] == nil {
+                    hostIsNew = true
                 }
-                if let v = simSampleBilinear(oldWater, ox: oldOX, oz: oldOZ, cs: oldCS,
-                                             vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
-                    water[i] = v
+                if !hostIsNew {
+                    if let v = simSampleBilinear(oldSnow, ox: oldOX, oz: oldOZ, cs: oldCS,
+                                                 vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
+                        snow[i] = v
+                    }
+                    if let v = simSampleBilinear(oldWater, ox: oldOX, oz: oldOZ, cs: oldCS,
+                                                 vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
+                        water[i] = v
+                    }
                 }
             }
         }
@@ -4032,6 +4051,161 @@ final class Renderer {
             }
             prevPlowIntruders = snap
         }
+        // (c1b) v4.10.4: PINNED columns + REPOSE RELAXATION of
+        // the TARGET — the v4.6 shaping, restored to BEFORE the
+        // sim sync (it sat in (c2), after the sync, and ran 0
+        // passes while the sim was live, so recorder deposits
+        // reached the sim and the screen UNSHAPED at every drag
+        // rebuild, and the flow kernel's work at edited cells
+        // was overwritten by the raw target at the next one).
+        //
+        // A column is PINNED when a contacting intruder's
+        // footprint covers it and the intruder's underside is
+        // at or below the column's snow top — the object is
+        // physically holding that snow down, so relaxation
+        // must not move it (and the drop at a present object's
+        // wall is the object's own silhouette, like a support
+        // step — the sheet meets the wall at the banked
+        // height and the compressed interior is inside the
+        // object, unseen).
+        //
+        // Relaxation then enforces the angle of repose on the
+        // snow SURFACE: between same-support neighbours
+        // (support heights within 5 cm — a genuine support
+        // step is the object's silhouette, not snow holding a
+        // cliff), no edge may exceed tan(37°) × cell. It runs
+        // Gauss–Seidel (in-place, fixed sweep order) because
+        // the Jacobi form of this scheme DIVERGES in 2D (four
+        // edges per column, per-edge transfer of half the
+        // excess overshoots — host audit, v4.5: heights blew
+        // past 1e10 within 40 passes on the pit grid). GS
+        // leaves each visited pair exactly at the limit and
+        // is a pure function of the current height state:
+        // deterministic per rebuild, no state, nothing extra
+        // stored — save/load is untouched. Effect: lift a
+        // buried block and the pit the imprint leaves slumps —
+        // audit: max interior slope 81° -> 37°, pit centre
+        // recovers 0.00 -> 0.76 m of its 1.56 m field (a smooth
+        // hollow; volume is conserved, so it does not fill
+        // flat). Footprint stamps (soft, unpinned) get their
+        // rims softened the same way. The GPU sim still owns
+        // evolution BETWEEN rebuilds at unedited cells; at
+        // edited cells it now starts from this shaped state.
+        noteWeatherStep("sheet:pinRelax")
+        var pinned = [Bool](repeating: false, count: vx * vz)
+        if snowPossible {
+            for j in 0..<vz {
+                for i in 0..<vx {
+                    let idx = vIdx(i, j)
+                    guard let s = verts[idx].support else { continue }
+                    let x = vX(i), z = vZ(j)
+                    for intr in intruders {
+                        if let sid = intr.staticID, sid == s.hostID { continue }
+                        if x < intr.worldMin.x - 0.5 || x > intr.worldMax.x + 0.5
+                            || z < intr.worldMin.z - 0.5 || z > intr.worldMax.z + 0.5 {
+                            continue
+                        }
+                        // v4.6: the underside test reads the
+                        // column top WITHOUT the displacement
+                        // layer — a berm the plow just deposited
+                        // beside (or the trail under) the
+                        // footprint must slump like any snow,
+                        // not be pinned by the layer's own
+                        // height. layerTop was captured before
+                        // step (c1) overwrote topY.
+                        let layerTop = s.y + verts[idx].snowH
+                            - (layerApplied[idx] ? layerDelta[idx] : 0)
+                        guard intr.worldMax.y > s.y + 0.001,
+                              intr.bottomY - 0.02 <= layerTop + 0.01 else { continue }
+                        let lp = intr.inverse * SIMD4<Float>(x, s.y, z, 1)
+                        let lx = lp.x - intr.centre.x
+                        let lz = lp.z - intr.centre.y
+                        let inside: Bool
+                        if intr.isCircle {
+                            inside = lx * lx + lz * lz < intr.half.x * intr.half.x
+                        } else {
+                            inside = abs(lx) < intr.half.x && abs(lz) < intr.half.y
+                        }
+                        if inside { pinned[idx] = true; break }
+                    }
+                }
+            }
+            // v4.6: freshly carved columns are blade-
+            // compacted — pinned for THIS pass too (the
+            // persistent rule below covers them from the next
+            // pass on; this covers the carving pass itself).
+            for vi in carvedThisPass { pinned[vi] = true }
+            // v4.6: and PERSISTENTLY — any column whose
+            // stored layer delta is a real carve (≤ −0.10 m)
+            // is compacted snow: pinned in every pass, like
+            // snow an object is standing on. The repose pass
+            // otherwise treats a narrow deep trail exactly
+            // like the v4.5 imprint pit and slumps it to a
+            // wide V in a single solve (audit round 6: stored
+            // carve −1.45 m rendered as a 0.49 m trough).
+            // Loose snow — berms (positive deltas), field,
+            // pits — relaxes as always; only the blade-packed
+            // floor holds.
+            if !snowPlow.isEmpty {
+                for idx in verts.indices where layerApplied[idx] {
+                    if layerDelta[idx] <= -0.10 { pinned[idx] = true }
+                }
+            }
+            let maxStep = Float(0.7536) * cs // tan(37°) × cell
+            for _ in 0..<48 {
+                var worst: Float = 0
+                for j in 0..<vz {
+                    for i in 0..<vx {
+                        let a = vIdx(i, j)
+                        if pinned[a] || verts[a].support == nil { continue }
+                        for (di, dj) in [(1, 0), (0, 1)] {
+                            let ii = i + di, jj = j + dj
+                            if ii >= vx || jj >= vz { continue }
+                            let b = vIdx(ii, jj)
+                            if pinned[b], verts[b].support != nil { continue }
+                            guard let sa = verts[a].support,
+                                  let sb = verts[b].support else { continue }
+                            if abs(sa.y - sb.y) > 0.05 { continue }
+                            let d = verts[a].topY - verts[b].topY
+                            if abs(d) > maxStep {
+                                let m = (abs(d) - maxStep) * 0.5
+                                worst = max(worst, m)
+                                if d > 0 {
+                                    verts[a].topY -= m; verts[b].topY += m
+                                } else {
+                                    verts[a].topY += m; verts[b].topY -= m
+                                }
+                            }
+                        }
+                    }
+                }
+                if worst < 0.0005 { break }
+            }
+            // Write the relaxed heights back into snowH NOW,
+            // before (c2a) builds tSnow from verts: the sim's
+            // initial condition, its remap fallback and every
+            // edit transfer must carry the SHAPED target.
+            for idx in verts.indices {
+                if let s = verts[idx].support {
+                    verts[idx].snowH = max(0, verts[idx].topY - s.y)
+                }
+            }
+            // v4.6 NOTE — no slump write-back, deliberately.
+            // The audit tried absorbing the relaxation's
+            // changes into the layer three ways (absolute,
+            // change-form, voted); every variant ratcheted:
+            // each rebuild's relaxation slumps the trail walls
+            // a little more and storing that state compounds
+            // across a 50-step drag until a 1.4 m plow depth
+            // reads as a 0.4 m swale and the berms are eaten
+            // into moats. The layer therefore stores ONLY what
+            // the recorder wrote (carve + deposit); the
+            // relaxation remains a per-pass RENDERING of that
+            // state (softening walls and berm crests for the
+            // eye) without feeding back into it. Same stored
+            // state → same rendered surface, every rebuild:
+            // the trail is a true fixed point.
+        }
         // (c2a) v4.8: SIMULATION SYNC. The columns above are
         // the v4.7 TARGET surface (closed form + imprints +
         // plow layer). The sim buffers are initialised from it
@@ -4044,9 +4218,11 @@ final class Renderer {
         // snow -- receive an edit transfer (target written into
         // the shared snow buffer). Everywhere else the GPU
         // simulation's own evolution (deposition, repose,
-        // rounding, melt) is what renders. The CPU relaxation
-        // in (c2) is skipped while the sim is live: the GPU
-        // flow kernel owns repose now.
+        // rounding, melt) is what renders. The target the
+        // transfers carry is the RELAXED target from (c1b):
+        // the sheet shapes the target as v4.6 did, and the
+        // sim owns evolution between rebuilds at unedited
+        // cells, starting from shaped state at edited ones.
         noteWeatherStep("sheet:simSync")
         var v48SimActive = false
         do {
@@ -4180,157 +4356,17 @@ final class Renderer {
                 flushNanClampCount()
             }
         }
-        // (c2) v4.5: PINNED columns + REPOSE RELAXATION.
-        //
-        // A column is PINNED when a contacting intruder's
-        // footprint covers it and the intruder's underside is
-        // at or below the column's snow top — the object is
-        // physically holding that snow down, so relaxation
-        // must not move it (and the drop at a present object's
-        // wall is the object's own silhouette, like a support
-        // step — the sheet meets the wall at the banked
-        // height and the compressed interior is inside the
-        // object, unseen).
-        //
-        // Relaxation then enforces the angle of repose on the
-        // snow SURFACE: between same-support neighbours
-        // (support heights within 5 cm — a genuine support
-        // step is the object's silhouette, not snow holding a
-        // cliff), no edge may exceed tan(37°) × cell. It runs
-        // Gauss–Seidel (in-place, fixed sweep order) because
-        // the Jacobi form of this scheme DIVERGES in 2D (four
-        // edges per column, per-edge transfer of half the
-        // excess overshoots — host audit, v4.5: heights blew
-        // past 1e10 within 40 passes on the pit grid). GS
-        // leaves each visited pair exactly at the limit and
-        // is a pure function of the current height state:
-        // deterministic per rebuild, no state, nothing extra
-        // stored — save/load is untouched. Effect on Sean's
-        // repro: lift a buried block and the pit the imprint
-        // leaves slumps — audit: max interior slope 81° ->
-        // 37°, pit centre recovers 0.00 -> 0.76 m of its
-        // 1.56 m field (a smooth hollow; volume is conserved,
-        // so it does not fill flat). Footprint stamps (soft,
-        // unpinned) get their rims softened the same way.
-        noteWeatherStep("sheet:pinRelax")
-        var pinned = [Bool](repeating: false, count: vx * vz)
-        if snowPossible {
-            for j in 0..<vz {
-                for i in 0..<vx {
-                    let idx = vIdx(i, j)
-                    guard let s = verts[idx].support else { continue }
-                    let x = vX(i), z = vZ(j)
-                    for intr in intruders {
-                        if let sid = intr.staticID, sid == s.hostID { continue }
-                        if x < intr.worldMin.x - 0.5 || x > intr.worldMax.x + 0.5
-                            || z < intr.worldMin.z - 0.5 || z > intr.worldMax.z + 0.5 {
-                            continue
-                        }
-                        // v4.6: the underside test reads the
-                        // column top WITHOUT the displacement
-                        // layer — a berm the plow just deposited
-                        // beside (or the trail under) the
-                        // footprint must slump like any snow,
-                        // not be pinned by the layer's own
-                        // height. layerTop was captured before
-                        // step (c1) overwrote topY.
-                        let layerTop = s.y + verts[idx].snowH
-                            - (layerApplied[idx] ? layerDelta[idx] : 0)
-                        guard intr.worldMax.y > s.y + 0.001,
-                              intr.bottomY - 0.02 <= layerTop + 0.01 else { continue }
-                        let lp = intr.inverse * SIMD4<Float>(x, s.y, z, 1)
-                        let lx = lp.x - intr.centre.x
-                        let lz = lp.z - intr.centre.y
-                        let inside: Bool
-                        if intr.isCircle {
-                            inside = lx * lx + lz * lz < intr.half.x * intr.half.x
-                        } else {
-                            inside = abs(lx) < intr.half.x && abs(lz) < intr.half.y
-                        }
-                        if inside { pinned[idx] = true; break }
-                    }
-                }
-            }
-            // v4.6: freshly carved columns are blade-
-            // compacted — pinned for THIS pass too (the
-            // persistent rule below covers them from the next
-            // pass on; this covers the carving pass itself).
-            for vi in carvedThisPass { pinned[vi] = true }
-            // v4.6: and PERSISTENTLY — any column whose
-            // stored layer delta is a real carve (≤ −0.10 m)
-            // is compacted snow: pinned in every pass, like
-            // snow an object is standing on. The repose pass
-            // otherwise treats a narrow deep trail exactly
-            // like the v4.5 imprint pit and slumps it to a
-            // wide V in a single solve (audit round 6: stored
-            // carve −1.45 m rendered as a 0.49 m trough).
-            // Loose snow — berms (positive deltas), field,
-            // pits — relaxes as always; only the blade-packed
-            // floor holds.
-            if !snowPlow.isEmpty {
-                for idx in verts.indices where layerApplied[idx] {
-                    if layerDelta[idx] <= -0.10 { pinned[idx] = true }
-                }
-            }
-            // v4.8: the flow kernel reads the same pinning.
-            if let pinB = simPinnedBuf, pinned.count * 4 == (pinB.length) {
-                let ptr = pinB.contents().bindMemory(to: UInt32.self, capacity: pinned.count)
-                for i in pinned.indices { ptr[i] = pinned[i] ? 1 : 0 }
-            }
-            let maxStep = Float(0.7536) * cs // tan(37°) × cell
-            // v4.8: skipped while the GPU sim is live (its flow
-            // kernel owns repose + rounding between rebuilds).
-            for _ in 0..<(v48SimActive ? 0 : 48) {
-                var worst: Float = 0
-                for j in 0..<vz {
-                    for i in 0..<vx {
-                        let a = vIdx(i, j)
-                        if pinned[a] || verts[a].support == nil { continue }
-                        for (di, dj) in [(1, 0), (0, 1)] {
-                            let ii = i + di, jj = j + dj
-                            if ii >= vx || jj >= vz { continue }
-                            let b = vIdx(ii, jj)
-                            if pinned[b], verts[b].support != nil { continue }
-                            guard let sa = verts[a].support,
-                                  let sb = verts[b].support else { continue }
-                            if abs(sa.y - sb.y) > 0.05 { continue }
-                            let d = verts[a].topY - verts[b].topY
-                            if abs(d) > maxStep {
-                                let m = (abs(d) - maxStep) * 0.5
-                                worst = max(worst, m)
-                                if d > 0 {
-                                    verts[a].topY -= m; verts[b].topY += m
-                                } else {
-                                    verts[a].topY += m; verts[b].topY -= m
-                                }
-                            }
-                        }
-                    }
-                }
-                if worst < 0.0005 { break }
-            }
-            if !v48SimActive {
-                for idx in verts.indices {
-                    if let s = verts[idx].support {
-                        verts[idx].snowH = max(0, verts[idx].topY - s.y)
-                    }
-                }
-            }
-            // v4.6 NOTE — no slump write-back, deliberately.
-            // The audit tried absorbing the relaxation's
-            // changes into the layer three ways (absolute,
-            // change-form, voted); every variant ratcheted:
-            // each rebuild's relaxation slumps the trail walls
-            // a little more and storing that state compounds
-            // across a 50-step drag until a 1.4 m plow depth
-            // reads as a 0.4 m swale and the berms are eaten
-            // into moats. The layer therefore stores ONLY what
-            // the recorder wrote (carve + deposit); the
-            // relaxation remains a per-pass RENDERING of that
-            // state (softening walls and berm crests for the
-            // eye) without feeding back into it. Same stored
-            // state → same rendered surface, every rebuild:
-            // the trail is a true fixed point.
+        // (c2) v4.10.4: the pinned set and the repose
+        // relaxation moved to (c1b), BEFORE the sim sync, so
+        // the sim starts from the shaped target at edited
+        // cells. What remains at this v4.8 site is the pin-
+        // buffer write (post-sync, as before — the buffer's
+        // count is the lattice's only now): the flow kernel
+        // reads the same pinning between rebuilds.
+        if snowPossible, let pinB = simPinnedBuf,
+           pinned.count * 4 == (pinB.length) {
+            let ptr = pinB.contents().bindMemory(to: UInt32.self, capacity: pinned.count)
+            for i in pinned.indices { ptr[i] = pinned[i] ? 1 : 0 }
         }
         noteWeatherStep("sheet:normals")
         // (c3) v4.5: normals from the RELAXED lattice —

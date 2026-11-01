@@ -77,9 +77,10 @@
 //              (0, 1, 0), which is where addPrimitive drops
 //              new objects. Metrics at placement
 //              ("spawn-0", first metric after the add
-//              rebuild) and at +5/+15/+30 s of continued
-//              snowfall carry a spawn section: box-top snow
-//              max/mean, ring (plane within 0.4 m outside the
+//              rebuild) and at +5/+15/+30/+60/+90 s of
+//              continued snowfall carry a spawn section:
+//              box-top snow max/mean + box-top ceiling mean,
+//              ring (plane within 0.4 m outside the
 //              footprint) mean/min/max, and field (plane
 //              > 1 m from the footprint) mean/max.
 
@@ -273,7 +274,8 @@ final class ReproRun {
     private var dragMidEmitted = false
     private var spawnCheckpointIdx = 0
     private let spawnCheckpoints: [(delay: CFTimeInterval, label: String)] =
-        [(5, "spawn+5s"), (15, "spawn+15s"), (30, "spawn+30s")]
+        [(5, "spawn+5s"), (15, "spawn+15s"), (30, "spawn+30s"),
+         (60, "spawn+60s"), (90, "spawn+90s")]
 
     private var isDeepVariant: Bool {
         ReproDriver.variant == "deeprest" || ReproDriver.variant == "deepdrag"
@@ -362,6 +364,7 @@ final class ReproRun {
         // and all stats 0 before the box exists (pre-spawn).
         if ReproDriver.variant == "deepspawn" {
             var topMax: Float = 0, topSum: Float = 0, topCount = 0
+            var topCeilSum: Float = 0
             var ringSum: Float = 0, ringMin: Float = 0, ringMax: Float = 0, ringCount = 0
             var fieldSum: Float = 0, fieldMax: Float = 0, fieldCount = 0
             if s.initialised, n > 0, s.snow.count >= n, s.support.count >= n,
@@ -382,6 +385,7 @@ final class ReproRun {
                         if inside, abs(sup - 1.0) < 0.05 {
                             topCount += 1
                             topSum += snow
+                            if idx < s.ceiling.count { topCeilSum += clean(s.ceiling[idx]) }
                             if snow > topMax { topMax = snow }
                         } else if abs(sup) < 0.05 {
                             if rectDist > 0.001, rectDist <= 0.4 {
@@ -402,8 +406,9 @@ final class ReproRun {
             let ringMean: Float = ringCount > 0 ? ringSum / Float(ringCount) : 0
             let fieldMean: Float = fieldCount > 0 ? fieldSum / Float(fieldCount) : 0
             let ratio: Float = fieldMean > 0 ? topMean / fieldMean : 0
-            line += String(format: " spawnTopMax=%.4f spawnTopMean=%.4f spawnTopCount=%d ringMean=%.4f ringMin=%.4f ringMax=%.4f ringCount=%d fieldMean=%.4f fieldMax=%.4f fieldCount=%d topFieldRatio=%.4f A=%.4f",
-                           topMax, topMean, topCount,
+            let topCeilMean: Float = topCount > 0 ? topCeilSum / Float(topCount) : 0
+            line += String(format: " spawnTopMax=%.4f spawnTopMean=%.4f spawnTopCeilMean=%.4f spawnTopCount=%d ringMean=%.4f ringMin=%.4f ringMax=%.4f ringCount=%d fieldMean=%.4f fieldMax=%.4f fieldCount=%d topFieldRatio=%.4f A=%.4f",
+                           topMax, topMean, topCeilMean, topCount,
                            ringMean, ringMin, ringMax, ringCount,
                            fieldMean, fieldMax, fieldCount,
                            ratio, session?.liveSnowAmount ?? 0)

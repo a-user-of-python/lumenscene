@@ -1888,7 +1888,19 @@ kernel void simFlowKernel(
             float move = 0.0f;
             if (abs(diff) > maxStep) {
                 float excess = abs(diff) - maxStep;
-                move = excess * 0.5f;
+                // v4.10.4: 0.25, not 0.5. Within one parity
+                // dispatch up to 4 same-parity givers can move
+                // snow into a shared receiver simultaneously,
+                // each reading the receiver's stale depth; at
+                // 0.5 the receiver could gain ~2x the pairwise
+                // excess and become a NEW local maximum above
+                // its own ceiling (the at-rest degeneration).
+                // At 1/4 per giver the worst-case receiver gain
+                // is the largest single pair excess, so the
+                // maximum principle holds for the 4-neighbour
+                // stencil and the repose fixed point (the
+                // maxStep angle) is unchanged.
+                move = excess * 0.25f;
             }
             // Rounding diffusion: 4% of the depth difference
             // per visit, always on -- piles relax into soft

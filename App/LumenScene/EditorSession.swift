@@ -2662,18 +2662,36 @@ final class EditorSession: ObservableObject {
             }
             // v4.3 (§4): per-object exposure follows the ambient
             // A. Growth (snowing only) lifts every entry below A
-            // by the same delta, capped at A — young objects lag
-            // exactly by their age. Any shrink clamps entries
-            // down to A. All in the non-published map.
+            // by the snowfall increment, capped at A — young
+            // objects lag exactly by their age. Any shrink
+            // clamps entries down to A. All in the non-published
+            // map.
+            // v4.10.4: the growth delta is the SNOWFALL CLOCK
+            // increment — the identical expression snowfallTotal
+            // advances by above — NOT dA. dA stops at the depth
+            // cap (buildupSnow is clamped to snowMaxDepth), so
+            // under the old rule an object spawned while A sat
+            // at the cap kept a ~0 ceiling forever: its exposure
+            // could never grow because A never grew. The
+            // snowfall clock never caps, so at the cap exposure
+            // now keeps pace with snowfall until it converges
+            // to A. Below the cap the increment equals dA,
+            // except in the single frame A crosses the cap,
+            // where exposure may reach A one frame sooner
+            // (intended).
             let dA = buildupSnow - snowAmountBefore
-            if dA > 0, effMode == 2 {
-                let cap = Float(buildupSnow)
-                let delta = Float(dA)
-                for key in Array(snowExposureA.keys) { // v4.10.1: snapshot (see clampExposuresToAmbient)
-                    let v = snowExposureA[key] ?? 0
-                    if v < cap { snowExposureA[key] = min(cap, v + delta) }
+            if effMode == 2 {
+                let snowfallInc = (depth / 100) * weatherRateScale * dynIntensity * Double(dt)
+                if snowfallInc > 0 {
+                    let cap = Float(buildupSnow)
+                    let delta = Float(snowfallInc)
+                    for key in Array(snowExposureA.keys) { // v4.10.1: snapshot (see clampExposuresToAmbient)
+                        let v = snowExposureA[key] ?? 0
+                        if v < cap { snowExposureA[key] = min(cap, v + delta) }
+                    }
                 }
-            } else if dA < 0 {
+            }
+            if dA < 0 {
                 clampExposuresToAmbient()
             }
         }
