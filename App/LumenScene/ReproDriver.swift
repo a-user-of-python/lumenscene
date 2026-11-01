@@ -183,6 +183,8 @@ final class ReproRun {
     private var lastStepTag = ""
     private var sawSheetAfterWeatherOn = false
     private var sawSwapAfterWeatherOn = false
+    private var sawTickTag = false
+    private var firstStepCrossed = false
     private var weatherOn = false
     private var crossedA = false
     private var simTickFrames = 0
@@ -210,8 +212,12 @@ final class ReproRun {
     private func freezeTriggerMet() -> Bool {
         guard isFreezeVariant, !freezeDone else { return false }
         if ReproDriver.variant == "freeze" {
-            return crossedA && (session?.liveSnowAmount ?? 0) >= 0.002
-                && !sawSheetAfterWeatherOn
+            // A in [0.002, 0.006): accumulation under way, the
+            // first quantised step (0.00625 at the default
+            // 0.3 m depth) not yet crossed — no sheet rebuild
+            // can have fired.
+            let a = session?.liveSnowAmount ?? 0
+            return crossedA && a >= 0.002 && a < 0.006
         }
         return stagedSeen
     }
@@ -328,13 +334,28 @@ final class ReproRun {
             lastStepTag = tag
             ReproDriver.marker("step \(tag)")
             if weatherOn, tag.hasPrefix("sheet:") { sawSheetAfterWeatherOn = true }
-            if weatherOn, tag == "rebuild:swap" { sawSwapAfterWeatherOn = true }
+            // A swap only counts as the SHEET rebuild's swap
+            // once A has crossed the first quantised step —
+            // earlier swaps are the session-init builds. (The
+            // sheet:* tags themselves are transient within one
+            // frameTick and usually gone by polling time; the
+            // swap + the tick tag below are the persistent
+            // evidence the sheet pass ran.)
+            if weatherOn, tag == "rebuild:swap",
+               session.liveSnowAmount >= 0.006 {
+                sawSwapAfterWeatherOn = true
+            }
+            if weatherOn, tag.hasPrefix("tick:") { sawTickTag = true }
         }
 
         let a = session.liveSnowAmount
         if weatherOn, !crossedA, a > 0 {
             crossedA = true
             ReproDriver.marker("accumulation-positive A=\(a)")
+        }
+        if weatherOn, !firstStepCrossed, a >= 0.006 {
+            firstStepCrossed = true
+            ReproDriver.marker("first-step-crossed A=\(a)")
         }
         if sawSwapAfterWeatherOn { framesAfterSwap += 1 }
 
@@ -349,16 +370,19 @@ final class ReproRun {
         }
 
         // Settle = every link in the accumulation-start chain
-        // has demonstrably run: A crossed 0, a sheet build ran,
-        // its staged AS swapped in, and the sim ticked (or was
-        // deliberately disabled by the simtick toggle, in which
-        // case 90 post-swap frames stand in for tick evidence).
-        // Freeze variants additionally require the full
-        // engage -> frozen frames -> wake cycle to have run.
+        // has demonstrably run: A crossed 0 and then the first
+        // quantised step, the sheet rebuild's staged AS swapped
+        // in (a swap observed at A >= step), the sim initialised
+        // (a tick: tag was observed — tickWeatherSim tags only
+        // past its simInitialised guard) and ticked 5 times (or,
+        // with the simtick toggle, 90 post-swap frames stand in
+        // for tick evidence). Freeze variants additionally
+        // require the full engage -> frozen frames -> wake
+        // cycle to have run.
         let simSatisfied = ReproToggles.simTick ? framesAfterSwap >= 90
-                                                : simTickFrames >= 5
+                                                : (sawTickTag && simTickFrames >= 5)
         let freezeSatisfied = !isFreezeVariant || freezeDone
-        if crossedA, sawSheetAfterWeatherOn, sawSwapAfterWeatherOn, simSatisfied, freezeSatisfied {
+        if crossedA, firstStepCrossed, sawSwapAfterWeatherOn, simSatisfied, freezeSatisfied {
             finished = true
             ReproDriver.marker("settle A=\(a) pumps=\(pumpCount) simTicks=\(simTickFrames)")
             print("REPRO-DONE")

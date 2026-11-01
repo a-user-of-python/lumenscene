@@ -88,7 +88,7 @@ jobs:
           SIM_UDID: ${{ steps.sim.outputs.udid }}
         run: |
           cat > "$RUNNER_TEMP/repro_runner.py" <<'PYEOF'
-          import glob, os, re, subprocess, sys, time
+          import glob, json, os, re, subprocess, sys, time
 
           UDID = os.environ["SIM_UDID"]
           BUNDLE = "com.user.lumenscene"
@@ -127,21 +127,49 @@ jobs:
               return found
 
           def parse_crash(path):
+              # .ips files are JSON (optionally preceded by a
+              # one-line metadata JSON header).
               try:
-                  text = open(path, errors="replace").read()
+                  raw = open(path, errors="replace").read()
               except OSError:
                   return ("?", "?", "")
-              exc = re.search(r"Exception Type:\s*(.+)", text)
-              term = re.search(r"Termination Reason:\s*(.+)", text)
+              rep = None
+              try:
+                  rep = json.loads(raw)
+              except Exception:
+                  nl = raw.find("\n")
+                  if nl >= 0:
+                      try:
+                          rep = json.loads(raw[nl + 1:])
+                      except Exception:
+                          rep = None
+              if rep is None:
+                  exc = re.search(r"Exception Type:\s*(.+)", raw)
+                  term = re.search(r"Termination Reason:\s*(.+)", raw)
+                  return (exc.group(1).strip() if exc else "?",
+                          term.group(1).strip() if term else "?", "")
+              exc = rep.get("exception", {})
+              exc_s = f"{exc.get('type', '?')} {exc.get('signal', '')}".strip()
+              term = rep.get("termination", {})
+              term_s = (f"{term.get('namespace', '')} {term.get('code', '')}".strip()
+                        or "?")
               frames = ""
-              m = re.search(r"Thread \d+ Crashed:.*?(?:\n\n|\Z)", text, re.S)
-              if m:
-                  frames = "\n".join(m.group(0).splitlines()[:14])
-              return (exc.group(1).strip() if exc else "?",
-                      term.group(1).strip() if term else "?",
-                      frames)
+              try:
+                  ft = rep.get("faultingThread", 0)
+                  imgs = rep.get("usedImages", [])
+                  fr = rep.get("threads", [])[ft].get("frames", [])[:14]
+                  lines = []
+                  for f in fr:
+                      idx = f.get("imageIndex", -1)
+                      nm = imgs[idx].get("name", "?") if 0 <= idx < len(imgs) else "?"
+                      lines.append(f"{nm} {f.get('symbol', '?')}")
+                  frames = "\n".join(lines)
+              except Exception:
+                  frames = ""
+              return (exc_s, term_s, frames)
 
           summary = []
+          run_records = []
           harness_failed = False
           for name, extra in RUNS:
               subprocess.run(["xcrun", "simctl", "terminate", UDID, BUNDLE],
@@ -153,6 +181,7 @@ jobs:
               print(f"=== RUN {name}: {' '.join(cmd)}", flush=True)
               timed_out = False
               rc = None
+              run_start = time.time()
               with open(log_path, "wb") as lf:
                   try:
                       proc = subprocess.run(cmd, stdout=lf,
@@ -161,7 +190,8 @@ jobs:
                       rc = proc.returncode
                   except subprocess.TimeoutExpired:
                       timed_out = True
-              time.sleep(2)  # let any crash report flush to disk
+              time.sleep(6)  # let any crash report flush to disk
+              run_end = time.time()
               output = open(log_path, errors="replace").read()
               markers = [l for l in output.splitlines() if "REPRO-MARKER" in l]
               last_marker = markers[-1].strip() if markers else "(none)"
@@ -204,8 +234,37 @@ jobs:
               if result == "CRASH":
                   print(f"::error title=Repro crash in {name}::{crash_info} lastMarker=[{last_marker}]")
               summary.append(line)
+              run_records.append({"name": name, "start": run_start, "end": run_end,
+                                  "result": result, "idx": len(summary) - 1})
               subprocess.run(["xcrun", "simctl", "terminate", UDID, BUNDLE],
                              capture_output=True)
+
+          # Final sweep: a crash report can flush seconds after
+          # its run's window closed. Attribute any unclaimed
+          # LumenScene report by mtime to the run whose window
+          # contains it, upgrading a NO-VERDICT run to CRASH —
+          # a missed attribution must not hide a repro.
+          time.sleep(5)
+          claimed = {os.path.basename(p)
+                     for p in glob.glob(os.path.join(LOGDIR, "crash-*"))}
+          for path, mt in crash_reports().items():
+              base = os.path.basename(path)
+              if "LumenScene" not in base or base in claimed:
+                  continue
+              for rec in run_records:
+                  if rec["start"] - 5 <= mt <= rec["end"] + 25:
+                      dest = os.path.join(
+                          LOGDIR, f"crash-{rec['name']}-{base}")
+                      subprocess.run(["cp", path, dest])
+                      exc, term, frames = parse_crash(path)
+                      if rec["result"].startswith("NO-VERDICT"):
+                          rec["result"] = "CRASH"
+                          summary[rec["idx"]] = (
+                              f"{rec['name']}: CRASH (attributed in final sweep) "
+                              f"exception=[{exc}] termination=[{term}] "
+                              f"report={os.path.basename(dest)}")
+                          print(summary[rec["idx"]], flush=True)
+                      break
 
           with open(os.path.join(LOGDIR, "summary.txt"), "w") as f:
               f.write("LumenScene snow-accumulation repro — per-run results\n")
