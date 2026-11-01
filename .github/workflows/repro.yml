@@ -252,7 +252,10 @@ jobs:
               if "LumenScene" not in base or base in claimed:
                   continue
               for rec in run_records:
+                  if rec["result"].startswith("CRASH"):
+                      continue  # this run already has its report
                   if rec["start"] - 5 <= mt <= rec["end"] + 25:
+                      claimed.add(base)
                       dest = os.path.join(
                           LOGDIR, f"crash-{rec['name']}-{base}")
                       subprocess.run(["cp", path, dest])

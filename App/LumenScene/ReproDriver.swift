@@ -334,18 +334,6 @@ final class ReproRun {
             lastStepTag = tag
             ReproDriver.marker("step \(tag)")
             if weatherOn, tag.hasPrefix("sheet:") { sawSheetAfterWeatherOn = true }
-            // A swap only counts as the SHEET rebuild's swap
-            // once A has crossed the first quantised step —
-            // earlier swaps are the session-init builds. (The
-            // sheet:* tags themselves are transient within one
-            // frameTick and usually gone by polling time; the
-            // swap + the tick tag below are the persistent
-            // evidence the sheet pass ran.)
-            if weatherOn, tag == "rebuild:swap",
-               session.liveSnowAmount >= 0.006 {
-                sawSwapAfterWeatherOn = true
-            }
-            if weatherOn, tag.hasPrefix("tick:") { sawTickTag = true }
         }
 
         let a = session.liveSnowAmount
@@ -357,6 +345,20 @@ final class ReproRun {
             firstStepCrossed = true
             ReproDriver.marker("first-step-crossed A=\(a)")
         }
+        // Unconditional latches — NOT change-gated: the step
+        // tag can round-trip entry -> sheet -> stageAS -> swap
+        // inside ONE frameTick and return to exactly the value
+        // the previous poll saw, so a change-gated latch misses
+        // every swap after the first. A swap only counts as
+        // the SHEET rebuild's swap once A has crossed the
+        // first quantised step (earlier swaps are the
+        // session-init builds); the tick: latch proves the sim
+        // initialised (tickWeatherSim tags only past its
+        // simInitialised guard).
+        if weatherOn, tag == "rebuild:swap", a >= 0.006 {
+            sawSwapAfterWeatherOn = true
+        }
+        if weatherOn, tag.hasPrefix("tick:") { sawTickTag = true }
         if sawSwapAfterWeatherOn { framesAfterSwap += 1 }
 
         if renderer.simStepsLastFrame > 0 {
