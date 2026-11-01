@@ -114,6 +114,14 @@ final class EditorSession: ObservableObject {
         return (t != nil && t != "idle") ? t : nil
     }()
 
+    /// v4.10.2: the renderer's persisted count of non-finite
+    /// sim values the sheet readback has replaced with 0, read
+    /// at init and shown in the footer alongside the last-step
+    /// readout — if bad snow values are occurring at all, the
+    /// number grows between sessions.
+    private var previousNanClamps: Int =
+        UserDefaults.standard.integer(forKey: "lumenscene.nanClampCount")
+
     let renderer: Renderer
     /// v4.0: the node-graph game runtime. Inert in edit mode;
     /// started/stopped by toggleMode().
@@ -216,6 +224,11 @@ final class EditorSession: ObservableObject {
             } else {
                 previousSessionStep = nil
             }
+        }
+        // v4.10.2: the NaN-clamp count rides the same readout.
+        if previousNanClamps > 0 {
+            let extra = "NaN clamps: \(previousNanClamps)"
+            diag = diag.map { $0 + " · " + extra } ?? extra
         }
         footer.update(
             hint: isIdleFrozen
@@ -709,13 +722,26 @@ final class EditorSession: ObservableObject {
         // that is exactly the old build-up).
         buildupSnow = project.scene.weather.snowAmount
             ?? (project.scene.weather.snow * project.scene.weather.maxDepth)
+        // v4.10.2 (NaN hunt): a corrupt/legacy persisted
+        // amount must not reach the renderer's ceiling bake —
+        // Swift's max/min are comparison-based and pass NaN
+        // straight through, and from there it would reach
+        // sheet vertices and the AS build unguarded.
+        if !buildupSnow.isFinite { buildupSnow = 0 }
         snowfallTotal = project.scene.weather.snowfallTotal ?? 0
         buildupFreeze = min(1, max(0, project.scene.weather.puddleFreeze ?? 0))
         // v4.3 (§4): seed the per-object exposure map. A persisted
         // value wins; absent means the object had fully caught
         // up with the ambient snow (old projects keep their look).
         for obj in project.scene.objects {
-            snowExposureA[obj.id] = obj.snowExposure.map { Float($0) } ?? Float(buildupSnow)
+            // v4.10.2: sanitise the persisted exposure itself,
+            // not just its step conversion (round 1 hardened
+            // only the Int trap) — a non-finite amount would
+            // flow into the ceiling bake unsanitised.
+            snowExposureA[obj.id] = obj.snowExposure.map {
+                let f = Float($0)
+                return f.isFinite ? f : Float(buildupSnow)
+            } ?? Float(buildupSnow)
         }
         bakedExposureSteps = snowExposureA.mapValues { exposureStep(for: $0) }
         renderer.onNeedsFrame = { [weak self] in self?.kickRender() }
@@ -2103,7 +2129,12 @@ final class EditorSession: ObservableObject {
     /// their objects explicitly at 0 before this could see them.
     private func ensureExposuresForSceneObjects() {
         for obj in project.scene.objects where snowExposureA[obj.id] == nil {
-            snowExposureA[obj.id] = obj.snowExposure.map { Float($0) } ?? Float(buildupSnow)
+            // v4.10.2: same non-finite sanitisation as the
+            // init seeding — see there.
+            snowExposureA[obj.id] = obj.snowExposure.map {
+                let f = Float($0)
+                return f.isFinite ? f : Float(buildupSnow)
+            } ?? Float(buildupSnow)
             bakedExposureSteps[obj.id] = exposureStep(for: snowExposureA[obj.id] ?? 0)
         }
     }

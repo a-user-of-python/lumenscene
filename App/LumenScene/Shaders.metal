@@ -1942,9 +1942,15 @@ kernel void simApplyEditsKernel(
     device const uint* editIndex [[buffer(10)]],
     device const float* editDelta [[buffer(11)]],
     constant uint& editCount [[buffer(12)]],
+    constant uint& latticeCount [[buffer(13)]],
     uint idx [[thread_position_in_grid]])
 {
     if (idx >= editCount) return;
     uint v = editIndex[idx];
+    // v4.10.2: this kernel currently has NO dispatch site
+    // (the CPU applies edit transfers in appendSnowSheet),
+    // but its write was the one unbounded GPU write in the
+    // sim shader set — guard it before anyone wires it up.
+    if (v >= latticeCount) return;
     snowDepth[v] = max(0.0f, snowDepth[v] + editDelta[idx]);
 }

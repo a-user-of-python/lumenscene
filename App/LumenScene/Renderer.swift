@@ -296,6 +296,11 @@ final class Renderer {
         var triMatBuffer: MTLBuffer?
         var accel: MTLAccelerationStructure?
         var cmd: MTLCommandBuffer?
+        /// v4.10.2: the AS build could not be encoded
+        /// (allocation/encoder failure on a non-empty scene).
+        /// A failed stage must never be swapped in — see
+        /// staticStageFailed.
+        var buildFailed = false
     }
     private var pendingStatic: PreparedStatic?
     private var deferredStatic: PreparedStatic?
@@ -659,6 +664,31 @@ final class Renderer {
         UserDefaults.standard.set(tag, forKey: "lumenscene.weatherStep")
     }
 
+    // v4.10.2: how many non-finite sim values the sheet
+    // readback has had to replace with 0 (see appendSnowSheet).
+    // Round 2's NaN hunt found NO finite-guard between the sim
+    // buffers and the sheet vertices/AS build: one bad depth
+    // (a corrupt persisted exposure amount, a singular
+    // intruder inverse, a raced buffer) previously flowed
+    // straight into AS geometry. The clamp converts that into
+    // a one-vertex visual glitch; this counter — persisted,
+    // flushed once per sheet build, and surfaced in the panel
+    // footer by the session — records whether bad values are
+    // occurring at all.
+    private var nanClampCount: Int =
+        UserDefaults.standard.integer(forKey: "lumenscene.nanClampCount")
+    private var nanClampDirty = false
+    func noteNanClamp() {
+        nanClampCount += 1
+        nanClampDirty = true
+    }
+    private func flushNanClampCount() {
+        guard nanClampDirty else { return }
+        nanClampDirty = false
+        UserDefaults.standard.set(nanClampCount,
+                                  forKey: "lumenscene.nanClampCount")
+    }
+
     /// v4.10.1 hardening: floor-divide a world coordinate into a
     /// cell index WITHOUT the Int(Float) trap — a non-finite or
     /// out-of-range quotient (degenerate imported mesh, extreme
@@ -736,6 +766,12 @@ final class Renderer {
     var simRaining: Bool = false     // effective rain this tick
     var simWaterBase: Float = 0      // surge x rate scale for water fill
     var simLastTick: CFTimeInterval = 0
+    /// v4.10.2: the last committed sim-tick command buffer.
+    /// The tick is fire-and-forget; this handle lets CPU
+    /// readers/writers of the shared sim buffers fence on it
+    /// (waitForSimTick) and lets the tick's completion handler
+    /// report GPU errors into the weather-step trail.
+    private var lastSimCmd: MTLCommandBuffer?
     var simStepsLastFrame: Int = 0
     private var simLastSettleScan: CFTimeInterval = 0
     /// True while depths are still changing enough to matter.
@@ -2346,10 +2382,23 @@ final class Renderer {
             }
             wMin = lo; wMax = hi
         }
+        // v4.10.2 (NaN hunt): a zero- or near-zero-scale
+        // transform inverts to Inf/NaN entries, and the imprint
+        // path runs only once snow is possible — a dry scene
+        // with such an object renders fine, then every imprint
+        // sample inside its footprint goes NaN at accumulation
+        // start and poisons the sheet/AS. Reject the intruder
+        // instead (it simply leaves no imprint).
+        let inv = matrix.inverse
+        let invFinite = [inv.columns.0, inv.columns.1,
+                         inv.columns.2, inv.columns.3].allSatisfy { c in
+            c.x.isFinite && c.y.isFinite && c.z.isFinite && c.w.isFinite
+        }
+        guard abs(matrix.determinant) > 1e-12, invFinite else { return nil }
         return SnowIntruder(
             staticID: staticID,
             plowKey: plowKey,
-            inverse: matrix.inverse,
+            inverse: inv,
             bottomY: wMin.y,
             worldMin: wMin, worldMax: wMax,
             centre: SIMD2<Float>((lb.min.x + lb.max.x) / 2,
@@ -3334,6 +3383,21 @@ final class Renderer {
     /// back to the closed-form equilibrium for the support now
     /// beneath them (targetSnow). Patch mass is conserved to
     /// bilinear-sampling accuracy (audit tolerance 5%).
+    /// v4.10.2: the sim tick is fire-and-forget on the serial
+    /// queue (Lane-A finding): CPU code that reads or writes
+    /// the shared sim buffers must first know the last tick
+    /// finished, or it races the GPU kernels on the same
+    /// allocations. Bounded the same way as
+    /// waitForPreviousFrame — the tick is small and ahead of
+    /// the previous frame's trace in queue order.
+    private func waitForSimTick() {
+        if let c = lastSimCmd,
+           c.status != .completed, c.status != .error {
+            c.waitUntilCompleted()
+        }
+        lastSimCmd = nil
+    }
+
     private func simSyncLattice(ox: Float, oz: Float, cs: Float,
                                 vx: Int, vz: Int,
                                 supportY: [Float], hasSup: [Bool],
@@ -3342,6 +3406,10 @@ final class Renderer {
                                 waterCeil: [Float], waterRate: [Float],
                                 targetSnow: [Float], targetWater: [Float],
                                 forceInit: Bool) {
+        // v4.10.2: this function writes the shared sim
+        // buffers (ceilings/rates/depths) — fence on the last
+        // tick first so the writes can't race its kernels.
+        waitForSimTick()
         let count = vx * vz
         guard count > 0, simSourcePipeline != nil else { simInitialised = false; return }
         // Support signature: quantised support heights + pattern.
@@ -3504,6 +3572,10 @@ final class Renderer {
         let rawDt = now - simLastTick
         simLastTick = now
         guard rawDt > 0 else { return }
+        // v4.10.2: the settle scan below reads the shared sim
+        // buffers on the CPU — fence on the previous tick
+        // before touching them (and before encoding this one).
+        waitForSimTick()
         let inputsActive = simSnowBaseRate > 0 || simSnowSinkRate > 0
             || simRaining || weatherFreeze > 0.001
         if !inputsActive && simSettled { simStepsLastFrame = 0; return }
@@ -3642,7 +3714,24 @@ final class Renderer {
                 }
             }
         }
+        // v4.10.2: the tick's outcome joins the weather-step
+        // trail. Round 1–2 established the tick had NO error
+        // reporting at all — a GPU fault in it presented
+        // exactly like Sean's silent crash. Now a completed
+        // tick advances the tag (proving the sim dispatch is
+        // exonerated if a later step dies) and an errored one
+        // names itself.
+        cmd.addCompletedHandler { [weak self] b in
+            let tag: String?
+            if b.status == .error { tag = "tick:gpuError" }
+            else if b.status == .completed { tag = "tick:completed" }
+            else { tag = nil }
+            if let tag {
+                DispatchQueue.main.async { self?.noteWeatherStep(tag) }
+            }
+        }
         enc.endEncoding()
+        lastSimCmd = cmd
         cmd.commit()
     }
 
@@ -3940,16 +4029,39 @@ final class Renderer {
                     // footprints / plow shape the column
                     // (target != pure ceiling).
                     if abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
-                        snowPtr[idx] = tSnow[idx]
+                        // v4.10.2: a non-finite target must
+                        // not be written into the sim either —
+                        // the flow kernel's diffusion would
+                        // spread it to every neighbour.
+                        let tv = tSnow[idx]
+                        snowPtr[idx] = tv.isFinite ? tv : 0
+                        if !tv.isFinite { noteNanClamp() }
                         edited = true
                     }
                 }
                 if edited { simSnowContent = true }
                 for idx in verts.indices where hasS[idx] {
-                    verts[idx].snowH = snowPtr[idx]
-                    verts[idx].topY = supY[idx] + snowPtr[idx]
-                    verts[idx].waterD = waterPtr[idx]
+                    // v4.10.2 (the round-2 NaN fix): THE
+                    // finite-guard between the sim and the
+                    // sheet/AS. Round 1 checked buffer LENGTHS
+                    // here but copied values verbatim; one
+                    // non-finite depth — from a corrupt
+                    // persisted exposure, a singular intruder
+                    // inverse, or a raced buffer — flowed into
+                    // sheet vertices, the finite-difference
+                    // normals, and the AS build, any of which
+                    // can kill the process on device. Replace
+                    // with 0 (and count it) instead.
+                    let sv = snowPtr[idx]
+                    let wv = waterPtr[idx]
+                    let s = sv.isFinite ? sv : 0
+                    let w = wv.isFinite ? wv : 0
+                    if s != sv || w != wv { noteNanClamp() }
+                    verts[idx].snowH = s
+                    verts[idx].topY = supY[idx] + s
+                    verts[idx].waterD = w
                 }
+                flushNanClampCount()
             }
         }
         // (c2) v4.5: PINNED columns + REPOSE RELAXATION.
@@ -4365,11 +4477,19 @@ final class Renderer {
     /// static state WITHOUT waiting. Returns the structure and
     /// its command buffer (both nil for an empty scene, which
     /// needs no build and is immediately swappable).
+    /// v4.10.2: `failed` distinguishes "nothing to build"
+    /// (empty scene / no RT) from "a build was required but
+    /// could not be encoded" (allocation/encoder failure) —
+    /// round 1 returned (nil, nil) for both, and a valid
+    /// structure was silently discarded with the failure.
     private func makeStaticAS(posBuffer: MTLBuffer?, idxBuffer: MTLBuffer?,
                               triCount: Int)
-        -> (structure: MTLAccelerationStructure?, cmd: MTLCommandBuffer?) {
+        -> (structure: MTLAccelerationStructure?, cmd: MTLCommandBuffer?,
+            failed: Bool) {
         guard rayTracingSupported, triCount > 0,
-              let posBuffer, let idxBuffer else { return (nil, nil) }
+              let posBuffer, let idxBuffer else {
+            return (nil, nil, triCount > 0 && rayTracingSupported)
+        }
         let geom = MTLAccelerationStructureTriangleGeometryDescriptor()
         geom.vertexBuffer = posBuffer
         geom.vertexStride = 12
@@ -4384,23 +4504,42 @@ final class Renderer {
         guard let structure = device.makeAccelerationStructure(size: sizes.accelerationStructureSize),
               let scratch = device.makeBuffer(length: sizes.buildScratchBufferSize, options: .storageModePrivate),
               let cmd = queue.makeCommandBuffer(),
-              let enc = cmd.makeAccelerationStructureCommandEncoder() else { return (nil, nil) }
+              let enc = cmd.makeAccelerationStructureCommandEncoder() else { return (nil, nil, true) }
         enc.build(accelerationStructure: structure, descriptor: desc,
                   scratchBuffer: scratch, scratchBufferOffset: 0)
         enc.endEncoding()
         cmd.commit()
-        return (structure, cmd)
+        return (structure, cmd, false)
+    }
+
+    /// v4.10.2 (round-2 Lane-B F1): a staged static build
+    /// whose GPU work failed — encode failure, or a build
+    /// command buffer that ended in .error — must NEVER be
+    /// installed as the live state. Round 1's paths waited for
+    /// completion but never checked the result, and the frame
+    /// path treated only .completed as done: an errored build
+    /// wedged every later swap, and the synchronous flush
+    /// (thumbnails / export / final render) installed the
+    /// never-built AS outright — the next trace then
+    /// intersected a corrupt structure and faulted the
+    /// process. The first sheet build is the largest AS the
+    /// app ever builds, i.e. the one most likely to error.
+    private func staticStageFailed(_ p: PreparedStatic) -> Bool {
+        if p.buildFailed { return true }
+        if let c = p.cmd, c.status == .error { return true }
+        return false
     }
 
     /// Kick the AS build for a staged state and hold it as the
     /// pending build. A frame is owed (the swap happens at a
     /// frame boundary), so presentation is marked dirty.
     private func kickStatic(_ p: inout PreparedStatic) {
-        let (structure, cmd) = makeStaticAS(posBuffer: p.posBuffer,
-                                            idxBuffer: p.idxBuffer,
-                                            triCount: p.triCount)
+        let (structure, cmd, failed) = makeStaticAS(posBuffer: p.posBuffer,
+                                                    idxBuffer: p.idxBuffer,
+                                                    triCount: p.triCount)
         p.accel = structure
         p.cmd = cmd
+        p.buildFailed = failed
         pendingStatic = p
         presentationDirty = true
     }
@@ -4417,11 +4556,20 @@ final class Renderer {
     private func stageStaticBuild(_ prepared: PreparedStatic) {
         var prepared = prepared
         if !staticEverSwapped, pendingStatic == nil, deferredStatic == nil {
-            let (structure, cmd) = makeStaticAS(posBuffer: prepared.posBuffer,
-                                                idxBuffer: prepared.idxBuffer,
-                                                triCount: prepared.triCount)
+            let (structure, cmd, failed) = makeStaticAS(posBuffer: prepared.posBuffer,
+                                                        idxBuffer: prepared.idxBuffer,
+                                                        triCount: prepared.triCount)
             prepared.accel = structure
+            prepared.cmd = cmd
+            prepared.buildFailed = failed
             cmd?.waitUntilCompleted()
+            // v4.10.2: never install a failed first build —
+            // keep the (empty) prior state; a later rebuild
+            // retries through this same branch.
+            if staticStageFailed(prepared) {
+                noteWeatherStep("rebuild:stageError")
+                return
+            }
             swapStatic(prepared)
             return
         }
@@ -4442,6 +4590,15 @@ final class Renderer {
     /// state here, in the same order the old synchronous
     /// rebuild used.
     private func swapStatic(_ p: PreparedStatic) {
+        noteWeatherStep("rebuild:swap")
+        // v4.10.2 note (Lane-B F3): dropping the old AS and
+        // buffers here has no explicit fence — GPU safety
+        // rests on Metal's guarantee that a committed command
+        // buffer retains every resource its encoders
+        // referenced until it completes, plus the fact that
+        // the static buffers are never CPU-written after
+        // creation. Any future CPU write into a static buffer
+        // or CPU-side AS query voids that reliance.
         accel = p.accel
         posBuffer = p.posBuffer
         nrmBuffer = p.nrmBuffer
@@ -4484,13 +4641,27 @@ final class Renderer {
             }
             return
         }
-        let done = pending.cmd == nil || pending.cmd!.status == .completed
+        // v4.10.2: an errored build is FINISHED too — round 1
+        // tested only .completed, so an errored pending build
+        // wedged this check forever and no sheet ever swapped
+        // in. A failed stage is discarded unswapped (the
+        // previous live state keeps presenting) and the
+        // deferred stage, if any, is kicked in its place.
+        let status = pending.cmd?.status
+        let done = pending.cmd == nil || status == .completed || status == .error
         guard done else { return }
         pendingStatic = nil
         if let d = deferredStatic {
             deferredStatic = nil
             var d = d
             kickStatic(&d)
+            if staticStageFailed(pending) {
+                noteWeatherStep("rebuild:stageError")
+            }
+            return
+        }
+        if staticStageFailed(pending) {
+            noteWeatherStep("rebuild:stageError")
             return
         }
         swapStatic(pending)
@@ -4511,6 +4682,23 @@ final class Renderer {
             guard let pending = pendingStatic else { break }
             pending.cmd?.waitUntilCompleted()
             pendingStatic = nil
+            // v4.10.2: waitUntilCompleted returns for an
+            // ERRORED buffer exactly as for a completed one —
+            // round 1 never checked, and this flush (called by
+            // save thumbnails, PNG export, and the final
+            // render) installed the never-built AS, so the
+            // next trace faulted the process. A failed stage
+            // is dropped unswapped; the previous live state is
+            // what the capture renders.
+            if staticStageFailed(pending) {
+                noteWeatherStep("rebuild:stageError")
+                if let d = deferredStatic {
+                    deferredStatic = nil
+                    var d = d
+                    kickStatic(&d)
+                }
+                continue
+            }
             if let d = deferredStatic {
                 deferredStatic = nil
                 var d = d
@@ -6411,31 +6599,40 @@ final class Renderer {
 
     func pick(origin: SIMD3<Float>, dir: SIMD3<Float>) -> UUID? {
         guard cpuIndices.count >= 3 || cpuDynIndices.count >= 3 else { return nil }
+        // v4.10.2 (Lane-B F2): snapshot the CPU mirrors into
+        // locals before looping. They are value types, so the
+        // loops below are immune to a static swap replacing
+        // them mid-pick — same-thread swaps can't interleave,
+        // but the final render drives swaps from a background
+        // queue, and a smaller replacement scene would have
+        // subscripted the loop out of bounds.
+        let indices = cpuIndices, positions = cpuPositions, triObjects = cpuTriObject
+        let dynIndices = cpuDynIndices, dynPositions = cpuDynPositions, dynTriObjects = cpuDynTriObject
         var best: Float = .greatestFiniteMagnitude
         var bestObj: UUID? = nil
-        let triTotal = cpuIndices.count / 3
+        let triTotal = indices.count / 3
         for t in 0..<triTotal {
-            let ia = Int(cpuIndices[3 * t]), ib = Int(cpuIndices[3 * t + 1]), ic = Int(cpuIndices[3 * t + 2])
-            let p0 = SIMD3<Float>(cpuPositions[3 * ia], cpuPositions[3 * ia + 1], cpuPositions[3 * ia + 2])
-            let p1 = SIMD3<Float>(cpuPositions[3 * ib], cpuPositions[3 * ib + 1], cpuPositions[3 * ib + 2])
-            let p2 = SIMD3<Float>(cpuPositions[3 * ic], cpuPositions[3 * ic + 1], cpuPositions[3 * ic + 2])
+            let ia = Int(indices[3 * t]), ib = Int(indices[3 * t + 1]), ic = Int(indices[3 * t + 2])
+            let p0 = SIMD3<Float>(positions[3 * ia], positions[3 * ia + 1], positions[3 * ia + 2])
+            let p1 = SIMD3<Float>(positions[3 * ib], positions[3 * ib + 1], positions[3 * ib + 2])
+            let p2 = SIMD3<Float>(positions[3 * ic], positions[3 * ic + 1], positions[3 * ic + 2])
             if let d = rayTriangle(origin: origin, dir: dir, p0: p0, p1: p1, p2: p2), d < best {
                 best = d
-                bestObj = cpuTriObject[t]
+                bestObj = triObjects[t]
             }
         }
         // v4: dynamic mirrors too — nearest hit overall wins. A
         // dynamic hit with the sentinel id is unpickable: it
         // still occludes (best is set) and returns nil.
-        let dynTotal = cpuDynIndices.count / 3
+        let dynTotal = dynIndices.count / 3
         for t in 0..<dynTotal {
-            let ia = Int(cpuDynIndices[3 * t]), ib = Int(cpuDynIndices[3 * t + 1]), ic = Int(cpuDynIndices[3 * t + 2])
-            let p0 = SIMD3<Float>(cpuDynPositions[3 * ia], cpuDynPositions[3 * ia + 1], cpuDynPositions[3 * ia + 2])
-            let p1 = SIMD3<Float>(cpuDynPositions[3 * ib], cpuDynPositions[3 * ib + 1], cpuDynPositions[3 * ib + 2])
-            let p2 = SIMD3<Float>(cpuDynPositions[3 * ic], cpuDynPositions[3 * ic + 1], cpuDynPositions[3 * ic + 2])
+            let ia = Int(dynIndices[3 * t]), ib = Int(dynIndices[3 * t + 1]), ic = Int(dynIndices[3 * t + 2])
+            let p0 = SIMD3<Float>(dynPositions[3 * ia], dynPositions[3 * ia + 1], dynPositions[3 * ia + 2])
+            let p1 = SIMD3<Float>(dynPositions[3 * ib], dynPositions[3 * ib + 1], dynPositions[3 * ib + 2])
+            let p2 = SIMD3<Float>(dynPositions[3 * ic], dynPositions[3 * ic + 1], dynPositions[3 * ic + 2])
             if let d = rayTriangle(origin: origin, dir: dir, p0: p0, p1: p1, p2: p2), d < best {
                 best = d
-                let oid = cpuDynTriObject[t]
+                let oid = dynTriObjects[t]
                 bestObj = (oid == dynNilObjectSentinel) ? nil : oid
             }
         }
