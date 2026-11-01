@@ -288,6 +288,118 @@ jobs:
         if: always()
         run: cat repro-logs/summary.txt || true
 
+      - name: Gate check (device-idiom launch gate)
+        if: always()
+        env:
+          IPAD_UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          cat > "$RUNNER_TEMP/gate_check.py" <<'PYEOF'
+          import json, os, subprocess, sys
+
+          BUNDLE = "com.user.lumenscene"
+          APP = "build/simdd/Build/Products/Release-iphonesimulator/LumenScene.app"
+          LOGDIR = os.path.join(os.getcwd(), "repro-logs")
+          os.makedirs(LOGDIR, exist_ok=True)
+          lines = []
+
+          def note(s):
+              print(s, flush=True)
+              lines.append(s)
+
+          def launch_capture(udid, seconds=45):
+              # Plain launch (no -LSRepro): the app stays alive
+              # (home screen or gate notice) until the timeout
+              # ends the console attach — expected in both arms.
+              try:
+                  out = subprocess.run(
+                      ["xcrun", "simctl", "launch", "--console", udid, BUNDLE],
+                      capture_output=True, text=True, timeout=seconds)
+                  return (out.stdout or "") + (out.stderr or "")
+              except subprocess.TimeoutExpired as e:
+                  def dec(v):
+                      return v.decode(errors="replace") if isinstance(v, bytes) else (v or "")
+                  return dec(e.stdout) + dec(e.stderr)
+              finally:
+                  subprocess.run(["xcrun", "simctl", "terminate", udid, BUNDLE],
+                                 capture_output=True)
+
+          def pick_iphone():
+              data = json.loads(subprocess.run(
+                  ["xcrun", "simctl", "list", "devices", "available", "--json"],
+                  capture_output=True, text=True, check=True).stdout)["devices"]
+              def runtime_key(k):
+                  try:
+                      tail = k.rsplit("iOS-", 1)[1]
+                      return tuple(int(p) for p in tail.split("-"))
+                  except Exception:
+                      return (0,)
+              for runtime in sorted(data, key=runtime_key, reverse=True):
+                  for d in data[runtime]:
+                      if d.get("isAvailable", True) and d["name"].startswith("iPhone"):
+                          return d["udid"], d["name"]
+              return None, None
+
+          udid, name = pick_iphone()
+          if not udid:
+              # Fallback: create one from an iPhone device type
+              # on the newest available iOS runtime.
+              try:
+                  types = json.loads(subprocess.run(
+                      ["xcrun", "simctl", "list", "devicetypes", "--json"],
+                      capture_output=True, text=True, check=True).stdout)["devicetypes"]
+                  iphone_types = [t for t in types if t["name"].startswith("iPhone")]
+                  runtimes = json.loads(subprocess.run(
+                      ["xcrun", "simctl", "list", "runtimes", "--json"],
+                      capture_output=True, text=True, check=True).stdout)["runtimes"]
+                  ios_rts = [r for r in runtimes if r.get("isAvailable", True)
+                             and "iOS" in r["name"]]
+                  if iphone_types and ios_rts:
+                      rt = sorted(ios_rts, key=lambda r: r["name"])[-1]
+                      r = subprocess.run(
+                          ["xcrun", "simctl", "create", "GateCheck iPhone",
+                           iphone_types[-1]["identifier"], rt["identifier"]],
+                          capture_output=True, text=True)
+                      if r.returncode == 0 and r.stdout.strip():
+                          udid = r.stdout.strip()
+                          name = "GateCheck iPhone (created)"
+              except Exception as e:
+                  note(f"GATE-CHECK iPhone creation error: {e}")
+          if not udid:
+              note("GATE-CHECK SKIPPED: no iPhone simulator available or creatable on this runner")
+              with open(os.path.join(LOGDIR, "gate-check.txt"), "w") as f:
+                  f.write("\n".join(lines) + "\n")
+              sys.exit(0)
+
+          note(f"GATE-CHECK iPhone device: {name} ({udid})")
+          subprocess.run(["xcrun", "simctl", "boot", udid], capture_output=True)
+          subprocess.run(["xcrun", "simctl", "bootstatus", udid, "-b"],
+                         capture_output=True, timeout=600)
+          subprocess.run(["xcrun", "simctl", "install", udid, APP],
+                         capture_output=True)
+          out = launch_capture(udid)
+          with open(os.path.join(LOGDIR, "gate-iphone.log"), "w") as f:
+              f.write(out)
+          phone_ok = "GATE-MARKER ipad-required" in out
+          note("GATE-CHECK iphone: marker "
+               + ("FOUND - notice shown (expected)" if phone_ok else "MISSING"))
+
+          ipad = os.environ.get("IPAD_UDID", "")
+          ipad_ok = None
+          if ipad:
+              out2 = launch_capture(ipad)
+              with open(os.path.join(LOGDIR, "gate-ipad.log"), "w") as f:
+                  f.write(out2)
+              ipad_ok = "GATE-MARKER ipad-required" not in out2
+              note("GATE-CHECK ipad: marker "
+                   + ("absent - app proceeded (expected)" if ipad_ok
+                      else "PRESENT - gate wrongly engaged on iPad"))
+          with open(os.path.join(LOGDIR, "gate-check.txt"), "w") as f:
+              f.write("\n".join(lines) + "\n")
+          if not phone_ok or ipad_ok is False:
+              sys.exit(1)
+          PYEOF
+          python3 "$RUNNER_TEMP/gate_check.py"
+
       - name: Upload repro logs
         if: always()
         uses: actions/upload-artifact@v4

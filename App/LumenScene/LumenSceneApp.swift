@@ -2,6 +2,7 @@
 // project home screen and the full-screen editor.
 
 import SwiftUI
+import UIKit
 
 @main
 struct LumenSceneApp: App {
@@ -13,7 +14,57 @@ struct LumenSceneApp: App {
 
     var body: some SwiftUI.Scene {
         WindowGroup {
-            RootView()
+            // Device gate (Sean, 2026-11-01): LumenScene is an
+            // iPad app. On an iPhone it stops here, at a clear
+            // notice, before any editor UI exists. On an iPad
+            // this is exactly the pre-gate root, untouched —
+            // the gate sits in front of the idle-freeze and
+            // final-render paths without intersecting them.
+            if DeviceGate.isPhone {
+                IPadRequiredView()
+            } else {
+                RootView()
+            }
+        }
+    }
+}
+
+/// The launch device check: true only on an iPhone-idiom
+/// device. The repro driver is unaffected — it bootstraps in
+/// `init` and its rig runs on iPad-idiom simulators, where
+/// this is always false.
+enum DeviceGate {
+    static var isPhone: Bool {
+        UIDevice.current.userInterfaceIdiom == .phone
+    }
+}
+
+/// The full-screen notice shown on iPhones instead of the
+/// app. Headline is Sean's wording; one plain supporting
+/// line; high contrast, no clutter.
+struct IPadRequiredView: View {
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "ipad")
+                .font(.system(size: 64))
+            Text("You need an iPad for this to work")
+                .font(.title)
+                .fontWeight(.semibold)
+                .multilineTextAlignment(.center)
+            Text("LumenScene is designed for the iPad's larger screen.")
+                .font(.body)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .preferredColorScheme(.dark)
+        .onAppear {
+            // Proof marker for the simulator gate check in
+            // repro.yml (one line at launch; the iPad path
+            // never prints it).
+            print("GATE-MARKER ipad-required idiom=phone")
+            NSLog("GATE-MARKER ipad-required idiom=phone")
         }
     }
 }
