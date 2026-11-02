@@ -487,15 +487,14 @@ final class ReproRun {
             && riserLate.allSatisfy { abs($0.y - 2.0) <= 0.01 }
         check("riser", rose && riserRestOK,
               "rose=\(rose) finalY=\(gravAuxSamples.last?.y ?? -1)")
-            // Tick-alive witness: the ceiling box must have
-            // been hidden by the 4 s Delay branch — if the
-            // runtime stopped ticking after the 2.5 s hide, it
-            // is still visible.
-            if let ceil = session.project.scene.objects
-                .first(where: { $0.name == "Repro ceiling box" }) {
-                check("tickwitness", !session.runtimeIsObjectVisible(ceil.id),
-                      "ceiling visible at end=\(session.runtimeIsObjectVisible(ceil.id))")
-            }
+        // Tick-alive witness: the ceiling box must have been
+        // hidden by the 4 s Delay branch — if the runtime
+        // stopped ticking after the 2.5 s hide, it is still
+        // visible at the end of the run.
+        if let ceil = session.project.scene.objects
+            .first(where: { $0.name == "Repro ceiling box" }) {
+            check("tickwitness", !session.runtimeIsObjectVisible(ceil.id),
+                  "ceiling visible at end=\(session.runtimeIsObjectVisible(ceil.id))")
         }
     }
 
