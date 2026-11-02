@@ -1789,6 +1789,8 @@ struct SimParams {
     float reposeTan;  // v4.11: tan(angle of repose) at the current temperature
     float freshRho;   // v4.11: fresh-snow density at the current temperature
     float snowTemp;   // v4.11: air temperature (C); >= 100 = unset (legacy)
+    float gateUniform;// v4.11: the user's Max Depth (uniform, NOT
+                      // drift-factored): the gate-compaction threshold
 };
 
 kernel void simSourceSinkKernel(
@@ -2109,13 +2111,17 @@ kernel void snowSourcesKernel(
         float k = 0.0001f * (0.3f + m / 0.5f);
         rho += (1.0f - rho) * (1.0f - exp(-k * sp.dt));
     }
-    // Gate compaction: snow sitting ABOVE its deposition gate
-    // (the Max Depth control was lowered) densifies — depth
-    // falls at constant mass. Mass is never deleted here;
-    // v4.7's delete-to-ceiling is deliberately gone (see the
-    // design record).
+    // Gate compaction: snow sitting ABOVE the user's Max
+    // Depth (the uniform cap, NOT the drift-factored
+    // deposition gate — a displaced pile in a low-drift spot
+    // must not silently densify away; the drift field shapes
+    // where snowfall may accumulate, never how fast placed
+    // snow vanishes) densifies — depth falls at constant
+    // mass. Mass is never deleted here; v4.7's
+    // delete-to-ceiling is deliberately gone (see the design
+    // record).
     depth = m / max(rho, 0.05f);
-    if (depth > gate) {
+    if (depth > sp.gateUniform) {
         rho += (1.0f - rho) * (1.0f - exp(-0.02f * sp.dt));
     }
     // Intruder compaction: snow under an object is pressed

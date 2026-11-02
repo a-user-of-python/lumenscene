@@ -97,6 +97,7 @@ struct SimParams {
     var reposeTan: Float = 0
     var freshRho: Float = 0.4
     var snowTemp: Float = 999
+    var gateUniform: Float = 1e9
 }
 
 struct ReprojUniforms {
@@ -806,6 +807,10 @@ final class Renderer {
     /// drives the snow model's repose angle, fresh density
     /// and wet mobility (see the design record).
     var simTemperature: Float? = nil
+    /// v4.11: the project's Max Snow Depth (uniform cap) — the
+    /// gate-compaction threshold. Fed by the session with the
+    /// temperature; 1e9 = unset (compaction off).
+    var snowMaxDepth: Float = 1e9
     var simLastTick: CFTimeInterval = 0
     /// v4.10.2: the last committed sim-tick command buffer.
     /// The tick is fire-and-forget; this handle lets CPU
@@ -3444,6 +3449,40 @@ final class Renderer {
         for i in 0..<n { ptr[i] = values[i] }
     }
 
+    /// Host-masked bilinear sample: like simSampleBilinear but
+    /// only taps whose OLD host equals `want` contribute
+    /// (weights renormalised; nil when no tap matches). Used
+    /// for snow that rides a MOVING host — the unmasked sample
+    /// at the host-motion offset also reads whatever other
+    /// host's snow lies at that world position (the deep
+    /// ground field ahead of a dragged box), importing foreign
+    /// mass on every rebuild (in-app DRAG audit: +0.5% over
+    /// one drag).
+    private func simSampleBilinearMasked(_ field: [Float], hosts: [UUID?],
+                                         want: UUID?, ox: Float, oz: Float,
+                                         cs: Float, vx: Int, vz: Int,
+                                         x: Float, z: Float) -> Float? {
+        guard vx > 1, vz > 1, field.count == vx * vz,
+              hosts.count == vx * vz else { return nil }
+        let fx = (x - ox) / cs, fz = (z - oz) / cs
+        guard fx >= 0, fz >= 0, fx <= Float(vx - 1), fz <= Float(vz - 1) else { return nil }
+        let ix = min(Int(fx), vx - 2), iz = min(Int(fz), vz - 2)
+        let tx = fx - Float(ix), tz = fz - Float(iz)
+        let taps: [(Int, Float)] = [
+            (iz * vx + ix, (1 - tx) * (1 - tz)),
+            (iz * vx + ix + 1, tx * (1 - tz)),
+            ((iz + 1) * vx + ix, (1 - tx) * tz),
+            ((iz + 1) * vx + ix + 1, tx * tz),
+        ]
+        var wsum: Float = 0, acc: Float = 0
+        for (idx, w) in taps where hosts[idx] == want {
+            wsum += w
+            acc += field[idx] * w
+        }
+        guard wsum > 0.25 else { return nil }
+        return acc / wsum
+    }
+
     /// Bilinear sample of a previous lattice field at world XZ
     /// (0 outside). Used by the object-move remap.
     private func simSampleBilinear(_ field: [Float], ox: Float, oz: Float,
@@ -3761,23 +3800,33 @@ final class Renderer {
                         && i < oldHosts.count && oldHosts[i] != hostIDs[i] {
                         sx = x; sz = z
                     }
-                    if let v = simSampleBilinear(oldMass, ox: oldOX, oz: oldOZ, cs: oldCS,
-                                                 vx: oldVX, vz: oldVZ, x: sx, z: sz) {
+                    // Snow riding a MOVING host samples through
+                    // the host mask (its own host's old snow
+                    // only); everything else samples plainly.
+                    let hostMoved = (sx != x || sz != z)
+                    func sampleField(_ f: [Float]) -> Float? {
+                        if hostMoved {
+                            return simSampleBilinearMasked(
+                                f, hosts: oldHosts, want: hostIDs[i],
+                                ox: oldOX, oz: oldOZ, cs: oldCS,
+                                vx: oldVX, vz: oldVZ, x: sx, z: sz)
+                        }
+                        return simSampleBilinear(f, ox: oldOX, oz: oldOZ, cs: oldCS,
+                                                 vx: oldVX, vz: oldVZ, x: sx, z: sz)
+                    }
+                    if let v = sampleField(oldMass) {
                         mass[i] = v
-                        if let r = simSampleBilinear(oldRho, ox: oldOX, oz: oldOZ, cs: oldCS,
-                                                     vx: oldVX, vz: oldVZ, x: sx, z: sz) {
+                        if let r = sampleField(oldRho) {
                             rhoA[i] = min(max(r, 0.05), 1)
                         }
-                        if let a = simSampleBilinear(oldAge, ox: oldOX, oz: oldOZ, cs: oldCS,
-                                                     vx: oldVX, vz: oldVZ, x: sx, z: sz) {
+                        if let a = sampleField(oldAge) {
                             ageA[i] = a
                         }
                     } else {
                         let ic = initMass(targetSnow[i])
                         mass[i] = ic.m; rhoA[i] = ic.rho; ageA[i] = ic.age
                     }
-                    if let v = simSampleBilinear(oldWater, ox: oldOX, oz: oldOZ, cs: oldCS,
-                                                 vx: oldVX, vz: oldVZ, x: sx, z: sz) {
+                    if let v = sampleField(oldWater) {
                         water[i] = v
                     }
                 }
@@ -4220,6 +4269,7 @@ final class Renderer {
                                 * Float.pi / 180)
         params.freshRho = Renderer.snowFreshRho(temp: simTemperature)
         params.snowTemp = simTemperature ?? 999
+        params.gateUniform = snowMaxDepth
         noteWeatherStep("tick:dispatch")
         let threads = MTLSize(width: simVX * simVZ, height: 1, depth: 1)
         func bindSim(_ e: MTLComputeCommandEncoder) {

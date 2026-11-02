@@ -2721,6 +2721,7 @@ final class EditorSession: ObservableObject {
             // v4.11: the snow physics reads the temperature
             // directly (repose / fresh density / wet mobility).
             renderer.simTemperature = temp.map { Float($0) }
+            renderer.snowMaxDepth = Float(project.scene.weather.maxDepth)
         }
         // v4.7: renderer sees the EFFECTIVE mode (phase layer
         // recomputed here for the every-frame writes; when
