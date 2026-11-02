@@ -41,7 +41,6 @@ final class FooterDisplay: ObservableObject {
     /// objectWillChange, so a footer observing this object
     /// re-evaluates only when a displayed line really changes.
     func update(hint: String, weather: String?, diag: String? = nil) {
-                temperature: String?, diag: String? = nil) {
         if hintText != hint { hintText = hint }
         if weatherText != weather { weatherText = weather }
         if diagText != diag { diagText = diag }
