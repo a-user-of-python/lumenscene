@@ -200,7 +200,7 @@ enum ReproDriver {
             p.scene.objects.append(big)
             for i in 0..<6 {
                 var b = SceneObject.primitive("box", name: "Repro bench box \(i)")
-                b.transform.position = [Float(-7 + i * 3), 0.5, Float((i % 2) * 6 - 3)]
+                b.transform.position = [Double(-7 + i * 3), 0.5, Double((i % 2) * 6 - 3)]
                 p.scene.objects.append(b)
             }
         case "scaled":
@@ -762,13 +762,13 @@ final class ReproRun {
         case 2:
             let renderer = session.renderer
             if !perfEditInFlight {
-                let boxes = session.project.objects.indices.filter {
-                    session.project.objects[$0].primitiveKind == "box"
+                let boxes = session.project.scene.objects.indices.filter {
+                    session.project.scene.objects[$0].primitiveKind == "box"
                 }
                 guard perfEditsDone < 6, !boxes.isEmpty else { perfPhase = 3; return }
                 let idx = boxes[perfEditsDone % boxes.count]
-                session.project.objects[idx].position.x += 0.5
-                renderer.scheduleRebuild(geometry: true)
+                session.project.scene.objects[idx].transform.position[0] += 0.5
+                session.scheduleRebuild(geometry: true)
                 perfEditStart = CACurrentMediaTime()
                 perfEditInFlight = true
             } else if renderer.weatherStep == "rebuild:swap"
@@ -789,7 +789,7 @@ final class ReproRun {
             let loaded = ProjectStore.loadProject(id: project.id)
             check("saveload", loaded?.scene.weather.mode == 1,
                   "mode=\(String(describing: loaded?.scene.weather.mode))")
-            session.renderer.printTickMetric()
+            printTickMetric()
             finishSnow()
         }
     }
