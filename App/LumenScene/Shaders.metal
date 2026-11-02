@@ -305,6 +305,76 @@ static float4 samplePBR(texture2d_array<float> mainTex,
                   : mainTex.sample(smp, uv, slice, level(0.0f));
 }
 
+// MARK: - Shader snow accumulation (v4.12: one shared factor)
+//
+// Snow ON OBJECTS is a material layer, never geometry — the
+// standard games gate: cover grows with the drifted depth and
+// with how UP-FACING the surface is, so a vertical face
+// (geoN.y = 0) accumulates EXACTLY zero by construction, flat
+// tops the most, steep roofs little. Factored into one
+// function so the trace kernel, the guide kernel and the
+// v4.12 gate audit (snowGateAuditKernel) all evaluate the
+// identical math.
+static float snowUpFace(float ny) {
+    return smoothstep(0.5f, 0.85f, ny);
+}
+static float snowAccumFactor(float3 geoN, float snowLevel, float drift) {
+    float depth = snowLevel * mix(0.3f, 1.7f, drift);
+    return smoothstep(0.45f, 0.75f, depth) * snowUpFace(geoN.y);
+}
+// v4.12 (RDR2): caked-snow breakup. The gate above decides
+// WHERE snow can sit; this multiplier decides how it LOOKS
+// there — a patchy, noise-broken coating (broad lumps at
+// ~0.4 m, grain at ~9 cm) instead of uniform white paint.
+// It only ever MULTIPLIES the gated cover, so the gate's
+// guarantee survives untouched: a vertical face's cover is
+// 0 x anything = exactly 0.
+static float snowCakeBreakup(float3 p) {
+    float n = 0.65f * wnoise2(p.xz * 2.6f)
+            + 0.35f * wnoise2(p.xz * 11.0f);
+    return mix(0.25f, 1.10f, smoothstep(0.25f, 0.80f, n));
+}
+// v4.12 (RDR2): two-scale world-anchored micro normal detail
+// for snow surfaces — keeps troughs and tracks reading at
+// glancing angles (where the 0.20 m lattice normals alone go
+// flat) and gives the snow gloss its sparkle facets. The tilt
+// is applied in world XZ and scaled by n.y, valid because
+// snow lives on up-facing surfaces.
+static float3 snowDetailNormal(float3 p, float3 n, float amp) {
+    float e = 0.06f;
+    float b0 = wnoise2(p.xz * 6.0f);
+    float bx = wnoise2((p.xz + float2(e, 0.0f)) * 6.0f);
+    float bz = wnoise2((p.xz + float2(0.0f, e)) * 6.0f);
+    float f0 = wnoise2(p.xz * 45.0f);
+    float fx = wnoise2((p.xz + float2(e, 0.0f)) * 45.0f);
+    float fz = wnoise2((p.xz + float2(0.0f, e)) * 45.0f);
+    float2 g = float2((bx - b0) + 2.2f * (fx - f0),
+                      (bz - b0) + 2.2f * (fz - f0)) / e;
+    float3 tilted = n + float3(-g.x, 0.0f, -g.y) * amp * clamp(n.y, 0.0f, 1.0f);
+    return normalize(tilted);
+}
+// v4.12 (RDR2): the glint stage — RDR2's signature sparkle.
+// Sparse world-anchored micro-facets (~4 mm cells, ~0.35% of
+// the surface) flash when their random facet normal reflects
+// the sky toward the camera. Static in world space: stills
+// keep their specks, camera motion makes them twinkle.
+static float snowGlint(float3 p, float3 viewDir, float3 n) {
+    float3 cell = floor(p * 260.0f);
+    uint h = hash32(uint(int(cell.x)) * 1973u
+                  ^ uint(int(cell.y)) * 9277u
+                  ^ uint(int(cell.z)) * 26699u);
+    float hf = float(h >> 8) * (1.0f / 16777216.0f);
+    if (hf < 0.9965f) return 0.0f;
+    float3 rv = float3(
+        float(hash32(h ^ 0x9E3779B9u) >> 8) * (1.0f / 16777216.0f),
+        float(hash32(h ^ 0x85EBCA6Bu) >> 8) * (1.0f / 16777216.0f),
+        float(hash32(h ^ 0xC2B2AE35u) >> 8) * (1.0f / 16777216.0f));
+    float3 fn = normalize(n + 0.85f * (rv - 0.5f));
+    float3 r = reflect(viewDir, fn);
+    float sky = clamp(r.y, 0.0f, 1.0f);
+    return (hf - 0.9965f) / 0.0035f * sky * sky * 1.2f;
+}
+
 kernel void pathTraceKernel(
     texture2d<float, access::read_write> accum [[texture(0)]],
     texture2d_array<float> texAlbedo [[texture(1)]],
@@ -543,7 +613,7 @@ kernel void pathTraceKernel(
         // Wetness darkens up-facing surfaces and raises their
         // gloss; snow whitens them, kills the gloss, and pulls
         // the shading normal toward the geometric up-face.
-        float upFace = smoothstep(0.5f, 0.85f, geoN.y);
+        float upFace = snowUpFace(geoN.y);
         float wet = u.wetLevel * upFace;
         float snowGlobal = u.snowLevel * upFace;
         float gloss = (mat.texIndex > 0) ? clamp(1.0f - texRough, 0.0f, 1.0f) : 0.0f;
@@ -670,7 +740,7 @@ kernel void pathTraceKernel(
             // drifted depth is enough.
             drift = wfield.b;
             depth = u.snowLevel * mix(0.3f, 1.7f, drift);
-            snowCover = smoothstep(0.45f, 0.75f, depth) * upFace;
+            snowCover = snowAccumFactor(geoN, u.snowLevel, drift);
         }
         if (!isSheet && !isSnow) {
         // 1. Wet: darkened, glossier.
@@ -716,10 +786,20 @@ kernel void pathTraceKernel(
             float snowScale = as_type<float>(mat.pad.x);
             snowCover *= snowScale;
         }
+        // v4.12 (RDR2): caked-snow breakup — patchy coating,
+        // not uniform paint (a multiplier on the gated cover;
+        // vertical faces stay exactly 0).
+        if (snowCover > 0.001f) {
+            snowCover *= snowCakeBreakup(hitPos);
+        }
         if (snowCover > 0.001f) {
             albedo = mix(albedo, float3(0.88f, 0.91f, 0.97f), snowCover * 0.92f);
             albedo *= 1.0f - 0.18f * snowCover * (1.0f - drift);
-            gloss *= (1.0f - snowCover);
+            // v4.12: snow keeps a modest sheen (0.30 at full
+            // cover) instead of a dead gloss kill — the glint
+            // stage needs a specular component to flash.
+            gloss = gloss * (1.0f - snowCover)
+                  + 0.30f * snowCover * snowCover;
             bool relief = false;
             if (bounce <= 1u && geoN.y > 0.7f) {
                 // Drift gradient from the baked field (v3.3):
@@ -743,6 +823,11 @@ kernel void pathTraceKernel(
             if (!relief) {
                 shadingN = normalize(mix(shadingN, geoN, snowCover * 0.6f));
             }
+            // v4.12 (RDR2): micro-detail normals + the glint
+            // stage on object snow too, scaled by the cover.
+            shadingN = snowDetailNormal(hitPos, shadingN, 0.05f * snowCover);
+            albedo += float3(0.92f, 0.95f, 1.0f)
+                    * snowGlint(hitPos, ray.direction, shadingN) * snowCover;
         }
         } // !isSheet && !isSnow — weather steps 1-3 skipped for water and snow sheets
         if (isSheet) {
@@ -757,6 +842,18 @@ kernel void pathTraceKernel(
                 float3 iceCol = float3(0.55f, 0.65f, 0.75f);
                 albedo = mix(albedo, iceCol, clamp(u.freezeFrac, 0.0f, 1.0f) * 0.92f);
             }
+        }
+        if (isSnow) {
+            // v4.12 (RDR2): the snow sheet's material stage —
+            // micro-detail normals (troughs and tracks keep
+            // reading at glancing angles, where the 0.20 m
+            // lattice normals alone flatten out), a modest
+            // sheen gloss, and the glint stage: sparse
+            // world-anchored sparkle facets, RDR2's signature.
+            gloss = 0.30f;
+            shadingN = snowDetailNormal(hitPos, shadingN, 0.05f);
+            albedo += float3(0.92f, 0.95f, 1.0f)
+                    * snowGlint(hitPos, ray.direction, shadingN);
         }
 
         // ---- Glass: reflect / refract with Fresnel. Past the
@@ -1106,7 +1203,7 @@ kernel void guideKernel(
         // INSIDE the smoothstep with no drift.)
         float3 geoN = normalize(cross(p1 - p0, p2 - p0));
         if (dot(geoN, nInterp) < 0.0f) geoN = -geoN;
-        float upFace = smoothstep(0.5f, 0.85f, geoN.y);
+        float upFace = snowUpFace(geoN.y);
         float puddle = 0.0f;
         float snowCover = u.snowLevel * upFace; // trace default (no field)
         if (u.wetLevel > 0.001f || u.snowLevel > 0.001f) {
@@ -1149,9 +1246,7 @@ kernel void guideKernel(
                    * fieldFade * smoothstep(0.03f, 0.15f, u.wetLevel);
             glossEff = max(glossEff, puddle); // mirror puddle => restart
             // Snow (trace step 3): drifted depth -> cover.
-            float drift = wfield.b;
-            float depth = u.snowLevel * mix(0.3f, 1.7f, drift);
-            snowCover = smoothstep(0.45f, 0.75f, depth) * upFace;
+            snowCover = snowAccumFactor(geoN, u.snowLevel, wfield.b);
             snowCover *= (1.0f - puddle); // no snow inside puddles
         }
         // v4.3: per-object snow exposure, mirroring the trace
@@ -1163,8 +1258,13 @@ kernel void guideKernel(
             float snowScale = as_type<float>(mat.pad.x);
             snowCover *= snowScale;
         }
-        // Snow cover kills the gloss again in the trace kernel.
-        glossEff *= 1.0f - snowCover;
+        // v4.12 (RDR2): caked-snow breakup, mirroring the
+        // trace kernel (a multiplier on the gated cover).
+        snowCover *= snowCakeBreakup(hitPos);
+        // Snow sheen in the trace kernel: gloss falls with
+        // cover but keeps the 0.30 snow term (mirrored).
+        glossEff = glossEff * (1.0f - snowCover)
+                 + 0.30f * snowCover * snowCover;
         float cosV = clamp(dot(-ray.direction, nInterp), 0.15f, 1.0f);
         float fres = 0.04f + 0.96f * pow(1.0f - cosV, 5.0f);
         if (glossEff >= 0.92f
@@ -1697,7 +1797,7 @@ fragment float4 lineFragment(LineOut in [[stage_in]]) {
     return in.color;
 }
 
-// MARK: - Weather simulation (v4.8 water / v4.11 snow physics)
+// MARK: - Weather simulation (v4.8 water / v4.12 snow)
 //
 // WATER is the v4.8 system, unchanged: depths live in a
 // persistent per-lattice-vertex buffer (waterDepth) stepped by
@@ -1707,68 +1807,32 @@ fragment float4 lineFragment(LineOut in [[stage_in]]) {
 // confined, no climbing — is exactly that system's, and the
 // v4.8 audit still covers it.
 //
-// SNOW was rebuilt in v4.11 as a physically-based granular
-// height-field simulation (Sean, 2026-11-01: "Snow is now a
-// simulation... affected by physics and gravity... very very
-// very accurate to how real snow works"; the v4.2-v4.10.4
-// rule-stack — closed-form ceilings as shapes, exposure clocks,
-// the plow layer, drag caps, relaxation patches — is RETIRED).
-// The model (design record + Python mirror proof in the goal
-// record, hidden_files/v411-snow-audit.py — PILE / SETTLE /
-// DRAG / SPAWN / ROOF / LONGRUN all pass there, and the old
-// kernel rules fail the same SETTLE field at 79.7 deg):
-//
-//   State per lattice column: MASS m (SWE metres), DENSITY
-//   rho in [~0.35, 1.0], sinter AGE. Depth h = m / rho is
-//   DERIVED (snowWritebackKernel refreshes the snowDepth
-//   buffer the skin and water read). Per substep (1/30 s):
-//     1. snowSourcesKernel — deposition as an input FLUX
-//        (base rate x drift factor x fresh density, softly
-//        gated by the per-vertex gate = the old ceiling value
-//        demoted to an input gate), melt as mass removal at
-//        the session sink rate, overburden + gate + intruder
-//        compaction, footprint press events (CPU-stamped),
-//        ageing. This is the ONLY place snow mass is created
-//        or destroyed (plus the sync-time initial condition).
-//     2. snowFluxKernel — gravity flux: pairwise transfers
-//        over the snow SURFACE (support + depth) across ALL
-//        EIGHT neighbours (diagonals included: axial-only
-//        constraints let corner gradients reach sqrt(2) x
-//        repose — measured 43.7 deg at box corners in the
-//        mirror). ONE synchronous (Jacobi) sweep per substep:
-//        snowSnapKernel first copies the mass, and every
-//        transfer is decided from that snapshot — chained
-//        sweeps ratcheted piles below repose over minutes
-//        (mirror PILE-LONG). transfer = 0.25 x mobility x
-//        excess over the repose plane, the giver's total
-//        outflow scaled to never exceed its snapshot mass
-//        (the limiter makes conservation exact — without it
-//        parallel giving at support steps CREATED mass in
-//        the mirror).
-//        Mobility falls with density and sinter age; the
-//        repose angle is temperature-driven (34 deg cold to
-//        38 deg at 0 C, + up to 4 deg of sinter bonus). No
-//        diffusion term. Support steps are NOT skipped: snow
-//        sheds off edges and wall-adjacent fins relax, which
-//        is the v4.10.4 device failure this replaces.
-//     3. snowDisplaceCountKernel + snowDisplaceApplyKernel —
-//        objects as volume boundaries: the CPU rasterises the
-//        live intruder set into occupancy buffers every tick;
-//        intruded columns vacate a rate-limited fraction of
-//        their overlap mass each substep (compaction absorbs
-//        first, in step 1), distributed to non-intruded
-//        neighbours lowest-surface-first. Berms and trenches
-//        EMERGE from this + flux; nothing is recorded.
-//   simSourceSinkKernel's snow half is gated OFF by
-//   sp.snowMode == 1 (the v4.11 path); it still runs water.
+// SNOW is the v4.12 GAMES MODEL (Sean, 2026-11-02: "Do what
+// games typically do"): authored depth + carve-only local
+// deformation + shader accumulation — the stack games actually
+// ship (Arkham Origins -> Rise of the Tomb Raider -> God of
+// War / RDR2). It replaces v4.11's granular mass-transport sim,
+// whose support-switch transfer piled a smooth ramp up a box's
+// vertical face on device: snow is never transported sideways,
+// so no bank can ever form. The model (snowFieldKernel +
+// snowRenderKernel, below): per GROUND vertex, field (authored
+// depth — a value, not mass) and carve (compression below the
+// field); rendered = clamp(field − carve + rim, 0,
+// field + 0.10), the rim being the one permitted raise
+// (≤ 0.10 m lip at a depression's edge). The lattice covers
+// ground supports only; snow on objects is the shader layer
+// (snowAccumFactor), which is exactly zero on vertical faces
+// by construction.
+//   simSourceSinkKernel's snow half stays gated OFF by
+//   sp.snowMode == 1 (kept set); it still runs water.
 //   simFlowKernel now runs kind==1 (water) only.
 //   simApplyEditsKernel is dead (kept compiled; no dispatch).
 //
-// The closed-form height function survives ONLY as (a) the
-// per-vertex deposition GATE + drift-rate field (inputs), and
-// (b) the load-time initial condition (converted to mass via
-// a density profile at sync). The rendered sheet is a skin
-// over this state, as before.
+// The closed-form height function survives as (a) the
+// per-vertex authored ceiling + drift-rate field (inputs to
+// the field's growth), and (b) the load-time initial
+// condition. The rendered sheet is a skin over this state,
+// clipped at object footprints (see Renderer.appendSnowSheet).
 
 struct SimParams {
     uint vx;          // lattice vertices per row
@@ -1784,13 +1848,13 @@ struct SimParams {
     float freezeFrac; // 0..1; water flow scales by (1 - freezeFrac)
     float snowBase;   // v4.8: live snow base rate (m/s at drift factor 1)
     float waterBase;  // v4.8: live water fill scale (surge x rate scale)
-    uint snowMode;    // v4.11: 1 = snow owned by the physics kernels
+    uint snowMode;    // 1 = snow owned by the snow kernels
                       // (source/sink skips its snow half; flow runs water only)
-    float reposeTan;  // v4.11: tan(angle of repose) at the current temperature
-    float freshRho;   // v4.11: fresh-snow density at the current temperature
-    float snowTemp;   // v4.11: air temperature (C); >= 100 = unset (legacy)
-    float gateUniform;// v4.11: the user's Max Depth (uniform, NOT
-                      // drift-factored): the gate-compaction threshold
+    float reposeTan;  // v4.12: legacy — set but unused (kept for struct stability)
+    float freshRho;   // v4.12: legacy — set but unused
+    float snowTemp;   // air temperature (C); >= 100 = unset (legacy).
+                      // v4.12: flavours the carve refill time constant.
+    float gateUniform;// v4.12: legacy — set but unused
 };
 
 kernel void simSourceSinkKernel(
@@ -1808,15 +1872,15 @@ kernel void simSourceSinkKernel(
     uint count = sp.vx * sp.vz;
     if (idx >= count) return;
     if (hasSupport[idx] == 0u) {
-        // v4.11: in snowMode the snow depth buffer is owned by
-        // snowWritebackKernel (it zeroes unsupported columns
+        // In snowMode the snow depth buffer is owned by
+        // snowRenderKernel (it zeroes non-ground columns
         // itself); only water is still this kernel's to clear.
         if (sp.snowMode == 0u) { snowDepth[idx] = 0.0f; }
         waterDepth[idx] = 0.0f;
         return;
     }
-    // Snow (LEGACY path only — v4.11 sets snowMode == 1 and
-    // snowSourcesKernel owns snow): deposit toward the ceiling
+    // Snow (LEGACY path only — snowMode == 1 is always set and
+    // snowFieldKernel owns snow): deposit toward the ceiling
     // at the drift rate; above the ceiling compact toward it;
     // uniform sinks (temperature melt / legacy terms).
     if (sp.snowMode == 0u) {
@@ -2011,398 +2075,153 @@ kernel void simApplyEditsKernel(
     snowDepth[v] = max(0.0f, snowDepth[v] + editDelta[idx]);
 }
 
-// MARK: - v4.11 snow physics kernels
+// MARK: - v4.12 snow: authored field + carve-only deformation
 //
-// Constants below are ported verbatim from the Python mirror
-// (hidden_files/v411-snow-audit.py), where PILE / SETTLE /
-// DRAG / SPAWN / ROOF / LONGRUN pass with them. Do not retune
-// one side without the other.
+// The games model (Batman: Arkham Origins -> Rise of the Tomb
+// Raider -> God of War / RDR2), replacing v4.11's granular
+// mass-transport sim (retired 2026-11-02: on device, its
+// support-switch transfer piled a smooth ramp up a box's
+// vertical face — games never transport snow sideways at all).
+// Per ground vertex the whole model is two floats of state:
+//
+//   field = the AUTHORED snow depth (a value, not mass);
+//   carve = how far the surface is currently compressed below
+//           the field (>= 0) by objects / the player /
+//           footprint stamps.
+//
+// Rendered depth = clamp(field - carve + rim, 0, field + 0.10),
+// derived by snowRenderKernel. Nothing moves depth between
+// vertices: the field evolves only by the v4.8 source/sink
+// rules (grow toward the authored ceiling while it snows,
+// compact down toward it, temperature sink subtracts), and
+// carve only chases a live occupancy demand. The one permitted
+// raise is the rim: a <= 0.10 m lip at a depression's edge
+// (Rise-of-the-Tomb-Raider style), so the total surface can
+// never exceed authored depth + 0.10 m anywhere — the
+// carve-only invariant holds by construction.
 
-struct SnowEdge {
-    uint idx;
-    float mass;
-};
-
-// Shared per-column helpers (mirror: mobility / repose).
-static float snowMobility(float rho, float age, constant SimParams& sp) {
-    float mob = 1.0f / (1.0f + max(rho - sp.freshRho, 0.0f) * 3.0f);
-    float agef = clamp(age / 600.0f, 0.0f, 1.0f);
-    mob *= (1.0f - 0.5f * agef);
-    if (sp.snowTemp < 100.0f && sp.snowTemp > 0.0f) mob *= 1.25f;
-    return max(mob, 0.15f);
-}
-static float snowReposeTan(float age, constant SimParams& sp) {
-    float agef = clamp(age / 600.0f, 0.0f, 1.0f);
-    return sp.reposeTan + 0.0699268f * agef; // + tan(4 deg) sinter bonus
-}
-
-// Step 0 of each substep: clear the displacement edge counter.
-kernel void snowEdgeResetKernel(
-    device uint* edgeCount [[buffer(0)]],
-    uint idx [[thread_position_in_grid]])
-{
-    if (idx == 0u) { edgeCount[0] = 0u; }
-}
-
-// Step 1: sources / sinks / compaction / press / ageing.
-// The ONLY kernel that creates or destroys snow mass
-// (deposition in, melt out); press overflow is not destroyed
-// — it is appended to the displacement edge buffer and lands
-// on the neighbours in the apply step.
-kernel void snowSourcesKernel(
-    device float* snowMass [[buffer(0)]],
-    device float* snowRho [[buffer(1)]],
-    device float* snowAge [[buffer(2)]],
-    device const float* supportY [[buffer(3)]],
-    device const float* snowGate [[buffer(4)]],
+// Step 1 of each substep: evolve field + carve.
+//   Field growth/shrink: the v4.8 source/sink semantics
+//   verbatim (the same rules simSourceSinkKernel documents for
+//   its snow half, gated off since v4.11).
+//   Carve demand: an intruder covering this vertex (interval
+//   overlap of its [lo, hi] span against the snow column, the
+//   v4.11 test) wants the visible depth inside its span gone:
+//   desired carve = field - visible depth. Carve-in is fast
+//   (1 - exp(-8*dt) ~= 0.23 per 1/30 s substep); refill toward
+//   a LOWER demand is slow and temperature-flavoured:
+//   tau = 90 s while snowfall is active, 240 s idle, halved
+//   above 0 C (wet snow slumps back), x1.5 at <= -15 C (cold
+//   dry snow keeps its tracks). Press stamps act in the same
+//   step: carve rises to at least field * min(press, 0.9) — a
+//   footprint — and the press buffer is cleared after the
+//   first substep (snowPressClearKernel), so a stamp is
+//   one-shot.
+// Buffer layout: 0 field, 1 carve, 2 groundY, 3 groundHas,
+// 4 snowCeil, 5 snowRate, 6 occCov, 7 occLo, 8 occHi, 9 press,
+// 10 params.
+kernel void snowFieldKernel(
+    device float* field [[buffer(0)]],
+    device float* carve [[buffer(1)]],
+    device const float* groundY [[buffer(2)]],
+    device const uint* groundHas [[buffer(3)]],
+    device const float* snowCeil [[buffer(4)]],
     device const float* snowRate [[buffer(5)]],
-    device const uint* hasSupport [[buffer(6)]],
-    device const float* occCov [[buffer(7)]],
-    device const float* press [[buffer(8)]],
-    device SnowEdge* edges [[buffer(9)]],
-    device uint* edgeCount [[buffer(10)]],
-    constant uint& edgeCapacity [[buffer(11)]],
-    constant SimParams& sp [[buffer(12)]],
-    device const float* occLo [[buffer(13)]],
-    device const float* occHi [[buffer(14)]],
-    uint idx [[thread_position_in_grid]])
-{
-    uint count = sp.vx * sp.vz;
-    if (idx >= count) return;
-    if (hasSupport[idx] == 0u) {
-        snowMass[idx] = 0.0f;
-        snowAge[idx] = 0.0f;
-        return;
-    }
-    float m = snowMass[idx];
-    float rho = clamp(snowRho[idx], 0.05f, 1.0f);
-    float age = snowAge[idx];
-    float gate = snowGate[idx];
-    // Deposition: an input flux at fresh density, softly
-    // gated as depth approaches the gate (the gate is the
-    // old ceiling value — an input limit, never a shape).
-    float depth = m / max(rho, 0.05f);
-    if (sp.snowBase > 0.0f) {
-        float taper = clamp((gate - depth) / 0.05f, 0.0f, 1.0f);
-        float dm = sp.snowBase * snowRate[idx] * sp.freshRho * sp.dt * taper;
-        if (dm > 0.0f) {
-            rho = (m * rho + dm * sp.freshRho) / max(m + dm, 1e-9f);
-            m += dm;
-        }
-    }
-    // Melt: mass out at the session sink rate (a depth rate:
-    // dm = sink * rho * dt keeps dh/dt == sink). Wet snow
-    // densifies slightly while it melts.
-    if (sp.snowSink > 0.0f && m > 0.0f) {
-        float dm = min(m, sp.snowSink * rho * sp.dt);
-        m -= dm;
-        if (sp.snowTemp < 100.0f && sp.snowTemp > 0.0f) {
-            rho += (1.0f - rho) * 0.005f * sp.dt;
-        }
-    }
-    // Overburden compaction: the pack densifies under its own
-    // weight, faster the deeper it is. (Rate set by the
-    // mirror's PILE-LONG test: at 0.001 the DIFFERENTIAL rate
-    // (peak carries the most mass, compacts fastest) sank a
-    // test pile's peak ~25% in 300 s and dragged its flank
-    // from 33 deg to 26 deg — real densification of a fresh
-    // pack acts over hours. 0.0001: e-fold ~3 h at reference
-    // load; invisible over a scene session's minutes, gentle
-    // subsidence over hours.)
-    {
-        float k = 0.0001f * (0.3f + m / 0.5f);
-        rho += (1.0f - rho) * (1.0f - exp(-k * sp.dt));
-    }
-    // Gate compaction: snow sitting ABOVE the user's Max
-    // Depth (the uniform cap, NOT the drift-factored
-    // deposition gate — a displaced pile in a low-drift spot
-    // must not silently densify away; the drift field shapes
-    // where snowfall may accumulate, never how fast placed
-    // snow vanishes) densifies — depth falls at constant
-    // mass. Mass is never deleted here; v4.7's
-    // delete-to-ceiling is deliberately gone (see the design
-    // record).
-    depth = m / max(rho, 0.05f);
-    if (depth > sp.gateUniform) {
-        rho += (1.0f - rho) * (1.0f - exp(-0.02f * sp.dt));
-    }
-    // Intruder compaction: snow actually OVERLAPPED by an
-    // object is pressed toward full density fast — this is
-    // the "compact first" half of displacement; the rest
-    // vacates in step 3. The overlap test is the same one
-    // the displacement step uses (v4.11 fix round 4: the
-    // coverage mask alone also matches the SUPPORT ITSELF —
-    // the ground plane is an "intruder" covering every
-    // column with zero overlap — and compacting on coverage
-    // alone densified ALL ground snow to rho ~ 1 within
-    // seconds, collapsing pile depths by the fresh-density
-    // factor; the in-app PILE audit caught it: volume fell
-    // 2.41 -> 1.09 at constant mass).
-    if (occCov[idx] > 0.0f) {
-        float depthNow = m / max(rho, 0.05f);
-        float ovTop = min(occHi[idx] - supportY[idx], depthNow);
-        float ovBot = max(occLo[idx] - supportY[idx], 0.0f);
-        float ovFrac = clamp((ovTop - ovBot) / max(depthNow, 1e-6f), 0.0f, 1.0f);
-        if (ovFrac > 0.0f) {
-            rho += (1.0f - rho) * (1.0f - exp(-3.0f * ovFrac * sp.dt));
-            age = 0.0f;
-        }
-    }
-    // Footprint press (player steps, CPU-stamped per-vertex
-    // compress factors): depth scales down at constant mass
-    // (rho rises); past full density the excess mass sheds
-    // to the ring via the edge buffer.
-    float p = press[idx];
-    if (p > 0.001f && m > 0.0f) {
-        depth = m / max(rho, 0.05f);
-        float target = depth * (1.0f - min(p, 0.9f));
-        float rhoWant = m / max(target, 1e-6f);
-        if (rhoWant <= 1.0f) {
-            rho = rhoWant;
-        } else {
-            rho = 1.0f;
-            float over = m - target;
-            if (over > 0.0f) {
-                m = target;
-                uint slot = atomic_fetch_add_explicit(
-                    (device atomic_uint*)edgeCount, 1u,
-                    memory_order_relaxed);
-                if (slot < edgeCapacity) {
-                    edges[slot].idx = idx;
-                    edges[slot].mass = over;
-                }
-                // If the buffer were ever full the excess
-                // stays in the column (m restored) rather
-                // than vanishing: conservation is absolute.
-                else { m += over; }
-            }
-        }
-        age = 0.0f;
-    }
-    age += sp.dt;
-    snowMass[idx] = m;
-    snowRho[idx] = clamp(rho, 0.05f, 1.0f);
-    snowAge[idx] = age;
-}
-
-// Step 2: gravity flux. One thread per column of the pass's
-// colour class (sp.parity = class 0..3 of the 4-colouring
-// (x&1) + 2*(z&1)); a thread owns its column (plain subtract
-// of its own outflow — same-class columns never receive from
-// each other, and other classes are not running) and adds to
-// receivers atomically (several givers share receivers; the
-// adds commute and none are lost, so mass is conserved to
-// float rounding). Transfers are computed from the surfaces
-// the thread reads; staleness between givers is bounded by
-// the 0.25 factor and the outflow limiter, exactly as the
-// mirror's snapshot passes are.
-// v4.11 Jacobi snapshot copy: the flux pass reads ALL its
-// decisions from this snapshot of the substep-start mass, so
-// no transfer can chain off another transfer in the same
-// substep (the chained colour sweeps ratcheted piles below
-// repose — see the design record).
-kernel void snowSnapKernel(
-    device const float* snowMass [[buffer(0)]],
-    device float* snowMassSnap [[buffer(1)]],
-    constant SimParams& sp [[buffer(5)]],
-    uint idx [[thread_position_in_grid]])
-{
-    if (idx >= sp.vx * sp.vz) return;
-    snowMassSnap[idx] = snowMass[idx];
-}
-
-kernel void snowFluxKernel(
-    device float* snowMass [[buffer(0)]],
-    device const float* snowRho [[buffer(1)]],
-    device float* snowAge [[buffer(2)]],
-    device const float* supportY [[buffer(3)]],
-    device const uint* hasSupport [[buffer(4)]],
-    constant SimParams& sp [[buffer(5)]],
-    device const float* snowMassSnap [[buffer(6)]],
-    uint idx [[thread_position_in_grid]])
-{
-    uint count = sp.vx * sp.vz;
-    if (idx >= count) return;
-    if (hasSupport[idx] == 0u) return;
-    uint x = idx % sp.vx;
-    uint z = idx / sp.vx;
-    // ONE synchronous sweep per substep: every decision below
-    // reads the SNAPSHOT (buffer 6), never the live buffer, so
-    // the repose set is a true equilibrium of the update.
-    float m = snowMassSnap[idx];
-    if (m <= 0.0f) return;
-    float rho = clamp(snowRho[idx], 0.05f, 1.0f);
-    float surfI = supportY[idx] + m / rho;
-    float mobI = snowMobility(rho, snowAge[idx], sp);
-    float rtanI = snowReposeTan(snowAge[idx], sp);
-    const int dxs[8] = {1, -1, 0, 0, 1, 1, -1, -1};
-    const int dzs[8] = {0, 0, 1, -1, 1, -1, 1, -1};
-    uint nIdx[8];
-    float nMove[8];
-    int nCount = 0;
-    float totalOut = 0.0f;
-    for (uint k = 0u; k < 8u; ++k) {
-        int nx = int(x) + dxs[k];
-        int nz = int(z) + dzs[k];
-        if (nx < 0 || nz < 0 || nx >= int(sp.vx) || nz >= int(sp.vz)) continue;
-        uint n = uint(nz) * sp.vx + uint(nx);
-        if (hasSupport[n] == 0u) continue;
-        float dist = sp.cell * ((dxs[k] != 0 && dzs[k] != 0) ? 1.41421356f : 1.0f);
-        float rhoN = clamp(snowRho[n], 0.05f, 1.0f);
-        float surfN = supportY[n] + snowMassSnap[n] / rhoN;
-        float diff = surfI - surfN;
-        if (diff <= 0.0f) continue;
-        float maxStep = max(rtanI, snowReposeTan(snowAge[n], sp)) * dist;
-        float excess = diff - maxStep;
-        if (excess <= 0.0f) continue;
-        float mob = min(mobI, snowMobility(rhoN, snowAge[n], sp));
-        float move = min(0.25f * mob * excess * rho, m);
-        if (move <= 0.0f) continue;
-        nIdx[nCount] = n;
-        nMove[nCount] = move;
-        nCount += 1;
-        totalOut += move;
-    }
-    if (nCount == 0 || totalOut <= 0.0f) return;
-    // Outflow limiter against the snapshot mass: the giver
-    // never gives more than it had at substep start.
-    float scale = (totalOut > m) ? (m / totalOut) : 1.0f;
-    float given = 0.0f;
-    for (int k = 0; k < nCount; ++k) {
-        float mv = nMove[k] * scale;
-        if (mv <= 0.0f) continue;
-        atomic_fetch_add_explicit(
-            (device atomic_float*)&snowMass[nIdx[k]], mv,
-            memory_order_relaxed);
-        given += mv;
-    }
-    if (given > 0.0f) {
-        atomic_fetch_sub_explicit(
-            (device atomic_float*)&snowMass[idx], given,
-            memory_order_relaxed);
-    }
-    if (given > 1e-6f) {
-        // Disturbed snow loses its sinter age. (The write is
-        // the owner's own column; receivers' ages are reset by
-        // their own threads when they next give, and by the
-        // sources kernel when intruded — age is a material
-        // heuristic, not conserved state.)
-        snowAge[idx] = 0.0f;
-    }
-}
-
-// Step 3a: displacement count. One thread per column: if an
-// intruder's volume overlaps this column's snow, append the
-// rate-limited vacated mass to the edge buffer. The mass is
-// subtracted in the apply step (exactly once per entry).
-kernel void snowDisplaceCountKernel(
-    device const float* snowMass [[buffer(0)]],
-    device const float* snowRho [[buffer(1)]],
-    device const float* supportY [[buffer(2)]],
-    device const uint* hasSupport [[buffer(3)]],
-    device const float* occCov [[buffer(4)]],
-    device const float* occLo [[buffer(5)]],
-    device const float* occHi [[buffer(6)]],
-    device SnowEdge* edges [[buffer(7)]],
-    device uint* edgeCount [[buffer(8)]],
-    constant uint& edgeCapacity [[buffer(9)]],
+    device const float* occCov [[buffer(6)]],
+    device const float* occLo [[buffer(7)]],
+    device const float* occHi [[buffer(8)]],
+    device const float* press [[buffer(9)]],
     constant SimParams& sp [[buffer(10)]],
     uint idx [[thread_position_in_grid]])
 {
-    uint count = sp.vx * sp.vz;
+    uint count = uint(sp.vx) * uint(sp.vz);
     if (idx >= count) return;
-    if (hasSupport[idx] == 0u) return;
-    float cov = occCov[idx];
-    if (cov <= 0.0f) return;
-    float m = snowMass[idx];
-    if (m <= 0.0f) return;
-    float rho = clamp(snowRho[idx], 0.05f, 1.0f);
-    float depth = m / rho;
-    float ovTop = min(occHi[idx] - supportY[idx], depth);
-    float ovBot = max(occLo[idx] - supportY[idx], 0.0f);
-    float ovH = ovTop - ovBot;
-    if (ovH <= 0.0f) return;
-    float shed = m * (ovH / max(depth, 1e-6f)) * cov * 0.18f;
-    if (shed <= 1e-7f) return;
-    uint slot = atomic_fetch_add_explicit(
-        (device atomic_uint*)edgeCount, 1u, memory_order_relaxed);
-    if (slot < edgeCapacity) {
-        edges[slot].idx = idx;
-        edges[slot].mass = shed;
+    if (groundHas[idx] == 0u) {
+        field[idx] = 0.0f;
+        carve[idx] = 0.0f;
+        return;
     }
-    // Buffer full: the snow simply stays this substep (it
-    // vacates next substep instead) — never deleted.
+    float f = field[idx];
+    float c = carve[idx];
+    // (1) Authored field evolution — v4.8 source/sink rules.
+    float ceil = snowCeil[idx];
+    if (f < ceil) {
+        f = min(ceil, f + snowRate[idx] * sp.snowBase * sp.dt);
+    } else if (f > ceil) {
+        f = max(ceil, f - sp.compactRate * sp.dt);
+    }
+    if (sp.snowSink > 0.0f) {
+        f = max(0.0f, f - sp.snowSink * sp.dt);
+    }
+    // (2) Occupancy demand (interval overlap, see header).
+    float rendered = max(f - c, 0.0f);
+    float target = 0.0f;
+    if (occCov[idx] > 0.0f) {
+        float ovTop = min(occHi[idx] - groundY[idx], rendered);
+        float ovBot = max(occLo[idx] - groundY[idx], 0.0f);
+        float ovH = ovTop - ovBot;
+        if (ovH > 0.0f) { target = min(c + ovH, f); }
+    }
+    // (3) Chase the demand: fast in, slow refill out.
+    if (c < target) {
+        c += (target - c) * (1.0f - exp(-8.0f * sp.dt));
+    } else if (c > target) {
+        float tau = sp.snowBase > 0.0f ? 90.0f : 240.0f;
+        if (sp.snowTemp < 100.0f && sp.snowTemp > 0.0f) {
+            tau *= 0.5f;
+        } else if (sp.snowTemp < 100.0f && sp.snowTemp <= -15.0f) {
+            tau *= 1.5f;
+        }
+        c += (target - c) * (1.0f - exp(-sp.dt / tau));
+    }
+    // (4) Footprint press (one-shot; buffer cleared per tick).
+    float p = press[idx];
+    if (p > 0.001f && f > 0.0f) {
+        c = max(c, f * min(p, 0.9f));
+    }
+    // (5) A depression can never exceed the field itself.
+    carve[idx] = clamp(c, 0.0f, f);
+    field[idx] = f;
 }
 
-// Step 3b: displacement apply. One thread per edge entry:
-// distribute the shed mass to the giver's non-intruded
-// neighbours, weighted by surface headroom (lowest surfaces
-// first — berms shoulder against the mover, never teleport
-// bands), then subtract exactly the distributed sum from the
-// giver. All writes atomic: several entries can share
-// receivers, and a giver here is another entry's neighbour.
-kernel void snowDisplaceApplyKernel(
-    device float* snowMass [[buffer(0)]],
-    device const float* snowRho [[buffer(1)]],
-    device const float* supportY [[buffer(2)]],
-    device const uint* hasSupport [[buffer(3)]],
-    device const float* occCov [[buffer(4)]],
-    device const SnowEdge* edges [[buffer(5)]],
-    device const uint* edgeCount [[buffer(6)]],
-    constant SimParams& sp [[buffer(7)]],
+// Step 2 of each substep: derive the rendered depth. Read-only
+// on carve (neighbour rim), so the result is deterministic for
+// a given state. Rim: where a 4-neighbour is carved deeper by
+// more than 2 cm, this vertex's lip rises by 35% of the excess,
+// capped at 0.10 m — and the total is hard-clamped to
+// field + 0.10, so the carve-only invariant
+// (0 <= rendered <= field + 0.10) holds at every vertex.
+kernel void snowRenderKernel(
+    device float* snowDepth [[buffer(0)]],
+    device const float* field [[buffer(1)]],
+    device const float* carve [[buffer(2)]],
+    device const uint* groundHas [[buffer(3)]],
+    constant SimParams& sp [[buffer(4)]],
     uint idx [[thread_position_in_grid]])
 {
-    if (idx >= edgeCount[0]) return;
-    SnowEdge e = edges[idx];
-    uint g = e.idx;
-    if (g >= sp.vx * sp.vz) return;
-    float shed = e.mass;
-    if (shed <= 0.0f) return;
-    uint x = g % sp.vx;
-    uint z = g / sp.vx;
-    float rhoG = clamp(snowRho[g], 0.05f, 1.0f);
-    float surfG = supportY[g] + snowMass[g] / rhoG;
-    const int dxs[8] = {1, -1, 0, 0, 1, 1, -1, -1};
-    const int dzs[8] = {0, 0, 1, -1, 1, -1, 1, -1};
-    uint nIdx[8];
-    float nW[8];
-    int nCount = 0;
-    float wSum = 0.0f;
-    for (uint k = 0u; k < 8u; ++k) {
-        int nx = int(x) + dxs[k];
-        int nz = int(z) + dzs[k];
-        if (nx < 0 || nz < 0 || nx >= int(sp.vx) || nz >= int(sp.vz)) continue;
-        uint n = uint(nz) * sp.vx + uint(nx);
-        if (hasSupport[n] == 0u) continue;
-        if (occCov[n] > 0.0f) continue; // into the mover: no
-        float rhoN = clamp(snowRho[n], 0.05f, 1.0f);
-        float surfN = supportY[n] + snowMass[n] / rhoN;
-        float w = max(surfG - surfN, 0.0f) + 0.01f;
-        nIdx[nCount] = n;
-        nW[nCount] = w;
-        nCount += 1;
-        wSum += w;
+    uint count = uint(sp.vx) * uint(sp.vz);
+    if (idx >= count) return;
+    if (groundHas[idx] == 0u) { snowDepth[idx] = 0.0f; return; }
+    float f = field[idx];
+    float c = carve[idx];
+    float rendered = max(f - c, 0.0f);
+    uint vx = uint(sp.vx);
+    uint x = idx % vx;
+    uint z = idx / vx;
+    float maxN = 0.0f;
+    if (x > 0u) { maxN = max(maxN, carve[idx - 1u]); }
+    if (x + 1u < vx) { maxN = max(maxN, carve[idx + 1u]); }
+    if (z > 0u) { maxN = max(maxN, carve[idx - vx]); }
+    if (z + 1u < uint(sp.vz)) { maxN = max(maxN, carve[idx + vx]); }
+    if (maxN > c + 0.02f) {
+        float rim = min(0.10f, 0.35f * (maxN - c));
+        rendered = min(rendered + rim, f + 0.10f);
     }
-    if (nCount == 0 || wSum <= 0.0f) return; // boxed in: stays
-    float given = 0.0f;
-    for (int k = 0; k < nCount; ++k) {
-        float share = shed * (nW[k] / wSum);
-        if (share <= 0.0f) continue;
-        atomic_fetch_add_explicit(
-            (device atomic_float*)&snowMass[nIdx[k]], share,
-            memory_order_relaxed);
-        given += share;
-    }
-    if (given > 0.0f) {
-        atomic_fetch_add_explicit(
-            (device atomic_float*)&snowMass[g], -given,
-            memory_order_relaxed);
-    }
+    snowDepth[idx] = rendered;
 }
 
-// Press stamps are one-shot events: after the first substep's
-// sources kernel consumes them, this clears the stamp buffer
-// so the remaining substeps of the tick do not re-apply them.
+// Press stamps are one-shot: consumed by the first
+// substep they are live for, cleared before the second.
 kernel void snowPressClearKernel(
     device float* press [[buffer(0)]],
     uint idx [[thread_position_in_grid]])
@@ -2410,18 +2229,19 @@ kernel void snowPressClearKernel(
     press[idx] = 0.0f;
 }
 
-// Step 4: writeback — the derived depth the skin, the water
-// ceiling and snowDepthAt read (mass / density).
-kernel void snowWritebackKernel(
-    device float* snowDepth [[buffer(0)]],
-    device const float* snowMass [[buffer(1)]],
-    device const float* snowRho [[buffer(2)]],
-    device const uint* hasSupport [[buffer(3)]],
-    constant SimParams& sp [[buffer(4)]],
+// v4.12 audit: evaluate the shared shader snow-accumulation
+// factor (snowAccumFactor, used by the trace + guide kernels)
+// for three probe normals at full snow level: a vertical face
+// (must be EXACTLY 0 — vertical faces accumulate nothing, by
+// construction), a flat top (full), and a 45-degree roof
+// (strictly between). Driven by Renderer.reproSnowGateAudit.
+kernel void snowGateAuditKernel(
+    device float* out [[buffer(0)]],
     uint idx [[thread_position_in_grid]])
 {
-    uint count = sp.vx * sp.vz;
-    if (idx >= count) return;
-    if (hasSupport[idx] == 0u) { snowDepth[idx] = 0.0f; return; }
-    snowDepth[idx] = snowMass[idx] / clamp(snowRho[idx], 0.05f, 1.0f);
+    if (idx >= 3u) return;
+    float3 n = idx == 0u ? float3(1.0f, 0.0f, 0.0f)
+             : idx == 1u ? float3(0.0f, 1.0f, 0.0f)
+                         : normalize(float3(0.0f, 1.0f, 1.0f));
+    out[idx] = snowAccumFactor(n, 1.0f, 0.5f);
 }
