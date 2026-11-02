@@ -747,12 +747,14 @@ final class Renderer {
     // v4.11 snow physics pipelines + state buffers.
     private var snowSourcesPipeline: MTLComputePipelineState?
     private var snowFluxPipeline: MTLComputePipelineState?
+    private var snowSnapPipeline: MTLComputePipelineState?
     private var snowDisplaceCountPipeline: MTLComputePipelineState?
     private var snowDisplaceApplyPipeline: MTLComputePipelineState?
     private var snowWritebackPipeline: MTLComputePipelineState?
     private var snowEdgeResetPipeline: MTLComputePipelineState?
     private var snowPressClearPipeline: MTLComputePipelineState?
     private var simSnowMassBuf: MTLBuffer?
+    private var simSnowMassSnapBuf: MTLBuffer?
     private var simSnowRhoBuf: MTLBuffer?
     private var simSnowAgeBuf: MTLBuffer?
     private var simSnowGateBuf: MTLBuffer?
@@ -943,6 +945,9 @@ final class Renderer {
         }
         if let fn = library.makeFunction(name: "snowFluxKernel") {
             snowFluxPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "snowSnapKernel") {
+            snowSnapPipeline = try? device.makeComputePipelineState(function: fn)
         }
         if let fn = library.makeFunction(name: "snowDisplaceCountKernel") {
             snowDisplaceCountPipeline = try? device.makeComputePipelineState(function: fn)
@@ -3738,15 +3743,33 @@ final class Renderer {
                         disp[i] = v
                     }
                 } else {
+                    // v4.11 conservation fix: a vertex whose
+                    // HOST CHANGED since the last sync (the
+                    // moving silhouette band of a dragged
+                    // object) samples the old field AT ITS OWN
+                    // POSITION — snow stays in the world when
+                    // its support changes (the support-switch
+                    // rule); sampling at the new host's motion
+                    // offset teleported and diffused it, which
+                    // the in-app DRAG audit measured as a
+                    // -0.23% mass drift over one drag. Vertices
+                    // on an unchanged host keep the host-motion
+                    // offset (snow rides its object).
+                    var sx = x - dx, sz = z - dz
+                    if ox == oldOX && oz == oldOZ && cs == oldCS
+                        && vx == oldVX && vz == oldVZ
+                        && i < oldHosts.count && oldHosts[i] != hostIDs[i] {
+                        sx = x; sz = z
+                    }
                     if let v = simSampleBilinear(oldMass, ox: oldOX, oz: oldOZ, cs: oldCS,
-                                                 vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
+                                                 vx: oldVX, vz: oldVZ, x: sx, z: sz) {
                         mass[i] = v
                         if let r = simSampleBilinear(oldRho, ox: oldOX, oz: oldOZ, cs: oldCS,
-                                                     vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
+                                                     vx: oldVX, vz: oldVZ, x: sx, z: sz) {
                             rhoA[i] = min(max(r, 0.05), 1)
                         }
                         if let a = simSampleBilinear(oldAge, ox: oldOX, oz: oldOZ, cs: oldCS,
-                                                     vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
+                                                     vx: oldVX, vz: oldVZ, x: sx, z: sz) {
                             ageA[i] = a
                         }
                     } else {
@@ -3754,7 +3777,7 @@ final class Renderer {
                         mass[i] = ic.m; rhoA[i] = ic.rho; ageA[i] = ic.age
                     }
                     if let v = simSampleBilinear(oldWater, ox: oldOX, oz: oldOZ, cs: oldCS,
-                                                 vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
+                                                 vx: oldVX, vz: oldVZ, x: sx, z: sz) {
                         water[i] = v
                     }
                 }
@@ -3833,6 +3856,7 @@ final class Renderer {
         simSnowBuf = makeSimBuffer(depth)
         simWaterBuf = makeSimBuffer(water)
         simSnowMassBuf = makeSimBuffer(mass)
+        simSnowMassSnapBuf = makeSimBuffer(mass)
         simSnowRhoBuf = makeSimBuffer(rhoA)
         simSnowAgeBuf = makeSimBuffer(ageA)
         simSnowGateBuf = makeSimBuffer(snowCeil)
@@ -4001,6 +4025,7 @@ final class Renderer {
               let wRateB = simWaterRateBuf, let hasB = simHasBuf,
               let pinB = simPinnedBuf,
               let snowSrc = snowSourcesPipeline, let snowFlux = snowFluxPipeline,
+              let snowSnap = snowSnapPipeline, let snapB = simSnowMassSnapBuf,
               let dispCount = snowDisplaceCountPipeline,
               let dispApply = snowDisplaceApplyPipeline,
               let writeback = snowWritebackPipeline,
@@ -4274,23 +4299,33 @@ final class Renderer {
                     enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: wp, height: 1, depth: 1))
                     dispatched = true
                 }
-                // 2: gravity flux — 3 rounds x 4 colour classes.
-                for _ in 0..<3 {
-                    for cls in [UInt32(0), UInt32(1), UInt32(2), UInt32(3)] {
-                        barrierIfNeeded()
-                        params.parity = cls
-                        enc.setComputePipelineState(snowFlux)
-                        enc.setBuffer(massB, offset: 0, index: 0)
-                        enc.setBuffer(rhoB, offset: 0, index: 1)
-                        enc.setBuffer(ageB, offset: 0, index: 2)
-                        enc.setBuffer(supB, offset: 0, index: 3)
-                        enc.setBuffer(hasB, offset: 0, index: 4)
-                        enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 5)
-                        let wf = snowFlux.threadExecutionWidth
-                        enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: wf, height: 1, depth: 1))
-                        dispatched = true
-                    }
-                }
+                // 2: gravity flux — ONE synchronous (Jacobi)
+                // sweep per substep from a snapshot of the
+                // substep-start mass. (The earlier chained
+                // colour sweeps ratcheted piles below repose
+                // over minutes; a snapshot update makes the
+                // repose set a true equilibrium — mirror
+                // PILE-LONG is the regression test.)
+                barrierIfNeeded()
+                enc.setComputePipelineState(snowSnap)
+                enc.setBuffer(massB, offset: 0, index: 0)
+                enc.setBuffer(snapB, offset: 0, index: 1)
+                enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 5)
+                let wn = snowSnap.threadExecutionWidth
+                enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: wn, height: 1, depth: 1))
+                dispatched = true
+                barrierIfNeeded()
+                enc.setComputePipelineState(snowFlux)
+                enc.setBuffer(massB, offset: 0, index: 0)
+                enc.setBuffer(rhoB, offset: 0, index: 1)
+                enc.setBuffer(ageB, offset: 0, index: 2)
+                enc.setBuffer(supB, offset: 0, index: 3)
+                enc.setBuffer(hasB, offset: 0, index: 4)
+                enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 5)
+                enc.setBuffer(snapB, offset: 0, index: 6)
+                let wf = snowFlux.threadExecutionWidth
+                enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: wf, height: 1, depth: 1))
+                dispatched = true
                 // 3a: displacement count.
                 barrierIfNeeded()
                 enc.setComputePipelineState(dispCount)

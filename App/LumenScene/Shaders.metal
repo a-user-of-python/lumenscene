@@ -1735,12 +1735,16 @@ fragment float4 lineFragment(LineOut in [[stage_in]]) {
 //        EIGHT neighbours (diagonals included: axial-only
 //        constraints let corner gradients reach sqrt(2) x
 //        repose — measured 43.7 deg at box corners in the
-//        mirror), FOUR-colour pass order (diagonals join
-//        same-parity cells), transfer = 0.25 x mobility x
+//        mirror). ONE synchronous (Jacobi) sweep per substep:
+//        snowSnapKernel first copies the mass, and every
+//        transfer is decided from that snapshot — chained
+//        sweeps ratcheted piles below repose over minutes
+//        (mirror PILE-LONG). transfer = 0.25 x mobility x
 //        excess over the repose plane, the giver's total
-//        outflow scaled to never exceed its mass (the limiter
-//        makes conservation exact — without it parallel
-//        giving at support steps CREATED mass in the mirror).
+//        outflow scaled to never exceed its snapshot mass
+//        (the limiter makes conservation exact — without it
+//        parallel giving at support steps CREATED mass in
+//        the mirror).
 //        Mobility falls with density and sinter age; the
 //        repose angle is temperature-driven (34 deg cold to
 //        38 deg at 0 C, + up to 4 deg of sinter bonus). No
@@ -2093,12 +2097,16 @@ kernel void snowSourcesKernel(
         }
     }
     // Overburden compaction: the pack densifies under its own
-    // weight, faster the deeper it is. (Rate tuned in the
-    // mirror: at 10x this, differential compaction flattened a
-    // test pile below repose inside 25 s — real densification
-    // acts over tens of minutes.)
+    // weight, faster the deeper it is. (Rate set by the
+    // mirror's PILE-LONG test: at 0.001 the DIFFERENTIAL rate
+    // (peak carries the most mass, compacts fastest) sank a
+    // test pile's peak ~25% in 300 s and dragged its flank
+    // from 33 deg to 26 deg — real densification of a fresh
+    // pack acts over hours. 0.0001: e-fold ~3 h at reference
+    // load; invisible over a scene session's minutes, gentle
+    // subsidence over hours.)
     {
-        float k = 0.001f * (0.3f + m / 0.5f);
+        float k = 0.0001f * (0.3f + m / 0.5f);
         rho += (1.0f - rho) * (1.0f - exp(-k * sp.dt));
     }
     // Gate compaction: snow sitting ABOVE its deposition gate
@@ -2165,6 +2173,21 @@ kernel void snowSourcesKernel(
 // the thread reads; staleness between givers is bounded by
 // the 0.25 factor and the outflow limiter, exactly as the
 // mirror's snapshot passes are.
+// v4.11 Jacobi snapshot copy: the flux pass reads ALL its
+// decisions from this snapshot of the substep-start mass, so
+// no transfer can chain off another transfer in the same
+// substep (the chained colour sweeps ratcheted piles below
+// repose — see the design record).
+kernel void snowSnapKernel(
+    device const float* snowMass [[buffer(0)]],
+    device float* snowMassSnap [[buffer(1)]],
+    constant SimParams& sp [[buffer(5)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= sp.vx * sp.vz) return;
+    snowMassSnap[idx] = snowMass[idx];
+}
+
 kernel void snowFluxKernel(
     device float* snowMass [[buffer(0)]],
     device const float* snowRho [[buffer(1)]],
@@ -2172,6 +2195,7 @@ kernel void snowFluxKernel(
     device const float* supportY [[buffer(3)]],
     device const uint* hasSupport [[buffer(4)]],
     constant SimParams& sp [[buffer(5)]],
+    device const float* snowMassSnap [[buffer(6)]],
     uint idx [[thread_position_in_grid]])
 {
     uint count = sp.vx * sp.vz;
@@ -2179,8 +2203,10 @@ kernel void snowFluxKernel(
     if (hasSupport[idx] == 0u) return;
     uint x = idx % sp.vx;
     uint z = idx / sp.vx;
-    if (((x & 1u) + 2u * (z & 1u)) != sp.parity) return;
-    float m = snowMass[idx];
+    // ONE synchronous sweep per substep: every decision below
+    // reads the SNAPSHOT (buffer 6), never the live buffer, so
+    // the repose set is a true equilibrium of the update.
+    float m = snowMassSnap[idx];
     if (m <= 0.0f) return;
     float rho = clamp(snowRho[idx], 0.05f, 1.0f);
     float surfI = supportY[idx] + m / rho;
@@ -2200,7 +2226,7 @@ kernel void snowFluxKernel(
         if (hasSupport[n] == 0u) continue;
         float dist = sp.cell * ((dxs[k] != 0 && dzs[k] != 0) ? 1.41421356f : 1.0f);
         float rhoN = clamp(snowRho[n], 0.05f, 1.0f);
-        float surfN = supportY[n] + snowMass[n] / rhoN;
+        float surfN = supportY[n] + snowMassSnap[n] / rhoN;
         float diff = surfI - surfN;
         if (diff <= 0.0f) continue;
         float maxStep = max(rtanI, snowReposeTan(snowAge[n], sp)) * dist;
@@ -2215,7 +2241,8 @@ kernel void snowFluxKernel(
         totalOut += move;
     }
     if (nCount == 0 || totalOut <= 0.0f) return;
-    // Outflow limiter: the giver never gives more than it has.
+    // Outflow limiter against the snapshot mass: the giver
+    // never gives more than it had at substep start.
     float scale = (totalOut > m) ? (m / totalOut) : 1.0f;
     float given = 0.0f;
     for (int k = 0; k < nCount; ++k) {
@@ -2226,7 +2253,11 @@ kernel void snowFluxKernel(
             memory_order_relaxed);
         given += mv;
     }
-    snowMass[idx] = m - given;
+    if (given > 0.0f) {
+        atomic_fetch_sub_explicit(
+            (device atomic_float*)&snowMass[idx], given,
+            memory_order_relaxed);
+    }
     if (given > 1e-6f) {
         // Disturbed snow loses its sinter age. (The write is
         // the owner's own column; receivers' ages are reset by
