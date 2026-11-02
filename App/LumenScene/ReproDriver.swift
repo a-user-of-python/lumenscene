@@ -487,34 +487,6 @@ final class ReproRun {
             && riserLate.allSatisfy { abs($0.y - 2.0) <= 0.01 }
         check("riser", rose && riserRestOK,
               "rose=\(rose) finalY=\(gravAuxSamples.last?.y ?? -1)")
-        // DIAGNOSTIC (v4.13 refell hunt): what does the
-        // renderer's collision export hold under the faller's
-        // footprint at the end of the run? A clean set has NO
-        // up-facing triangle with all vertices near y = 1.0
-        // (the hidden box's top) inside the footprint — if one
-        // survives, the collision pipeline is stale; if none,
-        // the fault is inside the runtime's grid/physics.
-        if let faller = session.project.scene.objects
-            .first(where: { $0.name == "Repro stack faller" }) {
-            let fx = faller.transform.position[0]
-            let fz = faller.transform.position[2]
-            var topTris = 0
-            var bottomTris = 0
-            var total = 0
-            for tri in session.renderer.collisionTriangles {
-                total += 1
-                let ys = [tri.0.y, tri.1.y, tri.2.y]
-                let xs = [tri.0.x, tri.1.x, tri.2.x]
-                let zs = [tri.0.z, tri.1.z, tri.2.z]
-                guard ys.allSatisfy({ abs($0 - 1.0) < 0.01 }),
-                      xs.allSatisfy({ abs($0 - Float(fx)) <= 0.51 }),
-                      zs.allSatisfy({ abs($0 - Float(fz)) <= 0.51 })
-                else { continue }
-                let n = simd_cross(tri.1 - tri.0, tri.2 - tri.0)
-                if n.y > 0 { topTris += 1 } else if n.y < 0 { bottomTris += 1 }
-            }
-            check("gridprobe", topTris == 0,
-                  "upTrisAt1.0=\(topTris) downTrisAt1.0=\(bottomTris) totalTris=\(total) fallerXZ=(\(fx),\(fz))")
             // Tick-alive witness: the ceiling box must have
             // been hidden by the 4 s Delay branch — if the
             // runtime stopped ticking after the 2.5 s hide, it
