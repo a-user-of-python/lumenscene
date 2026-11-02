@@ -163,6 +163,7 @@ image lines._
 | 4.12 | 2026-11-02 | Snow rebuilt on the games-standard model (Red Dead Redemption 2 the named reference): authored drift field, carve-only deformation with a capped edge lip, caked shader coating on objects, glint/sparkle stage; the granular simulation is retired |
 | 4.13 | 2026-11-02 | Applied Gravity node (56 kinds: wired objects fall and land in Play); snow and 3D water removed on device evidence — rain is streaks + flat wetness; app-wide optimisation (weather no longer rebuilds scene geometry) |
 | 4.14 | 2026-11-02 | Loop node (57 kinds) re-runs Move/Rotate/Scale/Follow nodes forever in Play; Move Object can move the player; Rotate Object can turn the player camera (writes through to the real look state — no snap-back) |
+| 4.15 | 2026-11-02 | Engine optimisation round 2: importance-sampled lights, deep-bounce NEE thinning, roughness-aware reflection roulette, cheaper glass (decision before texture fetch, nested-interface roulette), emissive hits resolved early, live-path variance-gated adaptive sampling — all exact or compensated-unbiased, settled image unchanged; modelled ≈1.45× settled / ≈2.2× live time-to-settle (honest arithmetic in VERSION-HISTORY §4.15) |
 
 Full details in the [Version History](docs/VERSION-HISTORY.md).
 

@@ -1196,6 +1196,165 @@ mean, edit rebuild 35.2 ms, host CPU), iPhone gate PASS.
 Loop smoothness and the feel of the camera turn are the
 device's verdict, as always.
 
+## Version 4.15 — engine optimisation round 2: light, reflections, glass (2026-11-02)
+
+Commission: *"optimize the engine especially light and
+reflections and glass until it has theoretically 3-4x
+performance boost"* — with the settled-image guardrail in
+force (same scene + same settings converge to the same
+picture; Final Render still 16 bounces / 4,096 SPP) and
+an explicit ban on inflating the model: if the honest
+arithmetic lands below 3×, the real number ships.
+
+**The honest headline first: the modelled gain is ≈1.45×
+for settled stills across the three reference scenes, and
+≈2.2× time-to-settle on the live path including adaptive
+sampling — below the 3–4× ask.** The arithmetic follows.
+The shortfall is structural, not effort: the v4.8/v4.13
+rounds already took the big structural wins (merged
+static+dynamic traversal, motion economy, an emissive CDF,
+weather decoupled from geometry). What remains under a
+strict no-bias guardrail is variance reduction and
+event-trimming, and those are bounded. Reaching 3–4× from
+here would require trading settled quality (fewer bounces
+or samples, clamped light, cheaper glass) — exactly what
+the guardrail forbids.
+
+### What changed (all in the path-trace kernel + emissive index)
+
+Every change is one of two kinds: **EXACT** (identical
+math, less work — the random stream and every downstream
+value are unchanged) or **COMPENSATED** (a roulette or
+reweighting whose expectation is algebraically the
+original estimator — the converged image is the same;
+only the noise-vs-cost balance moves).
+
+LIGHT
+- **L1 (COMPENSATED) — importance-sampled lights.** The
+  next-event-estimation CDF is built over
+  area × luminance(Le) instead of area alone, and the
+  estimator divides by the picked light's luminance (the
+  CPU weights and the GPU divisor use identical Rec.709
+  coefficients). Same integral; far less variance when
+  dim panels and hot spots share a scene. On the
+  convlight audit scene's actual emitter table (18
+  emitters, 38.17 m²), the selection second-moment
+  mismatch factor is **M = 2.44** (MODELLED, geometry
+  factored out): the two dim ceiling panels took 67.1%
+  of picks for 30.3% of the emitted weight under
+  area-uniform selection.
+- **L3 (COMPENSATED) — deep-bounce NEE thinning.** From
+  bounce 2, next-event estimation runs with probability
+  clamp(1.5 × throughput, 0.25, 1) and is scaled by the
+  reciprocal when it runs. Weak paths stop paying for
+  shadow rays; the estimator stays unbiased.
+
+REFLECTIONS
+- **R2 (COMPENSATED) — roughness-aware specular
+  continuation roulette.** A specular-roll bounce
+  survives with probability 0.35 + 0.65 × gloss and
+  survivors are compensated by its reciprocal.
+  Mirror-like reflection (gloss → 1) continues almost
+  always; rough sheen ends after the hit's own shading
+  (its NEE already landed).
+- **R1 (COMPENSATED) — path Russian roulette starts at
+  bounce 2** instead of 3 (same throughput rule, same
+  compensation).
+
+GLASS
+- **G1 (EXACT) — the reflect/refract decision is taken
+  BEFORE any texture fetch.** A pure glass event uses
+  only glass parameters + the interpolated normal; the
+  PBR fetch (up to 9 texture samples for triplanar
+  materials) was pure waste per interface. The fetch
+  consumes no RNG, so fall-through paths are bit-equal.
+  Note honestly: the audit scene's glass is untextured,
+  so G1's measured-class saving there is small; its win
+  lands on textured glass in real scenes.
+- **G3 (COMPENSATED) — nested-interface roulette.** Once
+  a path has crossed ≥2 glass interfaces, each further
+  continuation survives with probability = clamped path
+  throughput, compensated by its reciprocal. Deep stacks
+  stop consuming intersections for negligible light.
+- **G2 (EXACT) — Beer–Lambert skip for untinted glass:**
+  tint exactly 1 ⇒ exp(0) = 1; the transcendental is
+  skipped.
+
+CROSS-CUTTING
+- **C2 (EXACT) — emissive hits resolve before attribute
+  interpolation.** Their radiance needs the material
+  alone; an emissive hit no longer pays for the
+  33-float interpolation.
+- **C1 (live path only) — variance-gated adaptive
+  sampling.** Per-pixel sample moments (ΣL, ΣL²) are
+  tracked alongside the accumulation (and carried by
+  reprojection with the same weight ratios). A pixel
+  whose standard error falls under 2% of its mean
+  (+0.0015 floor) stops consuming samples. Stills and
+  the Final Render pass traceFlags = 0 and trace
+  exactly as before; the gate exists only in the live
+  draw path, where its cost is ~2–3% per sample in
+  moment traffic (netted into the figure below).
+
+### Cost model and multiplier arithmetic (all MODELLED)
+
+No host timings exist for this round — see the audit
+note below — so every figure is MODELLED from per-event
+work accounting, with the unit assumptions stated:
+merged-AS intersection = 1.0 unit; attribute
+interpolation 0.35; texture fetch 0.05 / 0.45 (UV) /
+1.05 (triplanar); NEE 1.15 (CDF search + setup + shadow
+traversal); per-event shading overhead 0.25; glass
+interface math 0.15; environment miss 1.0. Event mixes
+per scene are estimated from the audit scenes'
+composition at the audit settings (6 bounces, glass
+budget 6).
+
+| Scene | Per-sample work (units) pre → post | Cost ratio | Samples-to-tolerance factor | Total |
+|---|---|---|---|---|
+| convlight (18 emitters, diffuse) | 10.1 → 8.6 | 1.18× | 1.55× (L1: M 2.44 applied to a 60% direct-light variance share) | **1.83×** |
+| convglass (nested stacks) | 9.9 → 8.9 | 1.11× | ~1.1× | **1.22×** |
+| convrefl (wet gloss) | 14.3 → 12.3 | 1.16× | ~1.15× | **1.33×** |
+
+Three-scene blend ≈ **1.45×** for settled stills. The
+live path adds adaptive sampling: MODELLED 1.3–1.8× on
+settle-phase frame cost for typical editor scenes
+(flat diffuse regions retire early; glass/reflection
+pixels keep sampling), giving ≈ **2.2×** time-to-settle
+as the central live estimate. These are modelled
+figures with stated assumptions, not measurements.
+
+### Convergence audit — present, and honest about its host
+
+Three audit scenes (convglass / convrefl / convlight)
+and a convergence comparison + adaptive A/B harness
+were added to the repro matrix. **They cannot produce
+numbers in CI: the GitHub simulator reports
+`supportsRaytracing = false`, so no acceleration
+structure is ever built there (proven during
+development — the audit's resource printout showed
+every buffer/texture/pipeline present and
+`accel = false`, runs 41505450530 / 41509736093).**
+The whole pre-existing matrix is a logic matrix and
+never needed a real trace. On such hosts the audit
+SKIPs explicitly (`AUDIT-SKIP … rayTracingSupported=false`)
+rather than failing or fabricating numbers; on any
+ray-tracing-capable host it runs in full — settled
+region means vs captured baselines within
+max(4%, 0.004) per region, and gate-ON vs gate-OFF
+live races to 95% convergence. For this release, the
+settled-image guarantee rests on the estimator algebra
+above: no change alters a converged value's
+expectation, and the EXACT changes alter nothing at
+all. **Device frame rates are Sean's verdict, as
+always** — the checks that matter: the glassiest,
+most reflection-heavy, and most light-filled scenes
+settle to the same picture, faster; Final Render
+produces the same image.
+
+No behaviour changes elsewhere: all 57 node kinds,
+weather, imports, Play, save/load untouched.
+
 ---
 
 *Every version above was verified by automated build and inspection before
