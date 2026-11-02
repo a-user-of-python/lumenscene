@@ -1899,7 +1899,6 @@ final class EditorSession: ObservableObject {
         if project.scene.weather.plowCells != nil {
             project.scene.weather.plowCells = nil
         }
-        }
     }
 
     /// v4.3: the quantised exposure step of one A-value, in
