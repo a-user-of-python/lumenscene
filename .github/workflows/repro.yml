@@ -110,6 +110,7 @@ jobs:
               ("plane", ["-LSVariant", "plane"]),
               ("scaled", ["-LSVariant", "scaled"]),
               ("bigplane", ["-LSVariant", "bigplane"]),
+              ("perfbench", ["-LSVariant", "perfbench"]),
               ("wallbox", ["-LSVariant", "wallbox"]),
               ("walldeep", ["-LSVariant", "walldeep"]),
               ("carve", ["-LSVariant", "carve"]),
