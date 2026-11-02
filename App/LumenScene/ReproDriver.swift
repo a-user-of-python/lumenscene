@@ -328,6 +328,7 @@ final class ReproRun {
     private var dragStartX: Double = -2.5
     private var dragX: Double = -2.5
     private var dragMidEmitted = false
+    private var dragStepCount = 0
     private var spawnCheckpointIdx = 0
     private let spawnCheckpoints: [(delay: CFTimeInterval, label: String)] =
         [(5, "spawn+5s"), (15, "spawn+15s"), (30, "spawn+30s"),
@@ -564,6 +565,7 @@ final class ReproRun {
             }
             line += String(format: " mass=%.5f slopeTrue=%.2f spikeR=%.4f",
                            massTotal, slopeTrue, spikeR)
+            line += " remaps=\(renderer.reproRemapCount)"
             switch ReproDriver.variant {
             case "pile":
                 // Cone flank: median local edge slope along
@@ -805,6 +807,8 @@ final class ReproRun {
             dragX = min(dragX + 0.011, dragStartX + 3.3)
             session.project.scene.objects[idx].transform.position[0] = dragX
             session.scheduleRebuild(geometry: true)
+            dragStepCount += 1
+            if dragStepCount % 30 == 0 { emitMetric("dragstep") }
             if !dragMidEmitted, dragX >= dragStartX + 1.65 {
                 dragMidEmitted = true
                 emitMetric("mid-drag")
@@ -956,6 +960,8 @@ final class ReproRun {
             dragX = min(dragX + 0.011, dragStartX + 3.3)
             session.project.scene.objects[idx].transform.position[0] = dragX
             session.scheduleRebuild(geometry: true)
+            dragStepCount += 1
+            if dragStepCount % 30 == 0 { emitMetric("dragstep") }
             if !dragMidEmitted, dragX >= dragStartX + 1.65 {
                 dragMidEmitted = true
                 emitMetric("mid-drag")

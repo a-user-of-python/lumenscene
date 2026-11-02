@@ -3696,6 +3696,7 @@ final class Renderer {
         let latticeSame = simInitialised && !forceInit
             && simVX == vx && simVZ == vz && simOX == ox && simOZ == oz
             && simCS == cs && simSupportHash == hash
+        if !latticeSame && simInitialised { reproRemapCount += 1 }
         if latticeSame {
             // Same lattice: refresh only the static field
             // buffers (ceilings/gates move with exposure / max
@@ -3987,6 +3988,9 @@ final class Renderer {
     // swapStatic): the frame-boundary swap witness — the AS
     // itself can be nil where ray tracing is unsupported, so
     // this flag, not hasGeometry, proves a swap occurred.
+    /// v4.11 diagnostics: full-lattice remaps since launch
+    /// (the drag mass-drift hunt reads this via the metrics).
+    var reproRemapCount = 0
     func reproSimSnapshot() -> (snow: [Float], support: [Float],
                                 ceiling: [Float],
                                 vx: Int, vz: Int, cs: Float,

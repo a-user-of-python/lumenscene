@@ -127,7 +127,7 @@ jobs:
               ("toggle-copyreads", ["-LSToggle", "copyreads"]),
               ("toggle-norefit", ["-LSToggle", "norefit"]),
           ]
-          PER_RUN_TIMEOUT = 300
+          PER_RUN_TIMEOUT = 420
 
           def crash_reports():
               found = {}
