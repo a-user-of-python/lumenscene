@@ -30,7 +30,6 @@ struct EditorView: View {
 
     @State private var showImport = false
     @State private var showNodes = false
-    @State private var showSnowSettings = false
     @State private var shareItem: ShareItem?
     /// v4.2: the top bar switches to its compact row (icon-only
     /// back button, Weather folded into the More menu, narrower
@@ -72,7 +71,6 @@ struct EditorView: View {
             // discarded with the sheet.
             if session.finalRenderPhase == .rendering { session.cancelFinalRender() }
         }) { FinalRenderSheetView(session: session) }
-        .sheet(isPresented: $showSnowSettings) { snowSettingsSheet }
         .sheet(item: $shareItem) { item in ShareSheet(url: item.url) }
     }
 
@@ -155,19 +153,6 @@ struct EditorView: View {
     /// v4.8 (steering 1): water reflection resolution —
     /// Full (1.0, v4.7 quality) / Half / Quarter, mapped to
     /// the session's stepped waterReflectionScale.
-    private var waterReflectionBinding: Binding<Int> {
-        Binding(
-            get: {
-                switch session.waterReflectionScale {
-                case 0.5: return 1
-                case 0.25: return 2
-                default: return 0
-                }
-            },
-            set: { newValue in
-                session.setWaterReflectionScale([1.0, 0.5, 0.25][newValue])
-            })
-    }
 
     /// v4.10 (WS1): idle-freeze delay — Off / 15 s / 30 s /
     /// 1 min / 2 min / 5 min, tags 0-5 mapped to seconds.
@@ -291,11 +276,6 @@ struct EditorView: View {
                     Text("High detail").tag(1)
                     Text("Battery saver").tag(2)
                 }
-                Picker("Water reflections", selection: waterReflectionBinding) {
-                    Text("Full").tag(0)
-                    Text("Half").tag(1)
-                    Text("Quarter").tag(2)
-                }
                 Picker("Idle freeze", selection: idleFreezeBinding) {
                     Text("Off").tag(0)
                     Text("15 s").tag(1)
@@ -342,11 +322,8 @@ struct EditorView: View {
         Picker("Weather", selection: weatherBinding) {
             Text("Off").tag(0)
             Text("Rain").tag(1)
-            Text("Snow").tag(2)
         }
-        Button("Snow settings…") { showSnowSettings = true }
-        if session.project.scene.weather.wetness > 0.01
-            || session.project.scene.weather.snow > 0.01 {
+        if session.project.scene.weather.wetness > 0.01 {
             Divider()
             Button("Clear ground build-up") { session.clearWeatherBuildup() }
         }
@@ -355,117 +332,13 @@ struct EditorView: View {
     /// v4.3: binding for the Max Snow Depth slider — writes go
     /// through the session's explicit settings call (A preserved,
     /// renderer depth + geometry rescheduled there).
-    private var maxSnowDepthBinding: Binding<Double> {
-        Binding(
-            get: { session.project.scene.weather.maxDepth },
-            set: { session.setMaxSnowDepth($0) })
-    }
 
     /// v4.7: binding for the Temperature slider — writes go
     /// through the session's explicit settings call.
-    private var temperatureBinding: Binding<Double> {
-        Binding(
-            get: { session.project.scene.weather.temperature ?? 10.0 },
-            set: { session.setTemperature($0) })
-    }
 
     /// v4.3: the Snow settings sheet (from the Weather menu):
     /// the user-set Max Snow Depth, the per-project snow pattern
     /// seed with a re-roll, and the live depth readout.
-    private var snowSettingsSheet: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    if session.project.scene.weather.temperature == nil {
-                        Text("Not set — rain and snow behave as they always have.")
-                            .foregroundStyle(.secondary)
-                        Button("Set temperature") { session.setTemperature(10.0) }
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    } else {
-                        HStack {
-                            Text("Temperature")
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
-                            Spacer()
-                            Text(session.liveTemperatureText)
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
-                        }
-                        Slider(value: temperatureBinding, in: -20...30, step: 0.5)
-                        Text("At or below freezing, rain falls as snow and puddles freeze into ice. Above freezing, snow falls as rain and the snowpack melts, faster the warmer it is.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Button("Clear temperature") { session.setTemperature(nil) }
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-                } header: {
-                    Text("Temperature").lineLimit(1).fixedSize(horizontal: true, vertical: false)
-                }
-                Section {
-                    HStack {
-                        Text("Max Snow Depth")
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                        Spacer()
-                        Text(String(format: "%.2f m", session.project.scene.weather.maxDepth))
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-                    Slider(value: maxSnowDepthBinding, in: 0.05...2.0, step: 0.05)
-                    Text("Snow keeps falling until it reaches this depth. Lowering it lets deep snow settle down gradually — it isn't removed instantly.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } header: {
-                    Text("Depth").lineLimit(1).fixedSize(horizontal: true, vertical: false)
-                }
-                Section {
-                    HStack {
-                        Text("Pattern")
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                        Spacer()
-                        Text(session.project.scene.weather.seed == 0
-                             ? "Pattern #0 (Classic)"
-                             : "Pattern #\(session.project.scene.weather.seed)")
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-                    Button("Re-roll pattern") { session.rerollSnowSeed() }
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
-                } header: {
-                    Text("Snow Pattern").lineLimit(1).fixedSize(horizontal: true, vertical: false)
-                }
-                Section {
-                    Text(String(format: "Snow now: %.2f m of %.2f m max (%d%%)",
-                                session.liveSnowAmount,
-                                session.project.scene.weather.maxDepth,
-                                Int((session.liveSnowProgress * 100).rounded())))
-                        .monospacedDigit()
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
-                } header: {
-                    Text("Right Now").lineLimit(1).fixedSize(horizontal: true, vertical: false)
-                }
-            }
-            .navigationTitle("Snow Settings")
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { showSnowSettings = false }
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
-                }
-            }
-        }
-    }
 
     /// v4.6: tree taps route through here — in Multi Select
     /// mode a row tap toggles membership instead of replacing
@@ -940,26 +813,6 @@ struct TreeFooterView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .padding(.horizontal, 8)
-                    .padding(.bottom, footer.snowDepthText != nil ? 2 : 8)
-            }
-            // v4.3: the absolute depth under the cover percent —
-            // "Snow depth: 0.18 m of 0.30 m max".
-            if let snowDepthText = footer.snowDepthText {
-                Text(snowDepthText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, footer.temperatureText == nil ? 8 : 2)
-            }
-            // v4.7: temperature status, only when temperature
-            // is set — e.g. "−4.5 °C — puddles freezing".
-            if let temperatureText = footer.temperatureText {
-                Text(temperatureText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .padding(.horizontal, 8)
                     .padding(.bottom, 8)
             }
             // v4.10.1: post-crash diagnostic — the weather
@@ -1395,7 +1248,7 @@ struct MultiSelectionPropertiesView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(4)
                 Divider()
-                Text("Drag any selected object in the view to move them all together. Each one still pushes snow on its own when dragged through it.")
+                Text("Drag any selected object in the view to move them all together. Each one moves on its own path.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 Button {

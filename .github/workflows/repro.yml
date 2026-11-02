@@ -1,4 +1,4 @@
-name: Repro (snow accumulation)
+name: Repro
 
 # LS-REPRO harness (Lane A, v4.10.3): builds LumenScene for the
 # iOS Simulator, boots a simulator, and launches the app with
@@ -105,23 +105,13 @@ jobs:
           # copyreads, norefit).
           RUNS = [
               ("default", []),
-              ("freeze", ["-LSVariant", "freeze"]),
-              ("freeze2", ["-LSVariant", "freeze2"]),
               ("plane", ["-LSVariant", "plane"]),
               ("scaled", ["-LSVariant", "scaled"]),
               ("bigplane", ["-LSVariant", "bigplane"]),
               ("perfbench", ["-LSVariant", "perfbench"]),
-              ("wallbox", ["-LSVariant", "wallbox"]),
-              ("walldeep", ["-LSVariant", "walldeep"]),
-              ("carve", ["-LSVariant", "carve"]),
-              ("refill", ["-LSVariant", "refill"]),
-              ("snowgate", ["-LSVariant", "snowgate"]),
               ("gravfall", ["-LSVariant", "gravfall"]),
               ("gravstack", ["-LSVariant", "gravstack"]),
-              ("toggle-simtick", ["-LSToggle", "simtick"]),
               ("toggle-syncas", ["-LSToggle", "syncas"]),
-              ("toggle-noscoped", ["-LSToggle", "noscoped"]),
-              ("toggle-copyreads", ["-LSToggle", "copyreads"]),
               ("toggle-norefit", ["-LSToggle", "norefit"]),
           ]
           PER_RUN_TIMEOUT = 420

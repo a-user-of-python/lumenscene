@@ -888,7 +888,9 @@ final class GameRuntime {
             case "Rain":
                 session.runtimeSetWeather(mode: 1, clear: node.boolean("clear", false))
             case "Snow":
-                session.runtimeSetWeather(mode: 2, clear: node.boolean("clear", false))
+                // v4.13: snow is retired — a legacy Snow setting
+                // in an old graph turns the weather off.
+                session.runtimeSetWeather(mode: 0, clear: node.boolean("clear", false))
             case "Off":
                 session.runtimeSetWeather(mode: 0, clear: node.boolean("clear", false))
             default:
@@ -1389,14 +1391,16 @@ final class GameRuntime {
             enqueueFire(node.id, "out")
 
         case "actWeatherControl":
-            // Both scales always forward; the wet/snow levels
-            // forward only when their "set" bool is on (nil =
-            // leave that channel untouched).
+            // Both scales always forward; the wet level
+            // forwards only when its "set" bool is on (nil =
+            // leave it untouched). (v4.13: the snow channel was
+            // retired with snow itself; the session funnel still
+            // accepts and ignores it for old graphs.)
             session.runtimeSetWeatherControl(
                 rateScale: node.num("rateScale", 1),
                 intensityScale: node.num("intensityScale", 1),
                 wet: node.boolean("setWet", false) ? node.num("wet", 0.5) : nil,
-                snow: node.boolean("setSnow", false) ? node.num("snow", 0.5) : nil)
+                snow: nil)
             enqueueFire(node.id, "out")
 
         case "actShowValue":

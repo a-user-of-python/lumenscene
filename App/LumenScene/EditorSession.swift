@@ -31,9 +31,7 @@ final class FooterDisplay: ObservableObject {
     /// 30%"); nil = the line is not shown.
     @Published private(set) var weatherText: String? = nil
     /// "Snow depth: A m of M m max"; nil = not shown.
-    @Published private(set) var snowDepthText: String? = nil
     /// Temperature status line; nil = not shown.
-    @Published private(set) var temperatureText: String? = nil
     /// v4.10.1: post-crash diagnostic line ("Last step: …"),
     /// the weather-accumulation step the previous session
     /// last reached; nil = not shown.
@@ -42,12 +40,10 @@ final class FooterDisplay: ObservableObject {
     /// Change-only writes: an unchanged string never fires
     /// objectWillChange, so a footer observing this object
     /// re-evaluates only when a displayed line really changes.
-    func update(hint: String, weather: String?, snowDepth: String?,
+    func update(hint: String, weather: String?, diag: String? = nil) {
                 temperature: String?, diag: String? = nil) {
         if hintText != hint { hintText = hint }
         if weatherText != weather { weatherText = weather }
-        if snowDepthText != snowDepth { snowDepthText = snowDepth }
-        if temperatureText != temperature { temperatureText = temperature }
         if diagText != diag { diagText = diag }
     }
 }
@@ -201,18 +197,8 @@ final class EditorSession: ObservableObject {
         if w.wetness > 0.02 {
             parts.append("Ground: \(Int((w.wetness * 100).rounded()))% wet")
         }
-        if w.snow > 0.02 {
-            parts.append("Snow cover: \(Int((w.snow * 100).rounded()))%")
-        }
-        if parts.isEmpty {
-            if w.mode == 1 { parts.append("Ground: 0% wet") }
-            else if w.mode == 2 { parts.append("Snow cover: 0%") }
-        }
-        let showWeather = w.mode != 0 || w.wetness > 0.02 || w.snow > 0.02
-        let snowDepth: String? = liveSnowAmount > 0.005
-            ? String(format: "Snow depth: %.2f m of %.2f m max",
-                     liveSnowAmount, w.maxDepth)
-            : nil
+        if parts.isEmpty, w.mode == 1 { parts.append("Ground: 0% wet") }
+        let showWeather = w.mode != 0 || w.wetness > 0.02
         // v4.10.1: the previous session's last weather step
         // stays readable in the footer until this session's
         // own weather path writes a step (the renderer's tag
@@ -237,8 +223,6 @@ final class EditorSession: ObservableObject {
                 ? "Multi Select is on: tap objects in the view or the list to add or remove them. Drag any selected object to move them all. Tap empty space to clear."
                 : "Tap an object in the view to select it."),
             weather: showWeather ? parts.joined(separator: " · ") : nil,
-            snowDepth: snowDepth,
-            temperature: temperatureStatusText,
             diag: diag)
     }
 
@@ -266,11 +250,7 @@ final class EditorSession: ObservableObject {
     /// leak into the authored scene, because save() syncs the
     /// accumulators into the published project.
     private var playBuildupWet: Double = 0
-    private var playBuildupSnow: Double = 0
     private var playGeoStepWet: Int = 0
-    private var playGeoStepSnow: Int = 0
-    private var playSnowfallTotal: Double = 0
-    private var playBuildupFreeze: Double = 0
 
     /// v4.1 (§3.4): Play player speed in m/s. Session-only (NOT
     /// persisted); Play entry resets it to the v4.0 constant.
@@ -347,43 +327,24 @@ final class EditorSession: ObservableObject {
     /// normalised drift factor). The 0...1 progress the rest of
     /// the app speaks is derived: p = A / maxDepth (see below).
     private var buildupWet: Double = 0
-    private var buildupSnow: Double = 0
     /// v4.7: cumulative snowfall clock (metres fallen, uncapped,
     /// non-published per frame like the other accumulators).
-    private var snowfallTotal: Double = 0
     /// v4.7: puddle freeze fraction 0...1 (non-published).
-    private var buildupFreeze: Double = 0
 
     // MARK: v4.3 snow depth / exposure / footprints / player figure
 
     /// The user-set target depth (live from the published
     /// weather state; the settings sheet edits it as an explicit
     /// user action, which is a legitimate published write).
-    private var snowMaxDepth: Double { project.scene.weather.maxDepth }
     /// Step size in metres for quantised geometry: maxDepth / 24.
-    private var snowStepMetres: Double { snowMaxDepth / 24 }
     /// Unclamped accumulation progress p = A / maxDepth.
-    private var snowProgress: Double {
-        snowMaxDepth > 0 ? buildupSnow / snowMaxDepth : 0
-    }
     /// Clamped progress pc in 0...1 — what the persisted
     /// `weather.snow` level and the continuous shading level are.
-    private var snowProgressClamped: Double { min(1, max(0, snowProgress)) }
     /// Quantised AMOUNT step of A (uncapped — past 24 while deep
     /// snow above the target compacts). This is what geoStepSnow
     /// now counts; the renderer's weatherGeoSnow is the clamped
     /// progress step derived from it.
-    private var snowAmountStep: Int {
-        // v4.10.1 hardening: Int() traps on a non-finite or
-        // out-of-range quotient (a persisted snowAmount is a
-        // plain Double in the project file). Clamp instead;
-        // identical for every value the rates can produce.
-        guard snowMaxDepth > 0, buildupSnow.isFinite else { return 0 }
-        let q = (buildupSnow / snowStepMetres).rounded()
-        return q.isFinite ? Int(min(max(q, -1_000_000), 1_000_000)) : 0
-    }
     /// Renderer-facing quantised progress (0...24).
-    private var snowProgressStep: Int { Int((snowProgressClamped * 24).rounded()) }
 
     /// v4.3 (§4): per-object snow exposure — each scene object
     /// AND each Play clone tracks the absolute accumulation it
@@ -394,21 +355,13 @@ final class EditorSession: ObservableObject {
     /// tick (assignment is the sync — a deleted object's entry
     /// can never linger) and written back into the scene objects
     /// only on save/export (published-write discipline).
-    private var snowExposureA: [UUID: Float] = [:]
     /// The per-object exposure steps already baked into geometry
     /// / dynamic materials, for the coalesced rebuild trigger.
-    private var bakedExposureSteps: [UUID: Int] = [:]
 
     /// v4.3: player footprints in Play — transient stamps in the
     /// snow, fed to the renderer as compression spots. Nothing
     /// here is persisted; Play exit clears them before the
     /// snapshot-restore rebuild so restored snow is pristine.
-    private struct SnowStamp { var x: Float; var z: Float; var expiresAt: CFTimeInterval }
-    private var snowStamps: [SnowStamp] = []
-    private var lastStampFeet: SIMD2<Float>?
-    private var stampParity: Int = 0
-    private var lastImprintRebuildAt: CFTimeInterval = 0
-    private var imprintRebuildPending: Bool = false
 
     /// v4.3: player-figure driver state (session-only, visual
     /// only — playPosition / eye height / pose funnels are never
@@ -430,7 +383,6 @@ final class EditorSession: ObservableObject {
     /// only when a step boundary is crossed, at most ~1 per
     /// 0.8 s; the shading levels stay continuous throughout.
     private var geoStepWet = -1
-    private var geoStepSnow = -1
     private var lastGeoRebuildAt: CFTimeInterval = 0
 
     /// Weather dynamics (v3.2 — same non-published discipline
@@ -720,55 +672,15 @@ final class EditorSession: ObservableObject {
         // the file has one; v1–v4.2 files carry only the 0...1
         // level, so A = level * maxDepth (at the default 0.3 m
         // that is exactly the old build-up).
-        buildupSnow = project.scene.weather.snowAmount
-            ?? (project.scene.weather.snow * project.scene.weather.maxDepth)
-        // v4.10.2 (NaN hunt): a corrupt/legacy persisted
-        // amount must not reach the renderer's ceiling bake —
-        // Swift's max/min are comparison-based and pass NaN
-        // straight through, and from there it would reach
-        // sheet vertices and the AS build unguarded.
-        if !buildupSnow.isFinite { buildupSnow = 0 }
-        snowfallTotal = project.scene.weather.snowfallTotal ?? 0
-        buildupFreeze = min(1, max(0, project.scene.weather.puddleFreeze ?? 0))
-        // v4.3 (§4): seed the per-object exposure map. A persisted
-        // value wins; absent means the object had fully caught
-        // up with the ambient snow (old projects keep their look).
-        for obj in project.scene.objects {
-            // v4.10.2: sanitise the persisted exposure itself,
-            // not just its step conversion (round 1 hardened
-            // only the Int trap) — a non-finite amount would
-            // flow into the ceiling bake unsanitised.
-            snowExposureA[obj.id] = obj.snowExposure.map {
-                let f = Float($0)
-                return f.isFinite ? f : Float(buildupSnow)
-            } ?? Float(buildupSnow)
+        // v4.13: snow is removed — a project saved in snow
+        // mode opens with weather off; its stored snow state
+        // (amount, exposures, plow layer, freeze) is ignored.
+        if project.scene.weather.mode == 2 {
+            project.scene.weather.mode = 0
         }
-        bakedExposureSteps = snowExposureA.mapValues { exposureStep(for: $0) }
         renderer.onNeedsFrame = { [weak self] in self?.kickRender() }
         _ = renderer.reloadTextureArraysIfNeeded()
-        // v4.3: hand the renderer this project's field seed and
-        // depth settings BEFORE the first rebuild, so the baked
-        // field and the snow geometry match the saved project.
-        renderer.weatherSeed = project.scene.weather.seed
-        renderer.weatherMaxDepth = Float(project.scene.weather.maxDepth)
-        renderer.weatherSnowAmount = Float(buildupSnow)
-        renderer.objectSnowAmounts = snowExposureA
-        renderer.snowFootprints = []
-        // v4.11: the v4.6 plow layer is retired — old saves'
-        // plowCells still decode (the field stays in the
-        // model) but are deliberately not applied: trails are
-        // the physics simulation's own state now, and a stale
-        // recorded layer must not shape it.
-        renderer.snowfallTotal = Float(snowfallTotal)
-        renderer.weatherFreeze = Float(buildupFreeze)
-        // v3.4: seed the renderer's quantised geometry levels
-        // from the saved build-up BEFORE the first rebuild, so a
-        // project saved with snow/puddles opens with its solid
-        // weather already in place.
         geoStepWet = Int((buildupWet * 24).rounded())
-        geoStepSnow = snowAmountStep
-        renderer.weatherGeoWet = Float(geoStepWet) / 24
-        renderer.weatherGeoSnow = Float(snowProgressStep) / 24
         renderer.rebuild(scene: project.scene, meshes: meshes)
         // v4.3: the player figure stands idle at the saved Play
         // start in edit mode.
@@ -892,8 +804,6 @@ final class EditorSession: ObservableObject {
         // v4.3: objects that (re)appear via undo/redo join the
         // exposure map at their snapshot value (absent = caught
         // up); entries for vanished objects are pruned.
-        ensureExposuresForSceneObjects()
-        pruneExposures()
         renderer.rebuild(scene: project.scene, meshes: meshes)
         kickRender()
     }
@@ -1104,20 +1014,6 @@ final class EditorSession: ObservableObject {
         obj.transform.position = [t[0], kind == "plane" ? 0 : defaultY(for: obj), t[2]]
         project.scene.objects.append(obj)
         noteSceneObjectsChanged()
-        // v4.3: a brand-new object has caught NO snow yet — if
-        // snow is already down it gathers visibly from zero.
-        snowExposureA[obj.id] = 0
-        bakedExposureSteps[obj.id] = 0
-        // v4.6 (fold-in fix): the renderer's exposure map must
-        // learn the new id BEFORE the rebuild below — until
-        // the next frameTick sync it had no entry, and BOTH
-        // snow paths fall back to the ambient amount for an
-        // absent key (the sheet's support attribution and
-        // gpuMaterialForObject's shading factor), so a block
-        // placed in deep snow appeared with a full snow cap
-        // and full whitening at placement. Sean's restated
-        // rule (2026-10-31 16:57): new blocks land clean.
-        renderer.objectSnowAmounts = snowExposureA
         selection = obj.id
         renderer.rebuild(scene: project.scene, meshes: meshes)
         kickRender()
@@ -1156,10 +1052,6 @@ final class EditorSession: ObservableObject {
         let removedID = project.scene.objects[idx].id
         project.scene.objects.remove(at: idx)
         noteSceneObjectsChanged()
-        // v4.3: prune the deleted object's exposure immediately,
-        // so it never lingers in the renderer's map.
-        snowExposureA.removeValue(forKey: removedID)
-        bakedExposureSteps.removeValue(forKey: removedID)
         selection = nil
         renderer.rebuild(scene: project.scene, meshes: meshes)
         kickRender()
@@ -1238,13 +1130,8 @@ final class EditorSession: ObservableObject {
         beginEdit()
         project.scene.objects.removeAll { ids.contains($0.id) }
         noteSceneObjectsChanged()
-        for id in ids {
-            snowExposureA.removeValue(forKey: id)
-            bakedExposureSteps.removeValue(forKey: id)
-        }
         multiSelection = []
         selection = nil
-        renderer.objectSnowAmounts = snowExposureA
         renderer.rebuild(scene: project.scene, meshes: meshes)
         kickRender()
         status = "Deleted \(ids.count) objects."
@@ -1339,16 +1226,9 @@ final class EditorSession: ObservableObject {
                     obj.transform.position = [t[0] - cx, -Double(b.min.y), t[2] - cz]
                     self.meshes[obj.id] = mesh
                     self.project.scene.objects.append(obj)
-                    // v4.3: imported parts start with no snow
-                    // caught, like any newly created object.
-                    self.snowExposureA[obj.id] = 0
-                    self.bakedExposureSteps[obj.id] = 0
                     if firstID == nil { firstID = obj.id }
                 }
                 self.noteSceneObjectsChanged()
-                // v4.6: same placement fix as addPrimitive —
-                // sync the renderer's map before the rebuild.
-                self.renderer.objectSnowAmounts = self.snowExposureA
                 self.selection = firstID
                 self.renderer.rebuild(scene: self.project.scene, meshes: self.meshes)
                 self.kickRender()
@@ -1375,11 +1255,7 @@ final class EditorSession: ObservableObject {
             playWeatherMode = project.scene.weather.mode
             // v4.1 (F15/§4.4): snapshot the weather build-up too.
             playBuildupWet = buildupWet
-            playBuildupSnow = buildupSnow
             playGeoStepWet = geoStepWet
-            playGeoStepSnow = geoStepSnow
-            playSnowfallTotal = snowfallTotal
-            playBuildupFreeze = buildupFreeze
             // v4.1 (Appendix B): every new session state resets
             // on Play entry.
             playSpeed = 2.4
@@ -1399,10 +1275,6 @@ final class EditorSession: ObservableObject {
             runtimeUnloaded.removeAll()
             if !playBanner.isEmpty { playBanner = "" }
             bannerExpiry = nil
-            // v4.3: footprints start empty every Play session,
-            // and the figure driver starts from the look yaw
-            // with a still pose (first Play tick force-sends it).
-            clearSnowStamps()
             figureHeading = Float(project.scene.camera.playYaw) * .pi / 180
             figureWalkPhase = 0
             figureWalkBlend = 0
@@ -1423,16 +1295,8 @@ final class EditorSession: ObservableObject {
             // v4.1 (§7.4): clones die with the Play session; the
             // setDynamicEntries([]) above already removed their
             // renderer entries.
-            // v4.3: their exposure entries die with them.
-            for clone in clones {
-                snowExposureA.removeValue(forKey: clone.cloneID)
-                bakedExposureSteps.removeValue(forKey: clone.cloneID)
-            }
             clones.removeAll()
             cloneEntries.removeAll()
-            // v4.3: footprints clear BEFORE the snapshot-restore
-            // rebuild below, so the restored snow is pristine.
-            clearSnowStamps()
             renderer.setParticleSoups([])
             renderer.unloadedAreaIDs = []
             runtimeUnloaded.removeAll()
@@ -1441,23 +1305,7 @@ final class EditorSession: ObservableObject {
             // restored geometry levels, and reset every new
             // session state (Appendix B: resets in BOTH branches).
             buildupWet = playBuildupWet
-            buildupSnow = playBuildupSnow
-            snowfallTotal = playSnowfallTotal
-            buildupFreeze = playBuildupFreeze
-            geoStepWet = playGeoStepWet
-            geoStepSnow = playGeoStepSnow
-            renderer.weatherGeoWet = Float(geoStepWet) / 24
-            renderer.weatherGeoSnow = Float(snowProgressStep) / 24
             project.scene.weather.wetness = buildupWet
-            // v4.3: the published level is the clamped progress;
-            // the absolute amount rides alongside it.
-            project.scene.weather.snow = snowProgressClamped
-            project.scene.weather.snowAmount = buildupSnow
-            // v4.3: exposures gathered during Play belong to the
-            // Play session's weather, which was just rolled back
-            // — clamp them to the restored ambient so nothing
-            // keeps more snow than the ground has.
-            clampExposuresToAmbient()
             weatherRateScale = 1.0
             weatherIntensityScale = 1.0
             playSpeed = 2.4
@@ -1836,31 +1684,17 @@ final class EditorSession: ObservableObject {
                                   wet: Double?, snow: Double?) {
         if let rateScale { weatherRateScale = min(10, max(0, rateScale)) }
         if let intensityScale { weatherIntensityScale = min(4, max(0, intensityScale)) }
-        if wet != nil || snow != nil {
-            if let wet { buildupWet = min(1, max(0, wet)) }
-            // v4.3: the node's snow parameter is a 0...1 PROGRESS
-            // (its catalogue contract is unchanged) — in absolute
-            // terms that is progress * maxDepth metres.
-            if let snow { buildupSnow = min(1, max(0, snow)) * snowMaxDepth }
-            // v4.9: change-only published writes (the rebuild +
-            // reset below still run exactly as before).
+        // v4.13: the snow channel is retired — old graphs may
+        // still pass it; it is accepted and ignored. A wet set
+        // writes the accumulator + published value and resets
+        // accumulation (wetness is a shading uniform now; no
+        // geometry rebuild follows it).
+        if let wet {
+            buildupWet = min(1, max(0, wet))
             if project.scene.weather.wetness != buildupWet {
                 project.scene.weather.wetness = buildupWet
             }
-            if project.scene.weather.snow != snowProgressClamped {
-                project.scene.weather.snow = snowProgressClamped
-            }
-            if project.scene.weather.snowAmount != buildupSnow {
-                project.scene.weather.snowAmount = buildupSnow
-            }
-            // A direct level set can only lower exposures (they
-            // re-gather from falling snow, per the age rule).
-            clampExposuresToAmbient()
-            geoStepWet = Int((buildupWet * 24).rounded())
-            geoStepSnow = snowAmountStep
-            renderer.weatherGeoWet = Float(geoStepWet) / 24
-            renderer.weatherGeoSnow = Float(snowProgressStep) / 24
-            renderer.rebuild(scene: project.scene, meshes: meshes)
+            renderer.weatherWet = Float(buildupWet)
             renderer.resetAccumulation()
         }
         kickRender()
@@ -1928,13 +1762,6 @@ final class EditorSession: ObservableObject {
             temp.id = cloneID
             temp.transform = request.transform
             temp.material = snapshotMaterial
-            // v4.3: the clone's exposure starts at ZERO and is
-            // registered BEFORE its material is built below, so
-            // the spawn-time material already carries the bare
-            // (uncaught) snow factor — a clone spawned into deep
-            // snow appears bare and gathers visibly.
-            snowExposureA[cloneID] = 0
-            bakedExposureSteps[cloneID] = 0
             newClones.append(SpawnedClone(cloneID: cloneID, sourceID: request.sourceID,
                                           transform: request.transform,
                                           material: snapshotMaterial, triCount: tris))
@@ -1947,7 +1774,6 @@ final class EditorSession: ObservableObject {
         if !spawned.isEmpty {
             clones.append(contentsOf: newClones)
             cloneEntries.append(contentsOf: newEntries)
-            renderer.objectSnowAmounts = snowExposureA
             renderer.setDynamicEntries(dynamicEntries + cloneEntries)
             kickRender()
         }
@@ -1961,12 +1787,6 @@ final class EditorSession: ObservableObject {
         guard !removed.isEmpty else { return }
         clones.removeAll { removed.contains($0.cloneID) }
         cloneEntries.removeAll { removed.contains($0.key) }
-        // v4.3: despawned clones' exposure entries go too.
-        for id in removed {
-            snowExposureA.removeValue(forKey: id)
-            bakedExposureSteps.removeValue(forKey: id)
-        }
-        renderer.objectSnowAmounts = snowExposureA
         renderer.setDynamicEntries(dynamicEntries + cloneEntries)
         kickRender()
     }
@@ -1976,9 +1796,6 @@ final class EditorSession: ObservableObject {
         guard clones.contains(where: { $0.cloneID == cloneID }) else { return }
         clones.removeAll { $0.cloneID == cloneID }
         cloneEntries.removeAll { $0.key == cloneID }
-        snowExposureA.removeValue(forKey: cloneID)
-        bakedExposureSteps.removeValue(forKey: cloneID)
-        renderer.objectSnowAmounts = snowExposureA
         renderer.setDynamicEntries(dynamicEntries + cloneEntries)
         kickRender()
     }
@@ -2047,6 +1864,7 @@ final class EditorSession: ObservableObject {
     /// state, but NOT undoable — undo snapshots only cover objects,
     /// so no beginEdit() here.
     func setWeatherMode(_ mode: Int) {
+        let mode = mode == 2 ? 0 : mode // v4.13: snow mode retired — treated as Off
         noteUserInput()
         // Accumulators stay the source of truth — do not reset
         // them on a mode change (they were initialised from the
@@ -2075,85 +1893,30 @@ final class EditorSession: ObservableObject {
         if project.scene.weather.wetness != buildupWet {
             project.scene.weather.wetness = buildupWet
         }
-        // v4.3: the level persists as clamped progress; the
-        // absolute amount and the per-object exposures ride
-        // along so a reopened project resumes exactly here.
-        if project.scene.weather.snow != snowProgressClamped {
-            project.scene.weather.snow = snowProgressClamped
-        }
-        if project.scene.weather.snowAmount != buildupSnow {
-            project.scene.weather.snowAmount = buildupSnow
-        }
-        syncExposuresToProject()
-        // v4.11: new saves write no plow layer (the field is
-        // retired; see loadFromProject). Projects saved by
-        // older versions keep decoding, with the layer ignored.
+        // v4.13: snow state is no longer written back — stored
+        // keys in old files are left as they are (ignored on
+        // load). The retired plow layer is still actively
+        // cleared so new saves carry none.
         if project.scene.weather.plowCells != nil {
             project.scene.weather.plowCells = nil
         }
-        // v4.7: snowfall clock + freeze fraction persist the
-        // same way — nil at their zero values so untouched
-        // projects keep byte-identical saves.
-        let snowfallValue: Double? = snowfallTotal == 0 ? nil : snowfallTotal
-        if project.scene.weather.snowfallTotal != snowfallValue {
-            project.scene.weather.snowfallTotal = snowfallValue
-        }
-        let freezeValue: Double? = buildupFreeze == 0 ? nil : buildupFreeze
-        if project.scene.weather.puddleFreeze != freezeValue {
-            project.scene.weather.puddleFreeze = freezeValue
         }
     }
 
     /// v4.3: the quantised exposure step of one A-value, in
     /// maxDepth/24 units (the same quantum as the geometry steps).
-    private func exposureStep(for amount: Float) -> Int {
-        // v4.10.1 hardening: a persisted per-object exposure
-        // decodes through Float, so a corrupt value can arrive
-        // non-finite; Int() would trap on it (this runs at
-        // session init via bakedExposureSteps). Clamp instead.
-        guard snowMaxDepth > 0, amount.isFinite else { return 0 }
-        let q = (Double(amount) / snowStepMetres).rounded()
-        return q.isFinite ? Int(min(max(q, -1_000_000), 1_000_000)) : 0
-    }
 
     /// v4.3: scene objects with no exposure entry join at their
     /// persisted value (absent = fully caught up). Used after
     /// loads and snapshot restores — creation funnels register
     /// their objects explicitly at 0 before this could see them.
-    private func ensureExposuresForSceneObjects() {
-        for obj in project.scene.objects where snowExposureA[obj.id] == nil {
-            // v4.10.2: same non-finite sanitisation as the
-            // init seeding — see there.
-            snowExposureA[obj.id] = obj.snowExposure.map {
-                let f = Float($0)
-                return f.isFinite ? f : Float(buildupSnow)
-            } ?? Float(buildupSnow)
-            bakedExposureSteps[obj.id] = exposureStep(for: snowExposureA[obj.id] ?? 0)
-        }
-    }
 
     /// v4.3: drop exposure entries for ids that are neither scene
     /// objects nor live clones (save / despawn / delete paths).
-    private func pruneExposures() {
-        let live = Set(project.scene.objects.map(\.id)).union(clones.map(\.cloneID))
-        snowExposureA = snowExposureA.filter { live.contains($0.key) }
-        bakedExposureSteps = bakedExposureSteps.filter { live.contains($0.key) }
-    }
 
     /// v4.3: no object can hold more snow than the ambient A —
     /// after melts, compaction, direct level sets and Play-exit
     /// restores, every entry clamps down to A.
-    private func clampExposuresToAmbient() {
-        let cap = Float(buildupSnow)
-        // v4.10.1 hardening: iterate a SNAPSHOT of the keys —
-        // writing values back into the same dictionary while
-        // its Keys view is being iterated is mutation during
-        // enumeration (the frameTick growth loop and the
-        // clear-buildup loop follow the same discipline).
-        for key in Array(snowExposureA.keys) where (snowExposureA[key] ?? 0) > cap {
-            snowExposureA[key] = cap
-        }
-    }
 
     /// v4.3: re-bake the GPU materials of every dynamic entry
     /// (promoted scene objects + clones) so the snow factor the
@@ -2162,47 +1925,11 @@ final class EditorSession: ObservableObject {
     /// trigger in frameTick while snow is active. Clone
     /// materials are built from a temp object exactly as the
     /// spawn funnel builds them.
-    private func refreshDynamicSnowMaterials() {
-        for i in dynamicEntries.indices {
-            let key = dynamicEntries[i].key
-            guard let obj = project.scene.object(id: key) else { continue }
-            let gpu = renderer.gpuMaterialForObject(obj)
-            dynamicEntries[i].material = gpu
-            renderer.setDynamicMaterial(key: key, material: gpu)
-        }
-        for i in cloneEntries.indices {
-            let key = cloneEntries[i].key
-            guard let clone = clones.first(where: { $0.cloneID == key }),
-                  let source = project.scene.object(id: clone.sourceID)
-            else { continue }
-            var temp = source
-            temp.id = clone.cloneID
-            temp.transform = clone.transform
-            temp.material = clone.material
-            let gpu = renderer.gpuMaterialForObject(temp)
-            cloneEntries[i].material = gpu
-            renderer.setDynamicMaterial(key: key, material: gpu)
-        }
-    }
 
     /// v4.3: write the live exposure map back into the scene
     /// objects (scene objects ONLY — clones are Play-session
     /// ephemera). Called from save()/exports via
     /// syncWeatherToProject; never per frame.
-    func syncExposuresToProject() {
-        pruneExposures()
-        noteSceneObjectsChanged()
-        for i in project.scene.objects.indices {
-            if let exp = snowExposureA[project.scene.objects[i].id] {
-                // v4.9: change-only per object (save-rate, but
-                // the loop previously republished per object).
-                let value = Double(exp)
-                if project.scene.objects[i].snowExposure != value {
-                    project.scene.objects[i].snowExposure = value
-                }
-            }
-        }
-    }
 
     /// v4.3 (Weather sheet): set the Max Snow Depth. An explicit
     /// user action, so the published write is legitimate (weather
@@ -2211,30 +1938,11 @@ final class EditorSession: ObservableObject {
     /// building deeper; lowering it leaves deep snow standing,
     /// compacting slowly toward the new target while it snows
     /// (frameTick), never bulldozed instantly.
-    func setMaxSnowDepth(_ value: Double) {
-        let clamped = min(2.0, max(0.05, value))
-        project.scene.weather.maxDepth = clamped
-        project.scene.weather.snow = snowProgressClamped
-        project.scene.weather.snowAmount = buildupSnow
-        renderer.weatherMaxDepth = Float(clamped)
-        geoStepSnow = snowAmountStep
-        renderer.weatherGeoSnow = Float(snowProgressStep) / 24
-        bakedExposureSteps = snowExposureA.mapValues { exposureStep(for: $0) }
-        scheduleRebuild(geometry: true)
-        kickRender()
-        refreshFooter()
-    }
 
     /// v4.7 (Weather sheet): set the temperature (°C), or nil
     /// to clear it back to legacy behaviour. An explicit user
     /// action, so the published write is legitimate (same
     /// precedent as setMaxSnowDepth; not undoable).
-    func setTemperature(_ c: Double?) {
-        project.scene.weather.temperature = c.map { min(30, max(-20, $0)) }
-        renderer.resetAccumulation()
-        kickRender()
-        refreshFooter()
-    }
 
     /// v4.8 (steering 1): water reflection resolution. Held
     /// on the renderer exactly like the quality preference
@@ -2246,40 +1954,12 @@ final class EditorSession: ObservableObject {
     /// Full / Half / Quarter segments in the Render settings
     /// surface, beside the existing Quality picker that binds
     /// renderer.qualityPreference (EditorView ~line 140).
-    var waterReflectionScale: Double { Double(renderer.waterReflectionScale) }
-    func setWaterReflectionScale(_ scale: Double) {
-        let steps: [Double] = [1.0, 0.5, 0.25]
-        let snapped = steps.min(by: { abs($0 - scale) < abs($1 - scale) }) ?? 1.0
-        renderer.waterReflectionScale = Float(snapped)
-        renderer.resetAccumulation()
-        kickRender()
-    }
 
     /// v4.7: live temperature accessors for the UI.
-    var liveTemperature: Double? { project.scene.weather.temperature }
-    var liveFreeze: Double { buildupFreeze }
-    var liveSnowfallTotal: Double { snowfallTotal }
     /// Formatted temperature with the real minus sign, e.g.
     /// "+10.0 °C" / "−4.5 °C" / "0.0 °C".
-    var liveTemperatureText: String {
-        guard let t = liveTemperature else { return "" }
-        if t > 0 { return String(format: "+%.1f °C", t) }
-        if t < 0 { return "−" + String(format: "%.1f °C", abs(t)) }
-        return "0.0 °C"
-    }
     /// v4.7: footer status line wording by regime (nil when
     /// temperature is unset — legacy projects show nothing).
-    var temperatureStatusText: String? {
-        guard let t = liveTemperature else { return nil }
-        let txt = liveTemperatureText
-        if t < 0 {
-            return buildupFreeze >= 0.99 ? "\(txt) — puddles frozen"
-                                         : "\(txt) — puddles freezing"
-        }
-        if t == 0 { return "\(txt) — freezing point" }
-        if buildupSnow > 0.005 { return "\(txt) — snow melting" }
-        return "\(txt) — above freezing"
-    }
 
     /// v4.3 (Weather sheet): re-roll this project's snow pattern.
     /// A fresh non-zero seed re-bakes the renderer's field with
@@ -2287,49 +1967,15 @@ final class EditorSession: ObservableObject {
     /// v4.6: a re-roll is also the way back to PRISTINE snow —
     /// it clears the plow layer (trails and berms) along with
     /// the pattern, in the renderer and the saved project.
-    func rerollSnowSeed() {
-        let seed = UInt32.random(in: 1...UInt32.max)
-        project.scene.weather.seed = seed
-        renderer.weatherSeed = seed
-        renderer.resetWeatherSim()
-        renderer.snowPlow = [:]
-        project.scene.weather.plowCells = nil
-        renderer.rebuild(scene: project.scene, meshes: meshes)
-        renderer.resetAccumulation()
-        kickRender()
-        status = "Snow pattern re-rolled — plowed trails cleared."
-    }
 
     /// Read-only live snow figures for the Weather sheet.
-    var liveSnowAmount: Double { buildupSnow }
     var liveWetAmount: Double { buildupWet }
-    var liveSnowProgress: Double { snowProgressClamped }
 
     /// Clear rain wetness / snow cover back to dry ground.
     func clearWeatherBuildup() {
         buildupWet = 0
-        buildupSnow = 0
         project.scene.weather.wetness = 0
-        project.scene.weather.snow = 0
-        project.scene.weather.snowAmount = 0
-        // v4.3: every object's caught snow goes with the ground's,
-        // and any footprints vanish.
-        for key in Array(snowExposureA.keys) { snowExposureA[key] = 0 } // v4.10.1: snapshot (see clampExposuresToAmbient)
-        bakedExposureSteps = snowExposureA.mapValues { _ in 0 }
-        clearSnowStamps()
-        // v4.6: cleared build-up takes the plow layer with it —
-        // no snow, no trails.
-        renderer.snowPlow = [:]
-        project.scene.weather.plowCells = nil
-        renderer.resetWeatherSim()
-        renderer.objectSnowAmounts = snowExposureA
-        // v3.4: the solid weather geometry goes too — a full
-        // rebuild at zero levels removes sheets + displacement.
-        geoStepWet = 0
-        geoStepSnow = 0
-        renderer.weatherGeoWet = 0
-        renderer.weatherGeoSnow = 0
-        renderer.rebuild(scene: project.scene, meshes: meshes)
+        renderer.weatherWet = 0
         renderer.resetAccumulation()
         kickRender()
         status = "Ground build-up cleared."
@@ -2339,13 +1985,6 @@ final class EditorSession: ObservableObject {
     // MARK: v4.3 footprints + player figure
 
     /// Drop every footprint stamp and tell the renderer.
-    private func clearSnowStamps() {
-        snowStamps.removeAll()
-        lastStampFeet = nil
-        stampParity = 0
-        imprintRebuildPending = false
-        renderer.snowFootprints = []
-    }
 
     /// Rotation-Y matrix for the player figure: local −Z (its
     /// facing) maps to the play-forward for `heading` (radians,
@@ -2384,7 +2023,7 @@ final class EditorSession: ObservableObject {
     /// Per-tick Play driver + footprints, run just before the
     /// draw so teleports/checkpoints this tick are reflected.
     /// Purely visual: playPosition is READ, never written.
-    private func drivePlayerAndFootprints(now: CFTimeInterval, dt: Float) {
+    private func drivePlayerFigure(now: CFTimeInterval, dt: Float) {
         guard mode == .play else { return }
         // v4.5: in Play the camera IS the figure's eye (inside
         // the head box) — the renderer excludes head + hair
@@ -2394,46 +2033,6 @@ final class EditorSession: ObservableObject {
         let eye = SIMD3<Float>(Float(p[0]), Float(p[1]), Float(p[2]))
         let feet = eye - SIMD3<Float>(0, 1.7, 0)
 
-        // --- footprints -------------------------------------
-        // Expire first, then stamp. A stamp lands every 0.35 m
-        // of travel through snow that is actually deep here,
-        // offset alternately left/right of the stride line.
-        var stampsChanged = false
-        let beforeExpire = snowStamps.count
-        snowStamps.removeAll { $0.expiresAt <= now }
-        if snowStamps.count != beforeExpire { stampsChanged = true }
-        if buildupSnow > 0.005,
-           renderer.snowDepthAt(x: feet.x, z: feet.z) > 0.02 {
-            let feetXZ = SIMD2<Float>(feet.x, feet.z)
-            let dist = lastStampFeet.map { simd_distance(feetXZ, $0) } ?? .infinity
-            if dist > 0.35 {
-                var dir = SIMD2<Float>(-sin(figureHeading), -cos(figureHeading))
-                if let last = lastStampFeet {
-                    let d = feetXZ - last
-                    if simd_length(d) > 1e-4 { dir = simd_normalize(d) }
-                }
-                let perp = SIMD2<Float>(-dir.y, dir.x)
-                let side: Float = (stampParity % 2 == 0) ? 0.09 : -0.09
-                let pos = feetXZ + perp * side
-                snowStamps.append(SnowStamp(x: pos.x, z: pos.y, expiresAt: now + 25))
-                stampParity += 1
-                lastStampFeet = feetXZ
-                if snowStamps.count > 48 { snowStamps.removeFirst(snowStamps.count - 48) }
-                stampsChanged = true
-            }
-        }
-        renderer.snowFootprints = snowStamps.map { stamp in
-            let fade = Float(min(1, max(0, (stamp.expiresAt - now) / 5)))
-            return Renderer.SnowFootprint(x: stamp.x, z: stamp.z, radius: 0.16, compress: fade)
-        }
-        if stampsChanged { imprintRebuildPending = true }
-        if imprintRebuildPending, now - lastImprintRebuildAt >= 0.8 {
-            imprintRebuildPending = false
-            lastImprintRebuildAt = now
-            renderer.rebuild(scene: project.scene, meshes: meshes)
-        }
-
-        // --- figure -----------------------------------------
         var travelled: Float = 0
         var speed: Float = 0
         var velocityHeading: Float?
@@ -2572,251 +2171,38 @@ final class EditorSession: ObservableObject {
             // switch, so shading, precip and build-up scale
             // together.
             dynIntensity *= weatherIntensityScale
-            // v4.3: snow rates are in ABSOLUTE metres. `depth`
-            // is the rate scale (the target depth, with a sane
-            // fallback for a degenerate 0 in a hand-edited file);
-            // at the default 0.3 m every rate below reproduces
-            // the v3/v4.2 level rates × 0.3 exactly.
-            let depth = snowMaxDepth > 0 ? snowMaxDepth : 0.3
-            let snowAmountBefore = buildupSnow
-            // v4.7: phase layer. temperature == nil is LEGACY:
-            // effMode == stored mode and every term below is
-            // exactly v4.6. When set, sub-freezing turns stored
-            // rain into snow and above-freezing turns stored
-            // snow into rain, for dynamics and display alike.
-            let temperature = project.scene.weather.temperature
-            var effMode = mode
-            if let t = temperature {
-                if t <= 0 && mode == 1 { effMode = 2 }
-                if t > 0 && mode == 2 { effMode = 1 }
-            }
-            // v4.7: cumulative snowfall clock — advances by the
-            // pre-cap growth increment whenever the EFFECTIVE
-            // mode is snow, so plow trails heal even at the cap.
-            if effMode == 2 {
-                snowfallTotal += (depth / 100) * weatherRateScale * dynIntensity * Double(dt)
-            }
-            switch effMode {
-            case 1:
+            // v4.13: the only build-up left — rain wets the
+            // flat ground-wetness value (~75 s to soaked,
+            // surge-scaled); with rain off it dries slowly
+            // (~600 s). No snow, no 3D water, no geometry
+            // steps: the wetness is a shading uniform.
+            if mode == 1 {
                 buildupWet = min(1, buildupWet + Double(dt) * weatherRateScale / 75 * dynIntensity)
-                // Rain melts snow: the old level rate (1/300,
-                // intensity-blended) × maxDepth, in A units.
-                // v4.7: suppressed when temperature is set — the
-                // temperature melt below governs shrink instead.
-                if temperature == nil {
-                    buildupSnow = max(0, buildupSnow - depth * Double(dt) * weatherRateScale / 300
-                                            * (0.6 + 0.4 * dynIntensity))
-                }
-            case 2:
-                if buildupSnow < snowMaxDepth {
-                    // 100 s to the target depth, surge-scaled —
-                    // the v3 snow feel at the default depth.
-                    buildupSnow = min(snowMaxDepth, buildupSnow
-                        + (depth / 100) * weatherRateScale * dynIntensity * Double(dt))
-                } else if buildupSnow > snowMaxDepth {
-                    // The target was lowered under deep snow:
-                    // slow COMPACTION toward it (900 s scale,
-                    // half rate), never below it while snowing.
-                    // Compaction stays in all regimes (v4.7).
-                    buildupSnow = max(snowMaxDepth, buildupSnow
-                        - (depth / 900) * 0.5 * weatherRateScale * Double(dt))
-                }
-            case 0:
-                buildupWet = max(0, buildupWet - Double(dt) * weatherRateScale / 600)
-                // Full melt in ~15 min at the default depth.
-                // v4.7: suppressed when temperature is set (the
-                // temperature melt governs; freezing air never
-                // thaws) — legacy only when temperature is nil.
-                if temperature == nil {
-                    buildupSnow = max(0, buildupSnow - (depth / 900) * weatherRateScale * Double(dt))
-                }
-            default:
-                break
-            }
-            // v4.7: temperature melt + meltwater + freeze.
-            if let t = temperature {
-                if t > 0 {
-                    let beforeMelt = buildupSnow
-                    let meltRate = (depth / 900) * (t / 2.5) * weatherRateScale
-                    buildupSnow = max(0, buildupSnow - meltRate * Double(dt))
-                    let melted = beforeMelt - buildupSnow
-                    if melted > 0 {
-                        buildupWet = min(1, buildupWet + melted * 0.5)
-                    }
-                    buildupFreeze = max(0, buildupFreeze
-                        - Double(dt) * (1 + t / 10) / 180)
-                } else {
-                    buildupFreeze = min(1, buildupFreeze
-                        + Double(dt) * (1 + (-t) / 5) / 240)
-                }
-            } else if buildupFreeze > 0 {
-                // Defensive: with temperature unset the freeze
-                // fraction eases to 0 at the +10 °C thaw rate.
-                buildupFreeze = max(0, buildupFreeze - Double(dt) * 2 / 180)
-            }
-            // v4.3 (§4): per-object exposure follows the ambient
-            // A. Growth (snowing only) lifts every entry below A
-            // by the snowfall increment, capped at A — young
-            // objects lag exactly by their age. Any shrink
-            // clamps entries down to A. All in the non-published
-            // map.
-            // v4.10.4: the growth delta is the SNOWFALL CLOCK
-            // increment — the identical expression snowfallTotal
-            // advances by above — NOT dA. dA stops at the depth
-            // cap (buildupSnow is clamped to snowMaxDepth), so
-            // under the old rule an object spawned while A sat
-            // at the cap kept a ~0 ceiling forever: its exposure
-            // could never grow because A never grew. The
-            // snowfall clock never caps, so at the cap exposure
-            // now keeps pace with snowfall until it converges
-            // to A. Below the cap the increment equals dA,
-            // except in the single frame A crosses the cap,
-            // where exposure may reach A one frame sooner
-            // (intended).
-            let dA = buildupSnow - snowAmountBefore
-            if effMode == 2 {
-                let snowfallInc = (depth / 100) * weatherRateScale * dynIntensity * Double(dt)
-                if snowfallInc > 0 {
-                    let cap = Float(buildupSnow)
-                    let delta = Float(snowfallInc)
-                    for key in Array(snowExposureA.keys) { // v4.10.1: snapshot (see clampExposuresToAmbient)
-                        let v = snowExposureA[key] ?? 0
-                        if v < cap { snowExposureA[key] = min(cap, v + delta) }
-                    }
-                }
-            }
-            if dA < 0 {
-                clampExposuresToAmbient()
-            }
-        }
-        // v4.8: feed the GPU simulation its rates (same v4.7
-        // numbers the accumulators above use). Base snow rate is
-        // m/s at drift factor 1; the sink is the temperature
-        // melt when set, else the legacy rain-melt / thaw terms
-        // (suppressed exactly where frameTick suppresses them).
-        do {
-            let stored = project.scene.weather.mode
-            let temp = project.scene.weather.temperature
-            var eff = stored
-            if let t = temp {
-                if t <= 0 && stored == 1 { eff = 2 }
-                if t > 0 && stored == 2 { eff = 1 }
-            }
-            let depth = snowMaxDepth > 0 ? snowMaxDepth : 0.3
-            renderer.simSnowBaseRate = eff == 2
-                ? Float((depth / 100) * weatherRateScale * dynIntensity) : 0
-            if let t = temp, t > 0 {
-                renderer.simSnowSinkRate = Float((depth / 900) * (t / 2.5) * weatherRateScale)
-            } else if temp == nil && eff == 1 {
-                renderer.simSnowSinkRate = Float(depth * weatherRateScale / 300
-                                                 * (0.6 + 0.4 * dynIntensity))
-            } else if temp == nil && eff == 0 {
-                renderer.simSnowSinkRate = Float((depth / 900) * weatherRateScale)
             } else {
-                renderer.simSnowSinkRate = 0
+                buildupWet = max(0, buildupWet - Double(dt) * weatherRateScale / 600)
             }
-            renderer.simCompactRate = eff == 2
-                ? Float((depth / 900) * 0.5 * weatherRateScale) : 0
-            renderer.simRaining = eff == 1
-            renderer.simWaterBase = Float(dynIntensity * weatherRateScale)
-            // v4.11: the snow physics reads the temperature
-            // directly (repose / fresh density / wet mobility).
-            renderer.simTemperature = temp.map { Float($0) }
-            renderer.snowMaxDepth = Float(project.scene.weather.maxDepth)
         }
-        // v4.7: renderer sees the EFFECTIVE mode (phase layer
-        // recomputed here for the every-frame writes; when
-        // temperature is nil this is exactly the stored mode).
-        let rendererEffMode: Int = {
-            let stored = project.scene.weather.mode
-            guard let t = project.scene.weather.temperature else { return stored }
-            if t <= 0 && stored == 1 { return 2 }
-            if t > 0 && stored == 2 { return 1 }
-            return stored
-        }()
-        renderer.weatherMode = rendererEffMode
-        renderer.snowfallTotal = Float(snowfallTotal)
-        renderer.weatherFreeze = Float(buildupFreeze)
+        // v4.13: the renderer sees the stored mode (0 off /
+        // 1 rain — snow mode no longer exists) and the flat
+        // wetness; streak intensity follows the surge cycle.
+        renderer.weatherMode = project.scene.weather.mode
         renderer.weatherWet = Float(buildupWet)
-        // v4.3: the continuous shading level is the clamped
-        // PROGRESS; the absolute amount and target depth travel
-        // separately, and the exposure map syncs wholesale.
-        renderer.weatherSnow = Float(snowProgressClamped)
-        renderer.weatherSnowAmount = Float(buildupSnow)
-        renderer.weatherMaxDepth = Float(snowMaxDepth)
-        renderer.objectSnowAmounts = snowExposureA
         renderer.weatherDynTime = Float(weatherClock
             .truncatingRemainder(dividingBy: 3600))
         renderer.weatherDynIntensity = Float(dynIntensity)
-        renderer.weatherDynRain = rendererEffMode == 1
+        renderer.weatherDynRain = project.scene.weather.mode == 1
             ? Float(dynIntensity) : 0
         renderer.weatherWind = dynWind
-        // v3.4: weather GEOMETRY follows the build-up in
-        // quantised steps of 1/24, coalesced to at most one
-        // geometry rebuild per ~0.8 s. A step is ~4% of full
-        // cover — at full snow that's about a centimetre of
-        // drift growth per rebuild, arriving in the same short
-        // accumulation-reset bursts scene edits already use.
-        // v4.3: the snow step counts A in maxDepth/24 units
-        // (uncapped, so compaction of over-target snow still
-        // steps), the renderer's geo level is the CLAMPED
-        // progress step, and per-object exposure steps are an
-        // additional trigger into the same coalesced block.
-        let stepWet = Int((buildupWet * 24).rounded())
-        let stepSnow = snowAmountStep
-        var exposureSteps: [UUID: Int] = [:]
-        var exposureStepChanged = false
-        for (id, amount) in snowExposureA {
-            let s = exposureStep(for: amount)
-            exposureSteps[id] = s
-            if bakedExposureSteps[id] != s { exposureStepChanged = true }
-        }
-        if (stepWet != geoStepWet || stepSnow != geoStepSnow || exposureStepChanged),
-           now - lastGeoRebuildAt >= 0.8 {
-            geoStepWet = stepWet
-            geoStepSnow = stepSnow
-            bakedExposureSteps = exposureSteps
-            lastGeoRebuildAt = now
-            renderer.weatherGeoWet = Float(stepWet) / 24
-            renderer.weatherGeoSnow = Float(snowProgressStep) / 24
-            renderer.noteWeatherStep("session:geoTrigger")
-            renderer.rebuild(scene: project.scene, meshes: meshes)
-            // v4.3: dynamic entries (promoted objects + clones)
-            // aren't in the static rebuild — refresh their
-            // materials so their snow factor follows their
-            // exposure step. Bounded: only on this coalesced
-            // trigger, only while snow is in play.
-            if buildupSnow > 0 || project.scene.weather.mode == 2 {
-                refreshDynamicSnowMaterials()
-            }
-        }
         // Published sync only when the displayed (whole-percent)
-        // value actually changes. The snow percent is of the
-        // clamped progress pc.
-        // v4.9: narrowed per field — previously a crossing in
-        // EITHER channel rewrote all three published fields;
-        // now each field writes only when its own displayed
-        // percent crosses (snowAmount rides with the snow
-        // channel, exactly as it did whenever snow crossed;
-        // save()'s syncWeatherToProject still flushes the exact
-        // amount to disk). Displayed values are unchanged.
+        // wetness actually changes.
         let wetCrossed = Int((buildupWet * 100).rounded())
             != Int((project.scene.weather.wetness * 100).rounded())
-        let snowCrossed = Int((snowProgressClamped * 100).rounded())
-            != Int((project.scene.weather.snow * 100).rounded())
         if wetCrossed {
             project.scene.weather.wetness = buildupWet
         }
-        if snowCrossed {
-            project.scene.weather.snow = snowProgressClamped
-            project.scene.weather.snowAmount = buildupSnow
-        }
-        // v4.9: the footer follows the same change-only
-        // discipline via its own observable — refreshFooter
-        // republishes only when a displayed line changes, so
-        // this per-frame call is inert on unchanged frames
-        // (it also catches freeze-status flips, which cross
-        // no percent boundary).
+        // The footer follows the same change-only discipline
+        // via its own observable — this per-frame call is inert
+        // on unchanged frames.
         refreshFooter()
         // v4.0: banner expiry — a published write only on the
         // frame where it actually lapses.
@@ -2907,7 +2293,7 @@ final class EditorSession: ObservableObject {
         // teleports/checkpoints are already in playPosition.
         // Edit mode keeps the idle figure posed at the Play start.
         if mode == .play {
-            drivePlayerAndFootprints(now: now, dt: dt)
+            drivePlayerFigure(now: now, dt: dt)
         } else if !editFigureSet {
             setEditPlayerFigure()
         }

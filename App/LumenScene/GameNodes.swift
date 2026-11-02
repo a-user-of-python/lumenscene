@@ -387,10 +387,10 @@ enum NodeCatalog {
 
         NodeKindSpec(
             kind: "actSetWeather", title: "Set Weather", category: "Actions",
-            blurb: "Changes the weather to rain, snow, or off.",
+            blurb: "Changes the weather to rain or off.",
             hasIn: true, outs: ["out"],
             params: [
-                NodeParamSpec(key: "mode", label: "Weather", type: .choice, def: .text("Rain"), choices: ["Off", "Rain", "Snow"]),
+                NodeParamSpec(key: "mode", label: "Weather", type: .choice, def: .text("Rain"), choices: ["Off", "Rain"]),
                 NodeParamSpec(key: "clear", label: "Clear", type: .bool, def: .bool(false)),
             ]),
 
@@ -658,15 +658,13 @@ enum NodeCatalog {
 
         NodeKindSpec(
             kind: "actWeatherControl", title: "Weather Control", category: "Actions",
-            blurb: "Scales how fast weather builds up and how strong it looks, and can set the wetness/snow levels directly.",
+            blurb: "Scales how fast the ground wetness builds up and how strong the rain looks, and can set the wetness directly.",
             hasIn: true, outs: ["out"],
             params: [
                 NodeParamSpec(key: "rateScale", label: "Build-up Rate Scale", type: .number, def: .number(1), min: 0, max: 10),
                 NodeParamSpec(key: "intensityScale", label: "Intensity Scale", type: .number, def: .number(1), min: 0, max: 4),
                 NodeParamSpec(key: "setWet", label: "Set Wetness", type: .bool, def: .bool(false)),
                 NodeParamSpec(key: "wet", label: "Wetness", type: .number, def: .number(0.5), min: 0, max: 1),
-                NodeParamSpec(key: "setSnow", label: "Set Snow", type: .bool, def: .bool(false)),
-                NodeParamSpec(key: "snow", label: "Snow", type: .number, def: .number(0.5), min: 0, max: 1),
             ]),
 
         NodeKindSpec(

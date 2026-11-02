@@ -171,32 +171,6 @@ static float wfbm2(float2 p) {
 // radius cut produced in v3.2 (Sean's "square slab" puddles).
 // Evaluated ONLY by the field bake kernel below; the path
 // tracer reads the baked result from a texture.
-static float wpuddlePotential(float2 p) {
-    float2 warp = float2(wfbm2(p * 0.16f + float2(3.1f, 7.7f)),
-                         wfbm2(p * 0.16f + float2(11.9f, 1.3f)));
-    float2 q = p + (warp - 0.5f) * 1.0f; // up to ±0.5 cells of wobble
-    int2 ip = int2(floor(q));
-    float2 fp = fract(q);
-    float sum = 0.0f;
-    for (int j = -1; j <= 1; j++) {
-        for (int i = -1; i <= 1; i++) {
-            int2 c = ip + int2(i, j);
-            uint h = hash32((uint(c.x) * 0x8da6b343u) ^ (uint(c.y) * 0xd8163841u));
-            float r0 = float(h >> 8) * (1.0f / 16777216.0f);
-            uint h2 = hash32(h ^ 0x9e3779b9u);
-            float r1 = float(h2 >> 8) * (1.0f / 16777216.0f);
-            uint h3 = hash32(h2 ^ 0x85ebca6bu);
-            float cr = float(h3 >> 8) * (1.0f / 16777216.0f);
-            float a = pow(clamp((0.58f - cr) / 0.58f, 0.0f, 1.0f), 0.7f);
-            if (a <= 0.001f) continue;
-            float2 pt = float2(float(i), float(j)) + float2(r0, r1);
-            float d = length(pt - fp);
-            float s = clamp(1.0f - (d / 1.45f) * (d / 1.45f), 0.0f, 1.0f);
-            sum += a * s * s;
-        }
-    }
-    return sum;
-}
 
 // MARK: - Helpers
 
@@ -250,44 +224,6 @@ struct WeatherFieldParams {
     uint pad;
 };
 
-kernel void weatherFieldKernel(
-    texture2d<float, access::write> field [[texture(0)]],
-    constant WeatherFieldParams& fp [[buffer(0)]],
-    uint2 pixel [[thread_position_in_grid]])
-{
-    uint w = field.get_width();
-    uint h = field.get_height();
-    if (pixel.x >= w || pixel.y >= h) return;
-    float2 uv = (float2(pixel) + 0.5f) / float2(float(w), float(h));
-    float2 xz = (uv - 0.5f) * 64.0f;
-    // v4.3: EVERY channel is evaluated at the seed-shifted
-    // point; the puddle / wet / broad formulas themselves are
-    // unchanged (offset only).
-    float2 sp = xz + fp.offset;
-    float pot = wpuddlePotential(sp * (1.0f / 1.15f));
-    float wetPool = wfbm2(sp * 1.3f + float2(4.7f, 9.1f));
-    float drift;
-    if (fp.seeded != 0u) {
-        // Multi-scale, wind-anisotropic drift (v4.3), in
-        // lockstep with wgfDrift in Renderer.swift: rotate the
-        // shifted point by the wind heading, then broad
-        // (stretched along the wind -> elongated drifts) +
-        // lumps + fine detail. The bake writes the RAW value;
-        // the window fade is applied at sample time, exactly
-        // as the legacy channel was.
-        float2 q = float2(fp.wind.x * sp.x - fp.wind.y * sp.y,
-                          fp.wind.y * sp.x + fp.wind.x * sp.y);
-        float driftBroad = wfbm2(float2(q.x * 0.30f, q.y * 0.52f)
-                                 + float2(9.17f, 27.3f));
-        float lumps = wfbm2(q * 0.95f + float2(31.7f, 5.3f));
-        float fine = wnoise2(q * 2.7f + float2(13.1f, 41.9f));
-        drift = 0.58f * driftBroad + 0.30f * lumps + 0.12f * fine;
-    } else {
-        drift = wfbm2(sp * 0.5f + float2(9.17f, 27.3f));
-    }
-    float broad = wfbm2(sp * 0.32f + float2(17.31f, 3.97f));
-    field.write(float4(pot, wetPool, drift, broad), pixel);
-}
 
 // MARK: - Path trace kernel
 
@@ -315,12 +251,8 @@ static float4 samplePBR(texture2d_array<float> mainTex,
 // function so the trace kernel, the guide kernel and the
 // v4.12 gate audit (snowGateAuditKernel) all evaluate the
 // identical math.
-static float snowUpFace(float ny) {
+static float upFaceGate(float ny) {
     return smoothstep(0.5f, 0.85f, ny);
-}
-static float snowAccumFactor(float3 geoN, float snowLevel, float drift) {
-    float depth = snowLevel * mix(0.3f, 1.7f, drift);
-    return smoothstep(0.45f, 0.75f, depth) * snowUpFace(geoN.y);
 }
 // v4.12 (RDR2): caked-snow breakup. The gate above decides
 // WHERE snow can sit; this multiplier decides how it LOOKS
@@ -329,51 +261,17 @@ static float snowAccumFactor(float3 geoN, float snowLevel, float drift) {
 // It only ever MULTIPLIES the gated cover, so the gate's
 // guarantee survives untouched: a vertical face's cover is
 // 0 x anything = exactly 0.
-static float snowCakeBreakup(float3 p) {
-    float n = 0.65f * wnoise2(p.xz * 2.6f)
-            + 0.35f * wnoise2(p.xz * 11.0f);
-    return mix(0.25f, 1.10f, smoothstep(0.25f, 0.80f, n));
-}
 // v4.12 (RDR2): two-scale world-anchored micro normal detail
 // for snow surfaces — keeps troughs and tracks reading at
 // glancing angles (where the 0.20 m lattice normals alone go
 // flat) and gives the snow gloss its sparkle facets. The tilt
 // is applied in world XZ and scaled by n.y, valid because
 // snow lives on up-facing surfaces.
-static float3 snowDetailNormal(float3 p, float3 n, float amp) {
-    float e = 0.06f;
-    float b0 = wnoise2(p.xz * 6.0f);
-    float bx = wnoise2((p.xz + float2(e, 0.0f)) * 6.0f);
-    float bz = wnoise2((p.xz + float2(0.0f, e)) * 6.0f);
-    float f0 = wnoise2(p.xz * 45.0f);
-    float fx = wnoise2((p.xz + float2(e, 0.0f)) * 45.0f);
-    float fz = wnoise2((p.xz + float2(0.0f, e)) * 45.0f);
-    float2 g = float2((bx - b0) + 2.2f * (fx - f0),
-                      (bz - b0) + 2.2f * (fz - f0)) / e;
-    float3 tilted = n + float3(-g.x, 0.0f, -g.y) * amp * clamp(n.y, 0.0f, 1.0f);
-    return normalize(tilted);
-}
 // v4.12 (RDR2): the glint stage — RDR2's signature sparkle.
 // Sparse world-anchored micro-facets (~4 mm cells, ~0.35% of
 // the surface) flash when their random facet normal reflects
 // the sky toward the camera. Static in world space: stills
 // keep their specks, camera motion makes them twinkle.
-static float snowGlint(float3 p, float3 viewDir, float3 n) {
-    float3 cell = floor(p * 260.0f);
-    uint h = hash32(uint(int(cell.x)) * 1973u
-                  ^ uint(int(cell.y)) * 9277u
-                  ^ uint(int(cell.z)) * 26699u);
-    float hf = float(h >> 8) * (1.0f / 16777216.0f);
-    if (hf < 0.9965f) return 0.0f;
-    float3 rv = float3(
-        float(hash32(h ^ 0x9E3779B9u) >> 8) * (1.0f / 16777216.0f),
-        float(hash32(h ^ 0x85EBCA6Bu) >> 8) * (1.0f / 16777216.0f),
-        float(hash32(h ^ 0xC2B2AE35u) >> 8) * (1.0f / 16777216.0f));
-    float3 fn = normalize(n + 0.85f * (rv - 0.5f));
-    float3 r = reflect(viewDir, fn);
-    float sky = clamp(r.y, 0.0f, 1.0f);
-    return (hf - 0.9965f) / 0.0035f * sky * sky * 1.2f;
-}
 
 kernel void pathTraceKernel(
     texture2d<float, access::read_write> accum [[texture(0)]],
@@ -608,252 +506,22 @@ kernel void pathTraceKernel(
             }
         }
 
-        // ---- Weather + gloss (v3). Texture roughness finally
-        // shades: gloss = 1 - roughness for textured surfaces.
-        // Wetness darkens up-facing surfaces and raises their
-        // gloss; snow whitens them, kills the gloss, and pulls
-        // the shading normal toward the geometric up-face.
-        float upFace = snowUpFace(geoN.y);
+        // ---- Weather (v4.13): flat ground wetness only.
+        // Rain is falling streaks + ONE wetness value: as it
+        // rises, up-facing surfaces get darker, glossier and
+        // more reflective (the sheen); when the rain stops
+        // they dry back. No snow, no standing water, nothing
+        // that can climb a wall.
+        float upFace = upFaceGate(geoN.y);
         float wet = u.wetLevel * upFace;
-        float snowGlobal = u.snowLevel * upFace;
         float gloss = (mat.texIndex > 0) ? clamp(1.0f - texRough, 0.0f, 1.0f) : 0.0f;
-        // v3.4: puddle water sheets are real geometry carrying
-        // FLAG_SHEET. They shade as near-mirror standing water and
-        // skip the whole weather block below — no wet darkening,
-        // no snow cover, no second puddle mask on the water
-        // itself (the sheet's placement already IS the mask).
-        bool isSheet = (mat.flags & FLAG_SHEET) != 0u;
-        // v4.4: snow sheet geometry (FLAG_SNOW) shades as
-        // snow and only snow — it skips the weather block
-        // below exactly like the water sheet does (no wet
-        // darkening, no gloss change, no SECOND snow cover
-        // computed over the snow itself), and since the flag
-        // replaces the host material entirely, the glass and
-        // emissive branches above can never claim it either:
-        // its albedo is the material's snow colour times the
-        // per-vertex drift shade baked CPU-side.
-        bool isSnow = (mat.flags & FLAG_SNOW) != 0u;
-        // v4.8 (steering 1): water reflection resolution. At the
-        // default scale 1.0 nothing below ever triggers and water
-        // shades exactly as v4.7. Below 1.0, a rotating per-pixel
-        // pattern (pixel hash XOR frame counter, so coverage
-        // cycles across frames) selects which water-hit pixels
-        // trace the full scene reflection; the rest take the
-        // cheaper environment fill at the bounce below. Only
-        // sheet (standing-water) hits pay or save this cost --
-        // an audit of the v4.7 kernel showed reflection work for
-        // water lives entirely in the glossy specular roll for
-        // isSheet / mirror-puddle hits, and no other pixel class
-        // enters that roll with water gloss, so nothing is
-        // removed from non-water pixels (there was nothing to
-        // remove) and no reflection is faked at the default.
+        // v4.8's water-reflection economy retired with the
+        // standing water it served; the flag stays declared
+        // (always false) for the specular roll below.
         bool waterCheap = false;
-        if (isSheet && u.waterReflScale < 0.999f) {
-            uint rh = hash32(pixel.x * 1973u ^ pixel.y * 9277u
-                             ^ (u.frameCounter * 2654435761u)
-                             ^ (bounce * 40503u));
-            float rf = float(rh >> 8) * (1.0f / 16777216.0f);
-            waterCheap = rf >= u.waterReflScale;
-        }
-        // Shaped weather field: defaults are exactly the
-        // v3 global behaviour (wetF = wet, snowCover = snowGlobal,
-        // no puddle, drift 0.5, depth = snowGlobal). The shaped
-        // field is only evaluated on the first two bounces —
-        // deeper bounces keep the global levels, since the spatial
-        // detail is invisible there. Since v3.3 the field itself
-        // comes from the baked weatherField texture (one fetch)
-        // instead of per-hit procedural noise. When both levels
-        // are ~0 nothing below changes anything, so the dry
-        // settled image is unchanged from v3.
-        float wetF = wet;
-        float snowCover = snowGlobal;
-        float puddle = 0.0f;
-        float drift = 0.5f;
-        float depth = snowGlobal;
-        // Baked field sample + window fade (v3.3). Neutral
-        // values (potential 0, modulators at their mid) make
-        // the un-faded case identical to no field at all.
-        float4 wfield = float4(0.0f, 0.5f, 0.5f, 0.489f);
-        float fieldFade = 0.0f;
-        if (!isSheet && !isSnow && (u.wetLevel > 0.001f || u.snowLevel > 0.001f) && bounce <= 1u) {
-            // ONE bilinear fetch replaces the ~75 per-hit hash
-            // evaluations of the procedural v3.1/v3.2 block. The
-            // field window is 64 m across, centred on the
-            // origin; outside it the sample fades to neutral so
-            // distant geometry keeps the plain global levels.
-            float2 fuv = hitPos.xz * (1.0f / 64.0f) + 0.5f;
-            fieldFade = (1.0f - smoothstep(29.0f, 32.0f, abs(hitPos.x)))
-                      * (1.0f - smoothstep(29.0f, 32.0f, abs(hitPos.z)));
-            float4 fs = weatherField.sample(fieldSampler, fuv);
-            wfield = mix(float4(0.0f, 0.5f, 0.5f, 0.489f), fs, fieldFade);
-            // Wetness spreads and pools unevenly.
-            wetF = clamp(wet * (0.7f + 0.6f * wfield.g), 0.0f, 1.0f);
-            // Geometry response (v3.2): water runs downhill.
-            // elevBias favours low world positions (dips, holes,
-            // slope feet) and penalises raised ones; slopeShed
-            // drains slanted faces so water does not stand on a
-            // slant. On a dead-flat floor both are constant
-            // (elevBias +0.10 at floor level, shed 1), so the
-            // pattern layer below rules alone there.
-            float elevBias = clamp(0.10f - hitPos.y * 0.55f, -0.22f, 0.38f);
-            float slopeShed = clamp((geoN.y - 0.70f) / 0.30f, 0.0f, 1.0f);
-            // Trickle runnels: on slanted ground the wet
-            // darkening arrives as streaks elongated along the
-            // fall line (the shading normal's xz lean points
-            // downhill for an up-facing slope). One value-noise
-            // evaluation, slanted faces only — kept procedural
-            // because the streak frame is surface-dependent.
-            float slopeAmt = clamp((0.98f - geoN.y) / 0.28f, 0.0f, 1.0f);
-            if (slopeAmt > 0.01f && length(geoN.xz) > 1e-4f) {
-                float2 down = geoN.xz / length(geoN.xz);
-                float2 along = float2(dot(hitPos.xz, down),
-                                      dot(hitPos.xz, float2(-down.y, down.x)));
-                float streak = wnoise2(float2(along.y * 5.0f, along.x * 0.7f));
-                wetF = clamp(wetF + slopeAmt
-                             * smoothstep(0.52f, 0.85f, streak)
-                             * u.wetLevel * 0.55f, 0.0f, 1.0f);
-            }
-            // Puddles (v3.3): a threshold sweep of the baked
-            // METABALL potential. The threshold falls as
-            // wetness rises, so pools appear at the most
-            // eligible spots first, then grow and merge —
-            // coverage stays a deterministic function of
-            // wetness on ANY surface (the flat guarantee).
-            // elevBias shifts the threshold so dips, holes and
-            // slope feet fill earlier and deeper; slopeShed
-            // keeps standing water off slants; the broad
-            // pooling field modulates. Outlines are level sets
-            // of a smooth summed field: rounded, irregular,
-            // feathered — square corners are impossible.
-            float wetN = clamp(u.wetLevel, 0.0f, 1.0f);
-            float thr = mix(1.15f, 0.08f, pow(wetN, 1.15f)) - elevBias * 0.45f;
-            float mask = smoothstep(thr - 0.14f, thr + 0.14f, wfield.r);
-            float broad = 0.78f + 0.45f * wfield.a;
-            // fieldFade multiplies the mask as well as the
-            // sample: at the lowest (full-wetness) threshold the
-            // neutral potential 0 would otherwise read as a
-            // faint uniform puddle outside the field window.
-            puddle = clamp(mask * broad, 0.0f, 1.0f) * slopeShed * upFace
-                   * fieldFade * smoothstep(0.03f, 0.15f, u.wetLevel);
-            // Snow piles in drifts: depth varies with the
-            // baked drift field, cover turns on where the
-            // drifted depth is enough.
-            drift = wfield.b;
-            depth = u.snowLevel * mix(0.3f, 1.7f, drift);
-            snowCover = snowAccumFactor(geoN, u.snowLevel, drift);
-        }
-        if (!isSheet && !isSnow) {
-        // 1. Wet: darkened, glossier.
-        if (wetF > 0.001f) {
-            albedo *= (1.0f - 0.45f * wetF);
-            gloss = max(gloss, wetF * 0.85f);
-        }
-        // 2. Puddle: mirror-flat standing water over the wet base.
-        // The shading normal is the flat geometric normal so the
-        // reflection converges cleanly and stays put; the
-        // rain-ripple shimmer is applied at display time by the
-        // tonemap pass (v3.3), which is what lets rain trace —
-        // and settle — exactly like snow.
-        if (puddle > 0.001f) {
-            albedo *= (1.0f - 0.5f * puddle);
-            gloss = max(gloss, puddle);
-            shadingN = normalize(mix(shadingN, geoN, puddle));
-            // v4.8: a dominant mask puddle is water too -- the
-            // same rotating selection applies to its reflection.
-            if (puddle > 0.5f && u.waterReflScale < 0.999f) {
-                uint rh = hash32(pixel.x * 1973u ^ pixel.y * 9277u
-                                 ^ (u.frameCounter * 2654435761u)
-                                 ^ (bounce * 40503u));
-                float rf = float(rh >> 8) * (1.0f / 16777216.0f);
-                waterCheap = rf >= u.waterReflScale;
-            }
-            // v4.7: mask puddles freeze coherently with sheets.
-            if (u.freezeFrac > 0.001f) {
-                float3 iceCol = float3(0.55f, 0.65f, 0.75f);
-                albedo = mix(albedo, iceCol, clamp(puddle * u.freezeFrac, 0.0f, 1.0f) * 0.92f);
-            }
-        }
-        // 3. Snow: whitened, gloss killed, normal mounded by the
-        // drift gradient (or softened toward the face, as v3).
-        if (snowCover > 0.001f) {
-            snowCover *= (1.0f - puddle); // no snow inside puddles
-        }
-        // v4.3: per-object snow exposure — Material.pad.x is a
-        // Float bit pattern carrying this object's accumulated
-        // share of the ambient snow (spawned objects start at
-        // 0 = bare; long-standing objects reach 1 = full).
-        {
-            float snowScale = as_type<float>(mat.pad.x);
-            snowCover *= snowScale;
-        }
-        // v4.12 (RDR2): caked-snow breakup — patchy coating,
-        // not uniform paint (a multiplier on the gated cover;
-        // vertical faces stay exactly 0).
-        if (snowCover > 0.001f) {
-            snowCover *= snowCakeBreakup(hitPos);
-        }
-        if (snowCover > 0.001f) {
-            albedo = mix(albedo, float3(0.88f, 0.91f, 0.97f), snowCover * 0.92f);
-            albedo *= 1.0f - 0.18f * snowCover * (1.0f - drift);
-            // v4.12: snow keeps a modest sheen (0.30 at full
-            // cover) instead of a dead gloss kill — the glint
-            // stage needs a specular component to flash.
-            gloss = gloss * (1.0f - snowCover)
-                  + 0.30f * snowCover * snowCover;
-            bool relief = false;
-            if (bounce <= 1u && geoN.y > 0.7f) {
-                // Drift gradient from the baked field (v3.3):
-                // two extra fetches replace two fbm evaluations.
-                // Offset samples are faded toward neutral BEFORE
-                // the subtraction so the baseline matches the
-                // faded centre sample at the window fringe.
-                float gbx = mix(0.5f, weatherField.sample(fieldSampler,
-                        (hitPos.xz + float2(0.35f, 0.0f)) * (1.0f / 64.0f) + 0.5f).b,
-                        fieldFade);
-                float gbz = mix(0.5f, weatherField.sample(fieldSampler,
-                        (hitPos.xz + float2(0.0f, 0.35f)) * (1.0f / 64.0f) + 0.5f).b,
-                        fieldFade);
-                float gx = gbx - drift;
-                float gz = gbz - drift;
-                float3 mound = normalize(float3(-gx * depth * 1.4f, 1.0f,
-                                                -gz * depth * 1.4f));
-                shadingN = normalize(mix(shadingN, mound, snowCover * 0.6f));
-                relief = true;
-            }
-            if (!relief) {
-                shadingN = normalize(mix(shadingN, geoN, snowCover * 0.6f));
-            }
-            // v4.12 (RDR2): micro-detail normals + the glint
-            // stage on object snow too, scaled by the cover.
-            shadingN = snowDetailNormal(hitPos, shadingN, 0.05f * snowCover);
-            albedo += float3(0.92f, 0.95f, 1.0f)
-                    * snowGlint(hitPos, ray.direction, shadingN) * snowCover;
-        }
-        } // !isSheet && !isSnow — weather steps 1-3 skipped for water and snow sheets
-        if (isSheet) {
-            // Standing water: near-mirror gloss, and the shading
-            // normal is the sheet's real (flat) surface normal,
-            // so the reflection is stable, has true parallax
-            // against the floor beneath, and tracks the camera.
-            gloss = 0.97f;
-            shadingN = geoN;
-            // v4.7: frozen sheets shade as pale ice (still mirror).
-            if (u.freezeFrac > 0.001f) {
-                float3 iceCol = float3(0.55f, 0.65f, 0.75f);
-                albedo = mix(albedo, iceCol, clamp(u.freezeFrac, 0.0f, 1.0f) * 0.92f);
-            }
-        }
-        if (isSnow) {
-            // v4.12 (RDR2): the snow sheet's material stage —
-            // micro-detail normals (troughs and tracks keep
-            // reading at glancing angles, where the 0.20 m
-            // lattice normals alone flatten out), a modest
-            // sheen gloss, and the glint stage: sparse
-            // world-anchored sparkle facets, RDR2's signature.
-            gloss = 0.30f;
-            shadingN = snowDetailNormal(hitPos, shadingN, 0.05f);
-            albedo += float3(0.92f, 0.95f, 1.0f)
-                    * snowGlint(hitPos, ray.direction, shadingN);
+        if (wet > 0.001f) {
+            albedo *= (1.0f - 0.45f * wet);
+            gloss = max(gloss, wet * 0.85f);
         }
 
         // ---- Glass: reflect / refract with Fresnel. Past the
@@ -1158,113 +826,26 @@ kernel void guideKernel(
         float3(hNormals[3 * i2], hNormals[3 * i2 + 1], hNormals[3 * i2 + 2]) * bc2);
     Material mat = materials[hTriMat[tri]];
     float reusable = (mat.flags & FLAG_GLASS) ? 0.0f : 1.0f;
-    if ((mat.flags & FLAG_SHEET) != 0u) {
-        // v3.4: water sheets are pure reflection — view-dependent,
-        // never seeded from history (same treatment as glass).
-        reusable = 0.0f;
-    } else if ((mat.flags & FLAG_SNOW) != 0u) {
-        // v4.4: the snow sheet is a matte diffuse surface —
-        // full history reuse, and the weather mirror below
-        // must not run for it (its puddle term would restart
-        // history on snow that happens to lie over a puddle
-        // area of the field, and its gloss model describes
-        // the HOST surface under the snow, not the snow).
-    } else if (reusable > 0.5f) {
+    if (reusable > 0.5f) {
         // v3.4 (reflection ghosting fix): history reuse is
-        // anchored on the primary hit POSITION — the right anchor
-        // for diffuse radiance, the wrong one for reflections,
-        // whose content changes the instant the viewpoint moves.
-        // Position-anchored reuse smeared the old reflection
-        // across the new one for the life of the history tail
-        // (device report 2026-10-30: a light lingering in puddles
-        // ~1 s after the camera moved). Reflection-dominant first
-        // hits now restart like glass: near-mirror gloss at any
-        // angle, or strong gloss whose Fresnel term at this view
-        // angle makes the reflection carry the pixel. Diffuse and
-        // matte surfaces keep full reuse — the motion clarity
-        // the reprojection exists for is untouched there.
+        // anchored on the primary hit POSITION — the right
+        // anchor for diffuse radiance, the wrong one for
+        // reflections, whose content changes the instant the
+        // viewpoint moves. Reflection-dominant first hits
+        // restart like glass: near-mirror gloss at any angle,
+        // or strong gloss whose Fresnel term at this view
+        // angle makes the reflection carry the pixel.
         // v4.1 (F3): textured gloss comes from the material's
-        // MEAN texture roughness (glassParams.w, baked CPU-side
-        // from the slice's data channel) — NOT glassParams.y,
-        // which is the glass frost roughness (default 0.05) and
-        // made every textured surface read as near-mirror here,
-        // silently disabling reprojection for all of them.
+        // MEAN texture roughness (glassParams.w).
         float glossEff = (mat.texIndex > 0)
             ? clamp(1.0f - mat.glassParams.w, 0.0f, 1.0f) : 0.0f;
-        // v4.1 (F7): the weather gloss model now MIRRORS the
-        // trace kernel, from the baked field sampled at the
-        // hit's world position (the guide has world positions):
-        // wetF gloss, the thresholded puddle MASK (a mirror
-        // puddle reaches gloss 1 and restarts, as in the trace),
-        // and snowCover from the DRIFTED depth with upFace
-        // multiplied OUTSIDE the smoothstep — the trace kernel's
-        // exact structure and constants. (The old code used the
-        // raw global wet level and smoothed snowLevel * upFace
-        // INSIDE the smoothstep with no drift.)
+        // v4.13: the weather gloss model mirrors the trace
+        // kernel's flat wetness — up-facing hits gloss up
+        // with the wet level.
         float3 geoN = normalize(cross(p1 - p0, p2 - p0));
         if (dot(geoN, nInterp) < 0.0f) geoN = -geoN;
-        float upFace = snowUpFace(geoN.y);
-        float puddle = 0.0f;
-        float snowCover = u.snowLevel * upFace; // trace default (no field)
-        if (u.wetLevel > 0.001f || u.snowLevel > 0.001f) {
-            float2 fuv = hitPos.xz * (1.0f / 64.0f) + 0.5f;
-            float fieldFade = (1.0f - smoothstep(29.0f, 32.0f, abs(hitPos.x)))
-                            * (1.0f - smoothstep(29.0f, 32.0f, abs(hitPos.z)));
-            float4 wfield = mix(float4(0.0f, 0.5f, 0.5f, 0.489f),
-                                weatherField.sample(fieldSampler, fuv),
-                                fieldFade);
-            // Wet: darkened, glossier (trace step 1, field-shaped).
-            float wetF = clamp(u.wetLevel * upFace * (0.7f + 0.6f * wfield.g),
-                               0.0f, 1.0f);
-            // Trickle runnels (v4.1 N3): the trace kernel's
-            // slanted-face streak term, ported exactly — slope
-            // amount and downhill frame from the GEOMETRIC
-            // normal (geoN, from the hit triangle p0/p1/p2
-            // above, as in trace), one wnoise2 evaluation,
-            // added to wetF after the base field-shaped wetF
-            // and before the gloss terms below consume it.
-            float slopeAmt = clamp((0.98f - geoN.y) / 0.28f, 0.0f, 1.0f);
-            if (slopeAmt > 0.01f && length(geoN.xz) > 1e-4f) {
-                float2 down = geoN.xz / length(geoN.xz);
-                float2 along = float2(dot(hitPos.xz, down),
-                                      dot(hitPos.xz, float2(-down.y, down.x)));
-                float streak = wnoise2(float2(along.y * 5.0f, along.x * 0.7f));
-                wetF = clamp(wetF + slopeAmt
-                             * smoothstep(0.52f, 0.85f, streak)
-                             * u.wetLevel * 0.55f, 0.0f, 1.0f);
-            }
-            glossEff = max(glossEff, wetF * 0.85f);
-            // Puddle mask (trace step 2): threshold sweep of
-            // the baked metaball potential.
-            float elevBias = clamp(0.10f - hitPos.y * 0.55f, -0.22f, 0.38f);
-            float slopeShed = clamp((geoN.y - 0.70f) / 0.30f, 0.0f, 1.0f);
-            float wetN = clamp(u.wetLevel, 0.0f, 1.0f);
-            float thr = mix(1.15f, 0.08f, pow(wetN, 1.15f)) - elevBias * 0.45f;
-            float mask = smoothstep(thr - 0.14f, thr + 0.14f, wfield.r);
-            float broad = 0.78f + 0.45f * wfield.a;
-            puddle = clamp(mask * broad, 0.0f, 1.0f) * slopeShed * upFace
-                   * fieldFade * smoothstep(0.03f, 0.15f, u.wetLevel);
-            glossEff = max(glossEff, puddle); // mirror puddle => restart
-            // Snow (trace step 3): drifted depth -> cover.
-            snowCover = snowAccumFactor(geoN, u.snowLevel, wfield.b);
-            snowCover *= (1.0f - puddle); // no snow inside puddles
-        }
-        // v4.3: per-object snow exposure, mirroring the trace
-        // kernel — Material.pad.x is a Float bit pattern with
-        // this object's accumulated share of the ambient snow,
-        // applied after the puddle suppression above (and to
-        // the no-field default snowCover as well).
-        {
-            float snowScale = as_type<float>(mat.pad.x);
-            snowCover *= snowScale;
-        }
-        // v4.12 (RDR2): caked-snow breakup, mirroring the
-        // trace kernel (a multiplier on the gated cover).
-        snowCover *= snowCakeBreakup(hitPos);
-        // Snow sheen in the trace kernel: gloss falls with
-        // cover but keeps the 0.30 snow term (mirrored).
-        glossEff = glossEff * (1.0f - snowCover)
-                 + 0.30f * snowCover * snowCover;
+        float upFace = upFaceGate(geoN.y);
+        glossEff = max(glossEff, u.wetLevel * upFace * 0.85f);
         float cosV = clamp(dot(-ray.direction, nInterp), 0.15f, 1.0f);
         float fres = 0.04f + 0.96f * pow(1.0f - cosV, 5.0f);
         if (glossEff >= 0.92f
@@ -1538,35 +1119,21 @@ fragment float4 tonemapFragment(VSOut in [[stage_in]],
     // fall back to the uniform count where alpha is unset.
     float n = a.a > 0.5f ? a.a : max(1.0f, float(p.samples));
     float3 c = a.rgb / n;
-    // Rain-ripple shimmer (v3.3): while it rains, puddle pixels
-    // get a small time-varying brightness modulation in linear
-    // space — the display-rate echo of the normal tilt the
-    // path kernel used to re-trace every frame (v3.2's lag).
-    // Puddles are located exactly as the tracer shaded them:
-    // primary-hit world position from the guide, the baked
-    // field mask at that spot, up-facing hits only. The
-    // converged mirror underneath stays untouched; stills and
-    // exports pass shimmerRain = 0 and skip this entirely.
+    // Rain-ripple shimmer (v4.13): while it rains, wet
+    // up-facing hits get a small time-varying brightness
+    // modulation in linear space — expanding rain rings over
+    // the flat wetness, uniform wherever the ground is wet
+    // (no puddle mask; there is no standing water anymore).
+    // The converged image underneath stays untouched; stills
+    // and exports pass shimmerRain = 0 and skip this entirely.
     if (p.shimmerRain > 0.01f) {
         float4 g = guide.sample(s, in.uv);
         float4 gn = guideNormal.sample(s, in.uv);
         if (g.a > 0.5f && gn.y > 0.5f) {
             float3 wp = g.xyz;
-            float2 fuv = wp.xz * (1.0f / 64.0f) + 0.5f;
-            float fade = (1.0f - smoothstep(29.0f, 32.0f, abs(wp.x)))
-                       * (1.0f - smoothstep(29.0f, 32.0f, abs(wp.z)));
-            float4 fs = weatherField.sample(s, fuv);
-            float pot = fs.r * fade;
-            float wetN = clamp(p.wetLevel, 0.0f, 1.0f);
-            float elevBias = clamp(0.10f - wp.y * 0.55f, -0.22f, 0.38f);
-            float thr = mix(1.15f, 0.08f, pow(wetN, 1.15f)) - elevBias * 0.45f;
-            float mask = smoothstep(thr - 0.14f, thr + 0.14f, pot);
-            float broad = 0.78f + 0.45f * mix(0.489f, fs.a, fade);
-            float slopeShed = clamp((gn.y - 0.70f) / 0.30f, 0.0f, 1.0f);
             float upFace = smoothstep(0.5f, 0.85f, gn.y);
-            float puddleM = clamp(mask * broad, 0.0f, 1.0f) * slopeShed * upFace
-                          * fade * smoothstep(0.03f, 0.15f, p.wetLevel);
-            if (puddleM > 0.01f) {
+            float wetM = upFace * smoothstep(0.03f, 0.15f, p.wetLevel);
+            if (wetM > 0.01f) {
                 // Two layers of expanding rings, as in the old
                 // in-tracer version — but only their brightness
                 // echo: rings alternately lift and dip the
@@ -1589,7 +1156,7 @@ fragment float4 tonemapFragment(VSOut in [[stage_in]],
                     rings += ring * ((layer == 0) ? 0.65f : 0.40f)
                            * (ph > 0.5f ? 1.0f : -1.0f);
                 }
-                float m = 1.0f + 0.16f * rings * puddleM
+                float m = 1.0f + 0.16f * rings * wetM
                               * clamp(p.shimmerRain, 0.0f, 1.2f);
                 c *= m;
             }
@@ -1834,421 +1401,3 @@ fragment float4 lineFragment(LineOut in [[stage_in]]) {
 // condition. The rendered sheet is a skin over this state,
 // clipped at object footprints (see Renderer.appendSnowSheet).
 
-struct SimParams {
-    uint vx;          // lattice vertices per row
-    uint vz;          // lattice rows
-    uint parity;      // red-black pass parity (flow kernel)
-    uint kind;        // flow kernel: 0 = snow, 1 = water, 2 = both (v4.9 merged dispatch)
-    float dt;         // seconds this substep
-    float cell;       // lattice cell size (m)
-    float snowSink;   // uniform snow sink rate (m/s): temp melt or legacy shrink
-    float compactRate;// m/s toward ceiling when snow exceeds it
-    float waterDry;   // water drying rate (m/s)
-    float waterDrain; // extra water loss at support edges (m/s)
-    float freezeFrac; // 0..1; water flow scales by (1 - freezeFrac)
-    float snowBase;   // v4.8: live snow base rate (m/s at drift factor 1)
-    float waterBase;  // v4.8: live water fill scale (surge x rate scale)
-    uint snowMode;    // 1 = snow owned by the snow kernels
-                      // (source/sink skips its snow half; flow runs water only)
-    float reposeTan;  // v4.12: legacy — set but unused (kept for struct stability)
-    float freshRho;   // v4.12: legacy — set but unused
-    float snowTemp;   // air temperature (C); >= 100 = unset (legacy).
-                      // v4.12: flavours the carve refill time constant.
-    float gateUniform;// v4.12: legacy — set but unused
-};
-
-kernel void simSourceSinkKernel(
-    device float* snowDepth [[buffer(0)]],
-    device float* waterDepth [[buffer(1)]],
-    device const float* supportY [[buffer(2)]],
-    device const float* snowCeil [[buffer(3)]],
-    device const float* snowRate [[buffer(4)]],
-    device const float* waterCeil [[buffer(5)]],
-    device const float* waterRate [[buffer(6)]],
-    device const uint* hasSupport [[buffer(7)]],
-    constant SimParams& sp [[buffer(8)]],
-    uint idx [[thread_position_in_grid]])
-{
-    uint count = sp.vx * sp.vz;
-    if (idx >= count) return;
-    if (hasSupport[idx] == 0u) {
-        // In snowMode the snow depth buffer is owned by
-        // snowRenderKernel (it zeroes non-ground columns
-        // itself); only water is still this kernel's to clear.
-        if (sp.snowMode == 0u) { snowDepth[idx] = 0.0f; }
-        waterDepth[idx] = 0.0f;
-        return;
-    }
-    // Snow (LEGACY path only — snowMode == 1 is always set and
-    // snowFieldKernel owns snow): deposit toward the ceiling
-    // at the drift rate; above the ceiling compact toward it;
-    // uniform sinks (temperature melt / legacy terms).
-    if (sp.snowMode == 0u) {
-        float sn = snowDepth[idx];
-        float ceil = snowCeil[idx];
-        if (sn < ceil) {
-            sn = min(ceil, sn + snowRate[idx] * sp.snowBase * sp.dt);
-        } else if (sn > ceil) {
-            sn = max(ceil, sn - sp.compactRate * sp.dt);
-        }
-        if (sp.snowSink > 0.0f) sn = max(0.0f, sn - sp.snowSink * sp.dt);
-        snowDepth[idx] = sn;
-    }
-    // Water: rain fills toward the pooling ceiling (the baked
-    // puddle profile for this vertex -- zero where the field
-    // never pools, so rain alone cannot flood a flat plane
-    // edge-to-edge); drying removes at the ~10 min rate.
-    float wa = waterDepth[idx];
-    if (wa < waterCeil[idx]) {
-        wa = min(waterCeil[idx], wa + waterRate[idx] * sp.waterBase * sp.dt);
-    }
-    if (sp.waterDry > 0.0f) wa = max(0.0f, wa - sp.waterDry * sp.dt);
-    // Edge drainage: any missing 4-neighbour means this vertex
-    // sits on a support boundary -- water there drains off the
-    // edge instead of standing in a ledge against thin air.
-    uint x = idx % sp.vx;
-    uint z = idx / sp.vx;
-    bool edge = false;
-    if (x == 0u || z == 0u || x + 1u >= sp.vx || z + 1u >= sp.vz) {
-        edge = true;
-    } else {
-        if (hasSupport[idx - 1u] == 0u || hasSupport[idx + 1u] == 0u
-            || hasSupport[idx - sp.vx] == 0u || hasSupport[idx + sp.vx] == 0u) {
-            edge = true;
-        }
-    }
-    if (edge && sp.waterDrain > 0.0f) {
-        wa = max(0.0f, wa - sp.waterDrain * sp.dt);
-    }
-    waterDepth[idx] = wa;
-}
-
-kernel void simFlowKernel(
-    device float* snowDepth [[buffer(0)]],
-    device float* waterDepth [[buffer(1)]],
-    device const float* supportY [[buffer(2)]],
-    device const float* waterCeil [[buffer(5)]],
-    device const uint* hasSupport [[buffer(7)]],
-    device const uint* pinned [[buffer(9)]],
-    constant SimParams& sp [[buffer(8)]],
-    uint idx [[thread_position_in_grid]])
-{
-    uint count = sp.vx * sp.vz;
-    if (idx >= count) return;
-    if (hasSupport[idx] == 0u) return;
-    uint x = idx % sp.vx;
-    uint z = idx / sp.vx;
-    if (((x + z) & 1u) != sp.parity) return;
-    const float maxStep = 0.753554f * sp.cell; // tan(37 deg) * cell
-    // Four neighbours; opposite colour by construction, so a
-    // neighbour is never written by another thread this pass.
-    const int dxs[4] = {1, -1, 0, 0};
-    const int dzs[4] = {0, 0, 1, -1};
-    // v4.9: kind == 2 runs BOTH kinds in this one dispatch.
-    // The two kinds touch DISJOINT writable state (snow writes
-    // snowDepth only, water writes waterDepth only; supportY,
-    // waterCeil, hasSupport and pinned are read-only here), so
-    // running them sequentially in this thread, snow first then
-    // water, performs exactly the same transfers per buffer in
-    // the same neighbour order as the two separate dispatches
-    // did -- every transfer's arithmetic is unchanged. Parity
-    // passes stay separate dispatches: red and black within one
-    // dispatch would race (there is no grid-wide sync).
-    const uint kindCount = (sp.kind >= 2u) ? 2u : 1u;
-    for (uint ki = 0u; ki < kindCount; ++ki) {
-        const uint kind = (sp.kind >= 2u) ? ki : sp.kind;
-    for (uint k = 0u; k < 4u; ++k) {
-        int nx = int(x) + dxs[k];
-        int nz = int(z) + dzs[k];
-        if (nx < 0 || nz < 0 || nx >= int(sp.vx) || nz >= int(sp.vz)) continue;
-        uint n = uint(nz) * sp.vx + uint(nx);
-        // v4.8 (steering 3): water at a support boundary
-        // DRAINS in the flow pass itself -- a missing neighbour
-        // (support edge) or a lower support across a step takes
-        // half of the cell's water per visit and removes
-        // it. A source-sink drain rate alone loses to the
-        // levelling refill from the pool behind it (host audit
-        // v4.8: edge ring held 9.4 mm against the rate drain);
-        // draining in the flow is what guarantees water never
-        // stands past an edge or piles against a step.
-        if (kind == 1u
-            && (hasSupport[n] == 0u
-                || (abs(supportY[idx] - supportY[n]) > 0.05f
-                    && supportY[n] < supportY[idx]))) {
-            float fs = 1.0f - clamp(sp.freezeFrac, 0.0f, 1.0f);
-            if (fs > 0.001f) {
-                waterDepth[idx] -= waterDepth[idx] * 0.5f * fs;
-            }
-            continue;
-        }
-        if (hasSupport[n] == 0u) continue;
-        // Same-support edges only: a genuine support step is
-        // the object's silhouette, not snow/water holding a
-        // cliff (the v4.5 rule, kept verbatim).
-        if (abs(supportY[idx] - supportY[n]) > 0.05f) continue;
-        if (kind == 0u) {
-            // Snow. Pinned columns (resting intruder, carved
-            // trail floor) neither give nor receive.
-            if (pinned[idx] != 0u || pinned[n] != 0u) continue;
-            float ha = supportY[idx] + snowDepth[idx];
-            float hb = supportY[n] + snowDepth[n];
-            float diff = ha - hb;
-            float move = 0.0f;
-            if (abs(diff) > maxStep) {
-                float excess = abs(diff) - maxStep;
-                // v4.10.4: 0.25, not 0.5. Within one parity
-                // dispatch up to 4 same-parity givers can move
-                // snow into a shared receiver simultaneously,
-                // each reading the receiver's stale depth; at
-                // 0.5 the receiver could gain ~2x the pairwise
-                // excess and become a NEW local maximum above
-                // its own ceiling (the at-rest degeneration).
-                // At 1/4 per giver the worst-case receiver gain
-                // is the largest single pair excess, so the
-                // maximum principle holds for the 4-neighbour
-                // stencil and the repose fixed point (the
-                // maxStep angle) is unchanged.
-                move = excess * 0.25f;
-            }
-            // Rounding diffusion: 4% of the depth difference
-            // per visit, always on -- piles relax into soft
-            // mounds instead of holding faceted steps. Small
-            // enough that drift variety survives (the audit
-            // measures drift contrast before/after).
-            move += (snowDepth[idx] - snowDepth[n]) * 0.008f;
-            // Clamp: a cell never gives more snow than it holds.
-            if (move > 0.0f) move = min(move, snowDepth[idx]);
-            if (move < 0.0f) move = -min(-move, snowDepth[n]);
-            if (move != 0.0f) {
-                snowDepth[idx] -= move;
-                snowDepth[n] += move;
-            }
-        } else {
-            // Confinement: water never flows INTO a dry cell
-            // outside the pooling field (waterCeil == 0). On a
-            // dead-flat plane, unconfined levelling bleeds a
-            // pool into a plane-wide film (host audit v4.8) --
-            // the pooling field is what makes puddles puddles.
-            if (waterCeil[n] <= 0.0f && waterDepth[n] <= 0.0f
-                && (supportY[idx] + waterDepth[idx])
-                   > (supportY[n] + waterDepth[n])) continue;
-            if (waterCeil[idx] <= 0.0f && waterDepth[idx] <= 0.0f
-                && (supportY[n] + waterDepth[n])
-                   > (supportY[idx] + waterDepth[idx])) continue;
-            // Water levelling: move toward equal free surface.
-            float flowScale = 1.0f - clamp(sp.freezeFrac, 0.0f, 1.0f);
-            if (flowScale <= 0.001f) continue; // frozen: rigid
-            float la = supportY[idx] + waterDepth[idx];
-            float lb = supportY[n] + waterDepth[n];
-            float move = (la - lb) * 0.25f * flowScale;
-            if (move > 0.0f) move = min(move, waterDepth[idx]);
-            if (move < 0.0f) move = -min(-move, waterDepth[n]);
-            // Rounding diffusion on depth itself (surface
-            // tension): blurs the perimeter into blobs.
-            move += (waterDepth[idx] - waterDepth[n]) * 0.03f * flowScale;
-            if (move > 0.0f) move = min(move, waterDepth[idx]);
-            if (move < 0.0f) move = -min(-move, waterDepth[n]);
-            if (move != 0.0f) {
-                waterDepth[idx] -= move;
-                waterDepth[n] += move;
-            }
-        }
-    }
-    } // kind loop (v4.9 merged dispatch)
-}
-
-kernel void simApplyEditsKernel(
-    device float* snowDepth [[buffer(0)]],
-    device const uint* editIndex [[buffer(10)]],
-    device const float* editDelta [[buffer(11)]],
-    constant uint& editCount [[buffer(12)]],
-    constant uint& latticeCount [[buffer(13)]],
-    uint idx [[thread_position_in_grid]])
-{
-    if (idx >= editCount) return;
-    uint v = editIndex[idx];
-    // v4.10.2: this kernel currently has NO dispatch site
-    // (the CPU applies edit transfers in appendSnowSheet),
-    // but its write was the one unbounded GPU write in the
-    // sim shader set — guard it before anyone wires it up.
-    if (v >= latticeCount) return;
-    snowDepth[v] = max(0.0f, snowDepth[v] + editDelta[idx]);
-}
-
-// MARK: - v4.12 snow: authored field + carve-only deformation
-//
-// The games model (Batman: Arkham Origins -> Rise of the Tomb
-// Raider -> God of War / RDR2), replacing v4.11's granular
-// mass-transport sim (retired 2026-11-02: on device, its
-// support-switch transfer piled a smooth ramp up a box's
-// vertical face — games never transport snow sideways at all).
-// Per ground vertex the whole model is two floats of state:
-//
-//   field = the AUTHORED snow depth (a value, not mass);
-//   carve = how far the surface is currently compressed below
-//           the field (>= 0) by objects / the player /
-//           footprint stamps.
-//
-// Rendered depth = clamp(field - carve + rim, 0, field + 0.10),
-// derived by snowRenderKernel. Nothing moves depth between
-// vertices: the field evolves only by the v4.8 source/sink
-// rules (grow toward the authored ceiling while it snows,
-// compact down toward it, temperature sink subtracts), and
-// carve only chases a live occupancy demand. The one permitted
-// raise is the rim: a <= 0.10 m lip at a depression's edge
-// (Rise-of-the-Tomb-Raider style), so the total surface can
-// never exceed authored depth + 0.10 m anywhere — the
-// carve-only invariant holds by construction.
-
-// Step 1 of each substep: evolve field + carve.
-//   Field growth/shrink: the v4.8 source/sink semantics
-//   verbatim (the same rules simSourceSinkKernel documents for
-//   its snow half, gated off since v4.11).
-//   Carve demand: an intruder covering this vertex (interval
-//   overlap of its [lo, hi] span against the snow column, the
-//   v4.11 test) wants the visible depth inside its span gone:
-//   desired carve = field - visible depth. Carve-in is fast
-//   (1 - exp(-8*dt) ~= 0.23 per 1/30 s substep); refill toward
-//   a LOWER demand is slow and temperature-flavoured:
-//   tau = 90 s while snowfall is active, 240 s idle, halved
-//   above 0 C (wet snow slumps back), x1.5 at <= -15 C (cold
-//   dry snow keeps its tracks). Press stamps act in the same
-//   step: carve rises to at least field * min(press, 0.9) — a
-//   footprint — and the press buffer is cleared after the
-//   first substep (snowPressClearKernel), so a stamp is
-//   one-shot.
-// Buffer layout: 0 field, 1 carve, 2 groundY, 3 groundHas,
-// 4 snowCeil, 5 snowRate, 6 occCov, 7 occLo, 8 occHi, 9 press,
-// 10 params.
-kernel void snowFieldKernel(
-    device float* field [[buffer(0)]],
-    device float* carve [[buffer(1)]],
-    device const float* groundY [[buffer(2)]],
-    device const uint* groundHas [[buffer(3)]],
-    device const float* snowCeil [[buffer(4)]],
-    device const float* snowRate [[buffer(5)]],
-    device const float* occCov [[buffer(6)]],
-    device const float* occLo [[buffer(7)]],
-    device const float* occHi [[buffer(8)]],
-    device const float* press [[buffer(9)]],
-    constant SimParams& sp [[buffer(10)]],
-    uint idx [[thread_position_in_grid]])
-{
-    uint count = uint(sp.vx) * uint(sp.vz);
-    if (idx >= count) return;
-    if (groundHas[idx] == 0u) {
-        field[idx] = 0.0f;
-        carve[idx] = 0.0f;
-        return;
-    }
-    float f = field[idx];
-    float c = carve[idx];
-    // (1) Authored field evolution — v4.8 source/sink rules.
-    float ceil = snowCeil[idx];
-    if (f < ceil) {
-        f = min(ceil, f + snowRate[idx] * sp.snowBase * sp.dt);
-    } else if (f > ceil) {
-        f = max(ceil, f - sp.compactRate * sp.dt);
-    }
-    if (sp.snowSink > 0.0f) {
-        f = max(0.0f, f - sp.snowSink * sp.dt);
-    }
-    // (2) Occupancy demand (interval overlap, see header).
-    float rendered = max(f - c, 0.0f);
-    float target = 0.0f;
-    if (occCov[idx] > 0.0f) {
-        float ovTop = min(occHi[idx] - groundY[idx], rendered);
-        float ovBot = max(occLo[idx] - groundY[idx], 0.0f);
-        float ovH = ovTop - ovBot;
-        if (ovH > 0.0f) { target = min(c + ovH, f); }
-    }
-    // (3) Chase the demand: fast in, slow refill out.
-    if (c < target) {
-        c += (target - c) * (1.0f - exp(-8.0f * sp.dt));
-    } else if (c > target) {
-        float tau = sp.snowBase > 0.0f ? 90.0f : 240.0f;
-        if (sp.snowTemp < 100.0f && sp.snowTemp > 0.0f) {
-            tau *= 0.5f;
-        } else if (sp.snowTemp < 100.0f && sp.snowTemp <= -15.0f) {
-            tau *= 1.5f;
-        }
-        c += (target - c) * (1.0f - exp(-sp.dt / tau));
-    }
-    // (4) Footprint press (one-shot; buffer cleared per tick).
-    float p = press[idx];
-    if (p > 0.001f && f > 0.0f) {
-        c = max(c, f * min(p, 0.9f));
-    }
-    // (5) A depression can never exceed the field itself.
-    carve[idx] = clamp(c, 0.0f, f);
-    field[idx] = f;
-}
-
-// Step 2 of each substep: derive the rendered depth. Read-only
-// on carve (neighbour rim), so the result is deterministic for
-// a given state. Rim: where a 4-neighbour is carved deeper by
-// more than 2 cm, this vertex's lip rises by 35% of the excess,
-// capped at 0.10 m — and the total is hard-clamped to
-// field + 0.10, so the carve-only invariant
-// (0 <= rendered <= field + 0.10) holds at every vertex.
-kernel void snowRenderKernel(
-    device float* snowDepth [[buffer(0)]],
-    device const float* field [[buffer(1)]],
-    device const float* carve [[buffer(2)]],
-    device const uint* groundHas [[buffer(3)]],
-    constant SimParams& sp [[buffer(4)]],
-    uint idx [[thread_position_in_grid]])
-{
-    uint count = uint(sp.vx) * uint(sp.vz);
-    if (idx >= count) return;
-    if (groundHas[idx] == 0u) { snowDepth[idx] = 0.0f; return; }
-    float f = field[idx];
-    float c = carve[idx];
-    float rendered = max(f - c, 0.0f);
-    uint vx = uint(sp.vx);
-    uint x = idx % vx;
-    uint z = idx / vx;
-    float maxN = 0.0f;
-    if (x > 0u) { maxN = max(maxN, carve[idx - 1u]); }
-    if (x + 1u < vx) { maxN = max(maxN, carve[idx + 1u]); }
-    if (z > 0u) { maxN = max(maxN, carve[idx - vx]); }
-    if (z + 1u < uint(sp.vz)) { maxN = max(maxN, carve[idx + vx]); }
-    // v4.12 (round-2 fix): the rim is a DEPRESSION-EDGE lip —
-    // it may only rise on a vertex that keeps at least half
-    // its own snow. Without the gate it also fired across a
-    // fully carved plateau (under a resting box) wherever the
-    // drift field varied by > ~0.29 m between neighbours,
-    // printing rendered = the rim cap under the box (round-1
-    // sim audit: carve underbox measured exactly 0.1000).
-    if (maxN > c + 0.02f && c < 0.5f * f) {
-        float rim = min(0.10f, 0.35f * (maxN - c));
-        rendered = min(rendered + rim, f + 0.10f);
-    }
-    snowDepth[idx] = rendered;
-}
-
-// Press stamps are one-shot: consumed by the first
-// substep they are live for, cleared before the second.
-kernel void snowPressClearKernel(
-    device float* press [[buffer(0)]],
-    uint idx [[thread_position_in_grid]])
-{
-    press[idx] = 0.0f;
-}
-
-// v4.12 audit: evaluate the shared shader snow-accumulation
-// factor (snowAccumFactor, used by the trace + guide kernels)
-// for three probe normals at full snow level: a vertical face
-// (must be EXACTLY 0 — vertical faces accumulate nothing, by
-// construction), a flat top (full), and a 45-degree roof
-// (strictly between). Driven by Renderer.reproSnowGateAudit.
-kernel void snowGateAuditKernel(
-    device float* out [[buffer(0)]],
-    uint idx [[thread_position_in_grid]])
-{
-    if (idx >= 3u) return;
-    float3 n = idx == 0u ? float3(1.0f, 0.0f, 0.0f)
-             : idx == 1u ? float3(0.0f, 1.0f, 0.0f)
-                         : normalize(float3(0.0f, 1.0f, 1.0f));
-    out[idx] = snowAccumFactor(n, 1.0f, 0.5f);
-}
