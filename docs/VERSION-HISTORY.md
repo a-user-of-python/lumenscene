@@ -1115,6 +1115,89 @@ colliding — nothing could fall through where it had stood.
 
 ---
 
+## Version 4.14 — Loop node; Move/Rotate Object aim at the player (2026-11-02)
+
+Three commissions, all in the node system (57 kinds).
+
+**Loop node (Logic).** Wire a trigger into Loop and pick
+the node it drives on its card: every time the driven node
+finishes, Loop runs it again — forever, until Play stops.
+The driven node needs no wire back; Loop listens for its
+completion. A **Repeat Delay** (default 0) pauses between
+cycles, and Loop's own **out** fires once per cycle for
+chaining. Loop may drive the time-based movers whose run
+has a definite end: **Move Object** and **Scale Object**
+(their Arrived), **Follow Object** in its Once mode (its
+Arrived), and **Rotate Object** when its duration runs out
+(a duration of 0 already spins forever, so a Loop simply
+starts it). Everything else is excluded on purpose:
+continuous behaviours (Oscillate, Chase, Wander, Look At,
+Pulse, Cycle, Applied Gravity) already run until stopped,
+so looping them would mean nothing; one-shot actions
+finish the instant they start, so "looping" one is just a
+timer (Timer and Delay exist); and a Loop may never drive
+another Loop. A Loop that is already cycling ignores
+further triggers rather than double-driving its target,
+and Play exit clears every loop state — a second Play
+session starts its loops from the top.
+
+**Move Object → Player.** Move Object's new **Move**
+choice (Object / Player) glides the Play viewpoint with
+the node's existing semantics: same duration and smooth
+glide, To Object or By Offset. A To Object destination is
+converted with the same eye rule Teleport Player uses, so
+you end standing at the target rather than sunk inside
+it; By Offset glides from where you stand. The player's
+position has no collision model of its own (Play movement
+writes the viewpoint directly and eye height is locked),
+so the glide follows that convention — the written path
+is the path taken. Teleport / Respawn / Cut To View
+supersede an in-flight glide. While a glide runs, your
+look stays yours; when it lands, you walk on from the new
+spot. **Arrived** fires as usual — so Loop + Move (Player)
+starts a fresh glide the moment the last one lands.
+
+**Rotate Object → Player Camera.** Rotate Object's new
+**Rotate** choice (Object / Player Camera) turns the
+view itself at the node's speed for its duration. It
+advances the live look yaw — the very value the drag-look
+gesture owns — through the pose funnel, so there is no
+second stored orientation to snap back to: when the
+rotation ends, or you grab the look mid-spin, the view is
+simply wherever it currently points, and your drag
+continues from there. With Loop driving it, the view
+turns forever.
+
+Both new choices are ordinary parameters: old projects
+gain them by catalogue default (Object), so a pre-4.14
+graph runs exactly as before.
+
+**Host audits (in-simulator, REPRO-CHECK).** loopmove
+7/7: a Loop drives Move Object through four full +1.5 m
+cycles in 4.6 s of Play (final offset 6.03 m), gliding —
+largest single-frame step 0.22 m, never a teleport — and
+a second Loop drives Rotate Object to 307.7° unwrapped
+(five 60° cycles); at Play exit the box is restored and
+dead still across 35 samples; a fresh Play session loops
+again from the authored position (x = 2.89 at 1.7 s, mid
+second cycle). playernodes 8/8: the player glide lands
+exactly on the eye-rule destination (4, 2.2, 0) and stays
+there; the camera turn is gradual (60° at its midpoint),
+lands at 91.2° for a 90° ask, and after the audit drags
+the look a further +30° the yaw holds 121.2° — the node's
+orientation plus the drag, no snap-back; a Loop then
+drives the camera rotate at 363.8° over 4 s (four 90°
+cycles). Graphs using all three features round-trip
+through save/load with refs and parameters intact, and
+pre-4.14 files (Loop stripped, subject params absent)
+load unchanged. The full matrix stays green — gravity
+9/9 + 7/7, perf bench unchanged (rain frame tick 0.27 ms
+mean, edit rebuild 35.2 ms, host CPU), iPhone gate PASS.
+Loop smoothness and the feel of the camera turn are the
+device's verdict, as always.
+
+---
+
 *Every version above was verified by automated build and inspection before
 delivery; the final judge of each was the device it runs on, and several
 versions (3.1, 3.2, 3.3, 3.4) exist because device reports sent the work
