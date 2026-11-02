@@ -3752,11 +3752,23 @@ final class Renderer {
             }
             for i in 0..<count where hasSup[i] {
                 let x = ox + Float(i % vx) * cs, z = oz + Float(i / vx) * cs
-                var dx: Float = 0, dz: Float = 0
-                if let h = hostIDs[i], let nc = centroids[h], let oc = simPrevCentroids[h] {
-                    dx = nc.x - oc.x; dz = nc.y - oc.y
-                    if abs(dx) < 0.001 && abs(dz) < 0.001 { dx = 0; dz = 0 }
-                }
+                // v4.11 fix round 5: NO fractional centroid
+                // shift. The v4.11 remap samples every vertex
+                // at its own world position (identity on an
+                // unchanged grid — exactly conservative). The
+                // earlier host-motion offset (a centroid-delta
+                // fraction of a cell) resampled the whole field
+                // through bilinear interpolation on every
+                // rebuild; at the trench walls and berms that
+                // diffusion bled ~0.026 mass per rebuild
+                // (in-app DRAG audit, localised by per-step
+                // metrics + the remap counter). Snow "riding"
+                // a moving object is handled by the occupancy
+                // displacement + flux now, not by the remap:
+                // as the support pattern flips cell by cell,
+                // snow stays in the world (the host-changed
+                // rule below) and the mover displaces it.
+                let dx: Float = 0, dz: Float = 0
                 // v4.10.4 rule, kept: a vertex whose host is
                 // NEW to the lattice does NOT sample the old
                 // field for itself — it starts from its own
