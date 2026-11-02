@@ -848,6 +848,112 @@ inert unless launched with a special argument, so any future
 weather crash can be bisected the same mechanical way instead of
 by reading code.
 
+## Version 4.10.4 — drag and spawn fixes; the iPhone gate (2026-11-01)
+
+Two snow behaviours that the simulator audits had proven on paper
+get their final form. **Dragging an object through deep snow** no
+longer misbehaves: the displaced snow travels with the drag the way
+the model intends instead of snapping or leaving artefacts behind.
+And an object **spawned into existing snow** now lands with its top
+genuinely blank — the spawn-blank behaviour the exposure model
+always promised — displacing its own volume into banks around its
+base rather than starting pre-buried or pre-covered.
+
+This is also the version where the app stops pretending to be a
+phone app. On an **iPhone** it now shows a single notice — "You
+need an iPad for this to work" — and nothing else; the project was
+always built for the iPad's screen, and a phone build that half-ran
+the editor helped nobody. (The package still declares both device
+families so the one build serves both; the gate is the app's own.)
+
+**One honest correction to earlier wording:** the 2.00 m **Max Snow
+Depth** setting is a *per-cell ceiling*, not a hard bound on the
+snow surface — drifts and banks could legitimately stand at the
+ceiling in one cell while the surface as drawn passed above or
+below it elsewhere. The setting page's promise is narrower than
+earlier versions implied.
+
+**Device note, and it matters:** on the iPad itself, the verdict
+came back that the snow *still messed up*. The simulator-proven
+fixes had landed; the behaviour on the real device in a real scene
+had not matched them. That report — not any failing audit — is
+what sent snow back to the drawing board for v4.11.
+
+## Version 4.11 — snow becomes a granular simulation (2026-11-02)
+
+The entire rule stack that had grown from v4.2 to v4.10.4 —
+ceilings, exposure clocks, the plough layer, drag caps, relaxation
+patches — is **retired in one move** and replaced by a
+physics-first granular simulation on the same ~0.20 m lattice.
+Each column now carries snow **mass**, **density** (ρ from 0.30 to
+1.00) and a sinter **age**; depth is derived (height = mass /
+density). Thirty times a second the model runs its substeps:
+snowfall enters as an input flux only (the old ceiling survives
+only as a deposition gate, never as a shape), melt and compaction
+apply, and gravity moves mass between neighbouring columns in
+pairwise, exactly-conserving transfers limited by a
+**temperature-dependent angle of repose** — about 34° for cold
+snow, up to 38° near freezing. Objects are displacing volume
+boundaries, not decoration: placing one pushes its own volume of
+snow aside into repose-shaped banks and lands with a bare top;
+removing one lets the hole collapse; roofs shed to repose. (A
+particle method — MPM — was costed and rejected: whole-scene snow
+at particle spacing runs to roughly 5–6 million particles, which
+does not fit an M3 alongside a hardware path tracer at 60 FPS.
+The model's honest limits: one height per column means no
+overhangs or cornices, no airborne grains, and no wind transport
+beyond the deposition drift field.)
+
+**The audits were rebuilt for it** — a new in-app physics suite,
+plus a line-for-line float32 mirror of the kernel math checked
+host-side (20/20). On the final build: a dropped pile's cone flank
+settles at **33.97°** against a 34° ± 3 bar with mass exact to the
+last digit; injected spikes settle to a maximum slope of 34.08°
+with zero spike remaining (the retired model scores 79.7° on the
+same test); dragging a box through 1.8 m of snow carves its trench
+with total mass drift of −0.0003%; a spawn lands with its top at
+exactly zero and banks at 34.13°; a 45° roof sheds from 0.50 m to
+0.000 while a flat roof keeps its snow. **Zero crashes across all
+22 CI runs**, and the water system was not touched — its kernels
+are byte-identical and its v4.8 audit re-ran 33/33. The simulation
+step's cost was not directly instrumented; the repro harness pumps
+full ticks at interactive rates in the simulator, and the device
+remains the judge of performance.
+
+**Device note — the honest end of this model.** On the iPad, the
+user placed a 1 m box into 0.77 m of snow and the snow formed a
+**big smooth ramp climbing the box's vertical face**, meeting the
+wall far above the field depth instead of at it. The audits had
+passed because they were structurally blind to exactly this: the
+slope metric excluded edges ending at a bare object wall, and no
+check measured bank height against exposure. The mechanism, once
+dug out: an object sitting fully on the ground gives the
+displacement code no overlap to compact against, so **all** of the
+snow that was under its footprint is transferred into the single
+ring of cells around its base — at these proportions that ring
+reaches about the box's full height — and the snow sheet then
+renders the step up to the box's top as one smooth slope. Two
+real defects, compounding.
+
+That report triggered a research pass into how shipped games
+actually do snow, with Red Dead Redemption 2 as the reference.
+The finding: almost none of them simulate mass-conserving flow at
+all. The industry stack is **authored snow depth**, **carve-only
+deformation** (feet and objects push snow *down*; no operation
+ever raises it), and **shader accumulation gated by how up-facing
+a surface is** — which is exactly zero on a vertical face, so snow
+cannot climb a wall *by construction*. Real snow agrees: in still
+air the contact line sits at field depth, and measured equilibrium
+drift profiles run at 7–14°, not at a granular repose angle.
+
+So the granular model is **retired**, one day after it shipped.
+**v4.12, in development**, replaces it with the games-standard
+model: authored depth, carve-only deformation with persistent
+trails, and up-facing-gated shader accumulation with RDR2-style
+glint and caked-snow coating. This entry stays in the record
+because the rebuild was real work, honestly audited — and because
+the device outranks the audit, every time.
+
 *Every version above was verified by automated build and inspection before
 delivery; the final judge of each was the device it runs on, and several
 versions (3.1, 3.2, 3.3, 3.4) exist because device reports sent the work

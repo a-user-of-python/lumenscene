@@ -155,7 +155,8 @@ image lines._
 | 4.10.1 | 2026-11-01 | Crash-hardening hotfix (8 hazards) + step instrumentation; panel header fix |
 | 4.10.2 | 2026-11-01 | Crash round 2: failed-build swap chain, NaN guards, sim-tick fencing |
 | 4.10.3 | 2026-11-01 | The snow crash reproduced in the simulator and fixed for real; device-confirmed |
-| 4.10.4 | — | In progress: drag-through-snow and spawn-exposure fixes |
+| 4.10.4 | 2026-11-01 | Drag-through-snow and spawn snow fixes; on iPhone the app now shows an iPad-required notice |
+| 4.11 | 2026-11-02 | Snow rebuilt as a granular physics simulation (mass, density, repose flow) with a physics audit suite — retired on device evidence the same day; the games-standard model is in development as 4.12 |
 
 Full details in the [Version History](docs/VERSION-HISTORY.md).
 
