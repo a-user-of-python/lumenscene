@@ -243,12 +243,18 @@ enum ReproDriver {
             var gRise = LogicNode(kind: "actGravity", x: 220, y: 280)
             gRise.params = ["object": .ref(riser.id),
                             "strength": .number(-9.8), "bounce": .number(0)]
-            p.scene.graph.nodes = [start, gFall, delay, hide, gRise]
+            var delay2 = LogicNode(kind: "logDelay", x: 220, y: 420)
+            delay2.params = ["seconds": .number(4.0)]
+            var hide2 = LogicNode(kind: "actHide", x: 440, y: 420)
+            hide2.params = ["object": .ref(ceilingBox.id)]
+            p.scene.graph.nodes = [start, gFall, delay, hide, gRise, delay2, hide2]
             p.scene.graph.links = [
                 NodeLink(id: UUID(), from: start.id, fromPin: "out", to: gFall.id, toPin: "in"),
                 NodeLink(id: UUID(), from: start.id, fromPin: "out", to: delay.id, toPin: "in"),
                 NodeLink(id: UUID(), from: delay.id, fromPin: "out", to: hide.id, toPin: "in"),
                 NodeLink(id: UUID(), from: start.id, fromPin: "out", to: gRise.id, toPin: "in"),
+                NodeLink(id: UUID(), from: start.id, fromPin: "out", to: delay2.id, toPin: "in"),
+                NodeLink(id: UUID(), from: delay2.id, fromPin: "out", to: hide2.id, toPin: "in"),
             ]
         default:
             break
@@ -493,20 +499,31 @@ final class ReproRun {
             let fx = faller.transform.position[0]
             let fz = faller.transform.position[2]
             var topTris = 0
+            var bottomTris = 0
             var total = 0
             for tri in session.renderer.collisionTriangles {
                 total += 1
                 let ys = [tri.0.y, tri.1.y, tri.2.y]
                 let xs = [tri.0.x, tri.1.x, tri.2.x]
                 let zs = [tri.0.z, tri.1.z, tri.2.z]
-                if ys.allSatisfy({ abs($0 - 1.0) < 0.01 })
-                    && xs.allSatisfy({ abs($0 - Float(fx)) <= 0.51 })
-                    && zs.allSatisfy({ abs($0 - Float(fz)) <= 0.51 }) {
-                    topTris += 1
-                }
+                guard ys.allSatisfy({ abs($0 - 1.0) < 0.01 }),
+                      xs.allSatisfy({ abs($0 - Float(fx)) <= 0.51 }),
+                      zs.allSatisfy({ abs($0 - Float(fz)) <= 0.51 })
+                else { continue }
+                let n = simd_cross(tri.1 - tri.0, tri.2 - tri.0)
+                if n.y > 0 { topTris += 1 } else if n.y < 0 { bottomTris += 1 }
             }
             check("gridprobe", topTris == 0,
-                  "topTrisAt1.0=\(topTris) totalTris=\(total) fallerXZ=(\(fx),\(fz))")
+                  "upTrisAt1.0=\(topTris) downTrisAt1.0=\(bottomTris) totalTris=\(total) fallerXZ=(\(fx),\(fz))")
+            // Tick-alive witness: the ceiling box must have
+            // been hidden by the 4 s Delay branch — if the
+            // runtime stopped ticking after the 2.5 s hide, it
+            // is still visible.
+            if let ceil = session.project.scene.objects
+                .first(where: { $0.name == "Repro ceiling box" }) {
+                check("tickwitness", !session.runtimeIsObjectVisible(ceil.id),
+                      "ceiling visible at end=\(session.runtimeIsObjectVisible(ceil.id))")
+            }
         }
     }
 
