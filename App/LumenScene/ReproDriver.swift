@@ -637,69 +637,59 @@ final class ReproRun {
         ringTops.sort()
         let fieldLocal = ringTops.isEmpty ? 0 : ringTops[ringTops.count / 2]
         let deep = ReproDriver.variant == "walldeep"
+        // LOCAL per-vertex invariants — the only honest
+        // reference at ANY settings: the authored field varies
+        // on the drift scale (in walldeep the crest's own
+        // field is 1.6–1.9 m while the 1–2 m ring median reads
+        // 1.16 m; in wallbox the field is drift lace). Every
+        // sheet vertex is judged against the field AT ITS OWN
+        // XZ. walldeep additionally asserts its scene
+        // precondition (perimeter field >= 1.2 m) so the audit
+        // cannot silently degrade to a shallow scene.
         if deep {
-            // Scalar checks against the measured local field:
-            // the contact line = emitted vertices within 1 mm
-            // of the footprint perimeter; the wall band =
-            // everything within 0.25 m of the face.
-            var contact: [Float] = []
-            var wallBandMax = -Float.greatestFiniteMagnitude
-            for v in tris {
-                if rectDist(v.x, v.z) <= 0.25, v.y > wallBandMax {
-                    wallBandMax = v.y
+            var perMin = Float.greatestFiniteMagnitude
+            var t: Float = -0.5
+            while t <= 0.501 {
+                let pts: [(Float, Float)] = [(cx + t, cz - 0.5), (cx + t, cz + 0.5),
+                                             (cx - 0.5, cz + t), (cx + 0.5, cz + t)]
+                for p in pts {
+                    let v = snapBilinear(s.field, s.vx, s.vz, s.ox, s.oz, s.cs, p.0, p.1)
+                    if v < perMin { perMin = v }
                 }
-                let perim = max(abs(v.x - cx), abs(v.z - cz))
-                if abs(perim - 0.5) <= 0.001 {
-                    contact.append(v.y)
-                }
+                t += 0.05
             }
-            var medDev: Float = 1
-            if !contact.isEmpty {
-                let devs = contact.map { abs($0 - fieldLocal) }.sorted()
-                medDev = devs[devs.count / 2]
-            }
-            check("contact", contact.count >= 6 && medDev <= 0.06,
-                  String(format: "count=%d medDev=%.4f fieldLocal=%.4f",
-                         contact.count, medDev, fieldLocal))
-            check("wallband", wallBandMax <= fieldLocal + 0.12,
-                  String(format: "wallBandMax=%.4f fieldLocal=%.4f",
-                         wallBandMax, fieldLocal))
-        } else {
-            // LOCAL per-vertex invariants (Sean's settings:
-            // the field is drift lace, so every sheet vertex
-            // is judged against the field AT ITS OWN XZ).
-            var devs: [Float] = []
-            var bandViol = 0
-            var bandMaxExcess: Float = 0
-            for v in tris {
-                let gY = snapBilinear(s.groundY, s.vx, s.vz, s.ox, s.oz, s.cs, v.x, v.z)
-                if rectDist(v.x, v.z) <= 0.25 {
-                    let f = snapBilinear(s.field, s.vx, s.vz, s.ox, s.oz, s.cs, v.x, v.z)
-                    let excess = v.y - (gY + f + 0.115)
-                    if excess > bandMaxExcess { bandMaxExcess = excess }
-                    if excess > 0.01 { bandViol += 1 }
-                }
-                let perim = max(abs(v.x - cx), abs(v.z - cz))
-                if abs(perim - 0.5) <= 0.004 {
-                    // The clip pins wall-crossing vertices at
-                    // the FIELD surface (ground + authored
-                    // field): deviation from it is the moat /
-                    // float / ramp signature.
-                    let f = snapBilinear(s.field, s.vx, s.vz, s.ox, s.oz, s.cs, v.x, v.z)
-                    devs.append(abs(v.y - (gY + f)))
-                }
-            }
-            devs.sort()
-            let medDev = devs.isEmpty ? 1 : devs[devs.count / 2]
-            let within = devs.filter { $0 <= 0.06 }.count
-            check("contact", devs.count >= 4
-                  && Float(within) >= 0.9 * Float(devs.count)
-                  && (devs.last ?? 1) <= 0.10,
-                  String(format: "count=%d medDev=%.4f maxDev=%.4f",
-                         devs.count, medDev, devs.last ?? 0))
-            check("wallband", bandViol == 0,
-                  String(format: "viol=%d maxExcess=%.4f", bandViol, bandMaxExcess))
+            check("scene", perMin >= 1.2,
+                  String(format: "perimeterMinField=%.4f ringMedian=%.4f",
+                         perMin, fieldLocal))
         }
+        var devs: [Float] = []
+        var bandViol = 0
+        var bandMaxExcess: Float = 0
+        for v in tris {
+            let gY = snapBilinear(s.groundY, s.vx, s.vz, s.ox, s.oz, s.cs, v.x, v.z)
+            let f = snapBilinear(s.field, s.vx, s.vz, s.ox, s.oz, s.cs, v.x, v.z)
+            if rectDist(v.x, v.z) <= 0.25 {
+                let excess = v.y - (gY + f + 0.115)
+                if excess > bandMaxExcess { bandMaxExcess = excess }
+                if excess > 0.01 { bandViol += 1 }
+            }
+            let perim = max(abs(v.x - cx), abs(v.z - cz))
+            if abs(perim - 0.5) <= 0.004 {
+                // The clip pins wall-crossing vertices at
+                // the FIELD surface (ground + authored
+                // field): deviation from it is the moat /
+                // float / ramp signature.
+                devs.append(abs(v.y - (gY + f)))
+            }
+        }
+        devs.sort()
+        let medDev = devs.isEmpty ? 1 : devs[devs.count / 2]
+        check("contact", devs.count >= 4 && medDev <= 0.03
+              && (devs.last ?? 1) <= 0.10,
+              String(format: "count=%d medDev=%.4f maxDev=%.4f",
+                     devs.count, medDev, devs.last ?? 0))
+        check("wallband", bandViol == 0,
+              String(format: "viol=%d maxExcess=%.4f", bandViol, bandMaxExcess))
         check("underbox", underMax <= 0.05,
               String(format: "underMax=%.4f", underMax))
     }
