@@ -2213,7 +2213,14 @@ kernel void snowRenderKernel(
     if (x + 1u < vx) { maxN = max(maxN, carve[idx + 1u]); }
     if (z > 0u) { maxN = max(maxN, carve[idx - vx]); }
     if (z + 1u < uint(sp.vz)) { maxN = max(maxN, carve[idx + vx]); }
-    if (maxN > c + 0.02f) {
+    // v4.12 (round-2 fix): the rim is a DEPRESSION-EDGE lip —
+    // it may only rise on a vertex that keeps at least half
+    // its own snow. Without the gate it also fired across a
+    // fully carved plateau (under a resting box) wherever the
+    // drift field varied by > ~0.29 m between neighbours,
+    // printing rendered = the rim cap under the box (round-1
+    // sim audit: carve underbox measured exactly 0.1000).
+    if (maxN > c + 0.02f && c < 0.5f * f) {
         float rim = min(0.10f, 0.35f * (maxN - c));
         rendered = min(rendered + rim, f + 0.10f);
     }

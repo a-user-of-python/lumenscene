@@ -111,6 +111,7 @@ jobs:
               ("scaled", ["-LSVariant", "scaled"]),
               ("bigplane", ["-LSVariant", "bigplane"]),
               ("wallbox", ["-LSVariant", "wallbox"]),
+              ("walldeep", ["-LSVariant", "walldeep"]),
               ("carve", ["-LSVariant", "carve"]),
               ("refill", ["-LSVariant", "refill"]),
               ("snowgate", ["-LSVariant", "snowgate"]),

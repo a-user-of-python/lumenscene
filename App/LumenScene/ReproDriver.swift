@@ -64,6 +64,11 @@
 //              the RENDERED sheet against the wall (contact
 //              line at field depth, nothing above field +
 //              0.12 in the wall band, <= 0.05 under the box).
+//              Round 2: at Sean's settings the field is drift
+//              lace, so wallbox checks are LOCAL (per-vertex,
+//              against the field at each vertex's own XZ);
+//              walldeep (1.80 m, box aimed at the deepest
+//              drift crest) runs the scalar contact checks.
 //   carve    — v4.12 carve-only audit: bare 8x8 plane + 1 m
 //              box, 1.80 m pre-seed. The box drags +X at
 //              0.011 m/pump for 5.8 m (position write +
@@ -197,22 +202,31 @@ enum ReproDriver {
             if let i = p.scene.objects.firstIndex(where: { $0.primitiveKind == "plane" }) {
                 p.scene.objects[i].transform.scale = [12, 1, 12]
             }
-        case "wallbox":
-            // v4.12 wall-contact audit scene: Sean's exact
-            // proportions — a bare 8x8 plane pre-seeded at
-            // 0.77 m of snow (of 2.0 m max); the 1 m box is
-            // spawned mid-run via addPrimitive (camera target
-            // (0, 1, 0) lands it at (0, 0.5, 0)). Temperature
-            // -8: mode 0 afterwards = no growth, no melt, so
-            // the field the box meets is the field audited.
+        case "wallbox", "walldeep":
+            // v4.12 wall-contact audit scenes: a bare 8x8
+            // plane; the 1 m box is spawned mid-run via
+            // addPrimitive (camera target lands it). wallbox =
+            // Sean's exact device settings — 0.77 m of snow of
+            // 1.80 m max (his readout), box at the origin;
+            // walldeep = the same scene at 1.80 m of 2.0 m,
+            // with the box aimed at the deepest drift crest
+            // (see pickDriftCrest). Temperature -8: mode 0
+            // afterwards = no growth, no melt, so the field
+            // the box meets is the field audited.
             var plane = SceneObject.primitive("plane", name: "Repro bare plane")
             plane.params = ["w": 8, "d": 8]
             plane.transform.position = [0, 0, 0]
             p.scene.objects = [plane]
             p.scene.camera.target = [0, 1, 0]
-            p.scene.weather.maxDepth = 2.0
-            p.scene.weather.snowAmount = 0.77
-            p.scene.weather.snow = 0.385
+            if ReproDriver.variant == "walldeep" {
+                p.scene.weather.maxDepth = 2.0
+                p.scene.weather.snowAmount = 1.8
+                p.scene.weather.snow = 0.9
+            } else {
+                p.scene.weather.maxDepth = 1.8
+                p.scene.weather.snowAmount = 0.77
+                p.scene.weather.snow = 0.385
+            }
             p.scene.weather.temperature = -8
         case "carve":
             // v4.12 carve-only audit scene: bare 8x8 plane +
@@ -304,7 +318,7 @@ final class ReproRun {
     private var refillFieldMean: Float = 0
 
     private var isSnowAuditVariant: Bool {
-        ["wallbox", "carve", "refill", "snowgate"]
+        ["wallbox", "walldeep", "carve", "refill", "snowgate"]
             .contains(ReproDriver.variant)
     }
 
@@ -461,7 +475,7 @@ final class ReproRun {
     private func handleSnowAudit() {
         let now = CACurrentMediaTime()
         switch ReproDriver.variant {
-        case "wallbox": handleWallbox(now: now)
+        case "wallbox", "walldeep": handleWallbox(now: now)
         case "carve": handleCarve(now: now)
         case "refill": handleRefill(now: now)
         case "snowgate": handleSnowgate(now: now)
@@ -469,15 +483,32 @@ final class ReproRun {
         }
     }
 
-    /// wallbox: spawn the 1 m box into 0.77 m snow through the
-    /// REAL Add path, stop the weather, let the carve form,
-    /// force one more rebuild, then measure the RENDERED sheet
-    /// against the wall.
+    /// wallbox / walldeep: spawn the 1 m box into snow
+    /// through the REAL Add path, stop the weather, let the
+    /// carve form, force one more rebuild, then measure the
+    /// RENDERED sheet against the wall. wallbox uses Sean's
+    /// device settings (0.77 m of 1.80 m max) and LOCAL
+    /// per-vertex invariants — at those settings the authored
+    /// field is drift lace (≤ ~0.21 m, patchy), so a scalar
+    /// "field depth" does not exist; walldeep uses the deep
+    /// scene (1.80 m), picks the deepest drift crest from the
+    /// snapshot, aims the camera target at it (addPrimitive
+    /// lands on the target) and runs the scalar contact
+    /// checks with real depth to bite on.
     private func handleWallbox(now: CFTimeInterval) {
         guard let session else { return }
         switch snowPhase {
         case .establishing:
             guard snowEstablished else { return }
+            if ReproDriver.variant == "walldeep", let renderer {
+                if let crest = pickDriftCrest(renderer) {
+                    session.project.scene.camera.target =
+                        [Double(crest.0), 1, Double(crest.1)]
+                    ReproDriver.marker("walldeep-crest x=\(crest.0) z=\(crest.1) minField=\(crest.2)")
+                } else {
+                    ReproDriver.marker("walldeep-crest NONE")
+                }
+            }
             session.addPrimitive("box")
             if let box = session.project.scene.objects.first(where: { $0.primitiveKind == "box" }) {
                 let p = box.transform.position
@@ -503,6 +534,65 @@ final class ReproRun {
         case .measuring:
             break
         }
+    }
+
+    /// Bilinear sample of a lattice array from a sim
+    /// snapshot at world (x, z), clamped to the grid.
+    private func snapBilinear(_ a: [Float], _ vx: Int, _ vz: Int,
+                              _ ox: Float, _ oz: Float, _ cs: Float,
+                              _ x: Float, _ z: Float) -> Float {
+        guard vx > 1, vz > 1, cs > 0, a.count >= vx * vz else { return 0 }
+        let fx = min(max((x - ox) / cs, 0), Float(vx - 1))
+        let fz = min(max((z - oz) / cs, 0), Float(vz - 1))
+        let i0 = min(Int(fx), vx - 2), j0 = min(Int(fz), vz - 2)
+        let tx = fx - Float(i0), tz = fz - Float(j0)
+        let v00 = a[j0 * vx + i0], v10 = a[j0 * vx + i0 + 1]
+        let v01 = a[(j0 + 1) * vx + i0], v11 = a[(j0 + 1) * vx + i0 + 1]
+        return (v00 + (v10 - v00) * tx) * (1 - tz)
+            + (v01 + (v11 - v01) * tx) * tz
+    }
+
+    /// walldeep: the footprint centre (restricted to
+    /// |c| <= 1.4 m so the measurement ring stays on the
+    /// plane) whose PERIMETER carries the deepest minimum
+    /// authored field — the drift crest the box should land
+    /// on. Nil when the snapshot has no usable ground.
+    private func pickDriftCrest(_ renderer: Renderer) -> (Float, Float, Float)? {
+        let s = renderer.reproSimSnapshot()
+        let n = s.vx * s.vz
+        guard s.initialised, n > 0, s.field.count >= n,
+              s.groundHas.count >= n else { return nil }
+        var best: (Float, Float, Float, Float)?   // cx, cz, min, mean
+        var ci = -7
+        while ci <= 7 {
+            var cj = -7
+            while cj <= 7 {
+                let cx = Float(ci) * 0.2, cz = Float(cj) * 0.2
+                var mn = Float.greatestFiniteMagnitude
+                var sum: Float = 0
+                var cnt = 0
+                var t: Float = -0.5
+                while t <= 0.501 {
+                    let pts: [(Float, Float)] = [(cx + t, cz - 0.5), (cx + t, cz + 0.5),
+                                                 (cx - 0.5, cz + t), (cx + 0.5, cz + t)]
+                    for p in pts {
+                        let v = snapBilinear(s.field, s.vx, s.vz, s.ox, s.oz, s.cs, p.0, p.1)
+                        if v < mn { mn = v }
+                        sum += v
+                        cnt += 1
+                    }
+                    t += 0.1
+                }
+                let mean = cnt > 0 ? sum / Float(cnt) : 0
+                if best == nil || mn > best!.2 || (mn == best!.2 && mean > best!.3) {
+                    best = (cx, cz, mn, mean)
+                }
+                cj += 1
+            }
+            ci += 1
+        }
+        guard let b = best else { return nil }
+        return (b.0, b.1, b.2)
     }
 
     private func emitWallboxChecks() {
@@ -546,35 +636,70 @@ final class ReproRun {
         }
         ringTops.sort()
         let fieldLocal = ringTops.isEmpty ? 0 : ringTops[ringTops.count / 2]
-        // Rendered sheet geometry (the stash): the contact
-        // line = emitted vertices within 1 mm of the
-        // footprint perimeter; the wall band = everything
-        // within 0.25 m of the face.
-        var contactMin = Float.greatestFiniteMagnitude
-        var contactMax = -Float.greatestFiniteMagnitude
-        var contactCount = 0
-        var wallBandMax = -Float.greatestFiniteMagnitude
-        for v in tris {
-            if rectDist(v.x, v.z) <= 0.25, v.y > wallBandMax {
-                wallBandMax = v.y
+        let deep = ReproDriver.variant == "walldeep"
+        if deep {
+            // Scalar checks against the measured local field:
+            // the contact line = emitted vertices within 1 mm
+            // of the footprint perimeter; the wall band =
+            // everything within 0.25 m of the face.
+            var contact: [Float] = []
+            var wallBandMax = -Float.greatestFiniteMagnitude
+            for v in tris {
+                if rectDist(v.x, v.z) <= 0.25, v.y > wallBandMax {
+                    wallBandMax = v.y
+                }
+                let perim = max(abs(v.x - cx), abs(v.z - cz))
+                if abs(perim - 0.5) <= 0.001 {
+                    contact.append(v.y)
+                }
             }
-            let perim = max(abs(v.x - cx), abs(v.z - cz))
-            if abs(perim - 0.5) <= 0.001 {
-                contactCount += 1
-                if v.y < contactMin { contactMin = v.y }
-                if v.y > contactMax { contactMax = v.y }
+            var medDev: Float = 1
+            if !contact.isEmpty {
+                let devs = contact.map { abs($0 - fieldLocal) }.sorted()
+                medDev = devs[devs.count / 2]
             }
+            check("contact", contact.count >= 6 && medDev <= 0.06,
+                  String(format: "count=%d medDev=%.4f fieldLocal=%.4f",
+                         contact.count, medDev, fieldLocal))
+            check("wallband", wallBandMax <= fieldLocal + 0.12,
+                  String(format: "wallBandMax=%.4f fieldLocal=%.4f",
+                         wallBandMax, fieldLocal))
+        } else {
+            // LOCAL per-vertex invariants (Sean's settings:
+            // the field is drift lace, so every sheet vertex
+            // is judged against the field AT ITS OWN XZ).
+            var devs: [Float] = []
+            var bandViol = 0
+            var bandMaxExcess: Float = 0
+            for v in tris {
+                let gY = snapBilinear(s.groundY, s.vx, s.vz, s.ox, s.oz, s.cs, v.x, v.z)
+                if rectDist(v.x, v.z) <= 0.25 {
+                    let f = snapBilinear(s.field, s.vx, s.vz, s.ox, s.oz, s.cs, v.x, v.z)
+                    let excess = v.y - (gY + f + 0.115)
+                    if excess > bandMaxExcess { bandMaxExcess = excess }
+                    if excess > 0.01 { bandViol += 1 }
+                }
+                let perim = max(abs(v.x - cx), abs(v.z - cz))
+                if abs(perim - 0.5) <= 0.004 {
+                    // The clip pins wall-crossing vertices at
+                    // the FIELD surface (ground + authored
+                    // field): deviation from it is the moat /
+                    // float / ramp signature.
+                    let f = snapBilinear(s.field, s.vx, s.vz, s.ox, s.oz, s.cs, v.x, v.z)
+                    devs.append(abs(v.y - (gY + f)))
+                }
+            }
+            devs.sort()
+            let medDev = devs.isEmpty ? 1 : devs[devs.count / 2]
+            let within = devs.filter { $0 <= 0.06 }.count
+            check("contact", devs.count >= 4
+                  && Float(within) >= 0.9 * Float(devs.count)
+                  && (devs.last ?? 1) <= 0.10,
+                  String(format: "count=%d medDev=%.4f maxDev=%.4f",
+                         devs.count, medDev, devs.last ?? 0))
+            check("wallband", bandViol == 0,
+                  String(format: "viol=%d maxExcess=%.4f", bandViol, bandMaxExcess))
         }
-        let cMin = contactCount > 0 ? contactMin : 0
-        let cMax = contactCount > 0 ? contactMax : 0
-        check("contact", contactCount > 0
-              && abs(cMin - fieldLocal) <= 0.06
-              && abs(cMax - fieldLocal) <= 0.06,
-              String(format: "count=%d contact=[%.4f,%.4f] fieldLocal=%.4f",
-                     contactCount, cMin, cMax, fieldLocal))
-        check("wallband", wallBandMax <= fieldLocal + 0.12,
-              String(format: "wallBandMax=%.4f fieldLocal=%.4f",
-                     wallBandMax, fieldLocal))
         check("underbox", underMax <= 0.05,
               String(format: "underMax=%.4f", underMax))
     }
@@ -966,7 +1091,7 @@ final class ReproRun {
         // 420 s.
         let watchdogLimit: CFTimeInterval
         switch ReproDriver.variant {
-        case "wallbox": watchdogLimit = 150
+        case "wallbox", "walldeep": watchdogLimit = 150
         case "carve": watchdogLimit = 240
         case "refill": watchdogLimit = 300
         case "snowgate": watchdogLimit = 90
