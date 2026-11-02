@@ -954,6 +954,87 @@ glint and caked-snow coating. This entry stays in the record
 because the rebuild was real work, honestly audited — and because
 the device outranks the audit, every time.
 
+---
+
+## Version 4.12 — snow, the way games do it (2026-11-02)
+
+The snow model is replaced wholesale. v4.11's physics-first
+granular simulation (per-column mass, density and repose flow)
+passed its host audits but failed on the device in the way
+that matters: a 1 m box placed in 0.77 m of snow wore a big
+smooth ramp of snow climbing its vertical face. The user's
+direction was "do what games typically do", then named the
+reference: **Red Dead Redemption 2**. Research into production
+snow (Arkham Origins, Rise of the Tomb Raider, God of War,
+RDR2) found the industry stack, and v4.12 is that stack:
+
+- **Authored drift field, no flow.** Ground snow is a depth
+  field on the existing 0.20 m lattice over ground supports,
+  evolving toward the drift-pattern ceiling exactly as the
+  field always has (growth, compaction, melt unchanged).
+  Nothing moves sideways; there is no repose angle and no
+  banking — the two mechanisms that built v4.11's wall ramp
+  (a support-switch transfer with no under-object reservoir,
+  and a sheet that interpolated the support step into a
+  slope) are deleted by construction.
+- **Carve-only deformation.** Objects and the player only
+  ever REMOVE rendered snow: occupancy compresses the sheet
+  toward the ground, dragging carves a trough, and the player
+  wades a body-depth trough through deep snow in Play. The
+  only permitted raise is a small visual lip along a
+  depression's edge, capped at 0.10 m, confined to vertices
+  that keep at least half their own snow, and never above the
+  authored depth plus that cap; nothing piles ahead of or
+  beside a moving object. A placed object sits IN the snow —
+  contact line at the local field depth, no bank, no moat —
+  and removing it leaves a compressed patch. Depressions
+  refill gradually (faster while snow falls;
+  temperature-flavoured), and are session state: projects
+  save exactly as before, and a reopened project starts from
+  the pristine field, objects re-seating within seconds.
+- **Snow on objects is a coating, not geometry.** A material
+  layer gated by up-facing-ness x exposure with a
+  noise-broken snowline: flat tops cake over patchily, steep
+  roofs take little, vertical faces take **exactly zero** —
+  by construction in the shared accumulation function, and
+  proven on the GPU by a dedicated audit kernel. Lattice snow
+  no longer rides on object tops; the coating is its
+  replacement.
+- **RDR2 touches.** The sheet keeps detailed two-scale
+  normals so troughs and tracks read at glancing angles; the
+  snow material (sheet and coating) gains the glint/sparkle
+  stage — sparse view-dependent sparkles in the light; the
+  coating reads as caked snow, broken up by noise rather than
+  painted on uniformly. (RDR2's hardware tessellation stage
+  and its clothing-snow system are not ported; the sheet is
+  displaced on the same 0.20 m lattice as before.)
+- **Audits**, aimed at exactly the holes v4.11's suite had.
+  In-simulator verdicts (repro run 41451080339): wall contact
+  at the user's own settings (0.77 m of 1.80 m) — 17 contact
+  vertices, median deviation from the local field surface
+  0.0015 m, worst 0.0614 m; wall band violations 0; snow
+  under the box 0.0000 m. The deep-field variant (1.80 m,
+  box placed on the deepest drift crest, perimeter field
+  1.6119 m) — 119 contact vertices, median deviation
+  0.0015 m, worst 0.0954 m; violations 0; under-box 0.0000 m.
+  Drag-carve: invariant violations 0 across a 5.8 m drag in
+  1.80 m snow; trough mean 0.0409 m against a 1.3560 m field;
+  after a 20 s rest the trough persists at 0.1308 m; under-box
+  0.0000 m. Refill: an abandoned patch recovers 0.0000 ->
+  0.4028 m in 90 s (field 1.2683 m, no overshoot). Shader
+  gate on the GPU: vertical face exactly 0.000000, flat top
+  1.000000, 45-degree roof 0.636056. Host mirrors: the new
+  snow kernels 15/15, the untouched water audit still 33/33.
+  Crash matrix: every audit variant and lifecycle run
+  completed without a crash report (one freeze variant's
+  arming observation timed out on the runner three rounds
+  running — the app alive and ticking each time, the freeze
+  machinery itself passing in its sibling variant); the
+  iPhone gate check passed on both idioms. Snow tick cost in
+  the harness measured 0.012-0.026 ms of CPU encode time per
+  tick (encode time only, not GPU or device frame time —
+  the device remains the judge of smoothness, as always).
+
 *Every version above was verified by automated build and inspection before
 delivery; the final judge of each was the device it runs on, and several
 versions (3.1, 3.2, 3.3, 3.4) exist because device reports sent the work

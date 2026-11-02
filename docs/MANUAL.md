@@ -145,14 +145,17 @@ in meaningful ways.
   Puddles are thin **sheets of geometry** floating millimetres above the
   floor with a sloped rim — look at one from a low angle and it has an
   edge and parallax. Ripples shimmer across puddles while it rains.
-- **Snow drifts** — snow is **its own surface**: a fine lattice sheet
-  (about 20 cm across) draped over every up-facing support — floors,
-  rooftops, box tops — at the height of the drift field, so drifts pile
-  smoothly **regardless of how the shape underneath is built**: a plain
-  two-triangle plane gets the same rounded piles as a detailed mesh.
-  The raised sheet occludes, reflects, and casts shadows like any
-  solid, and it is **always snow** — opaque white snow material, even
-  where it lies on glass, emissive, or textured objects. The drift
+- **Snow drifts** — ground snow is **its own surface**: a fine lattice
+  sheet (about 20 cm across) lying on the ground and terrain, at the
+  height of the drift field, so drifts build smoothly **regardless of
+  how the ground underneath is built**: a plain two-triangle plane
+  gets the same rounded piles as a detailed mesh. The raised sheet
+  occludes, reflects, and casts shadows like any solid, and it is
+  **always snow** — opaque white snow material with fine surface
+  detail and a sparkle that glints as you move. Snow on **objects**
+  is not geometry: rooftops, box tops and other up-facing surfaces
+  get a caked-on snow **coating** (see "Snow ages per object" below);
+  vertical sides stay completely bare. The drift
   pattern is **different in every project**: each project stores a
   random pattern seed, and the field mixes broad wind-stretched
   swells, medium lumps, and fine detail, so cover builds patchily —
@@ -170,36 +173,37 @@ in meaningful ways.
   and melts as usual when the weather turns. The objects panel shows
   both readings: **Snow cover %** is progress toward the set depth, and
   **Snow depth** is the current accumulation in metres.
-- **Snow pushes back** — objects **crush** the snow they touch: an
-  object resting in a drift compresses the snow under its footprint,
-  and outside the footprint the snow **banks up against its sides** —
-  piled slightly higher right at the wall, easing back to the open
-  drift within about a metre — so it sits *in* the snow instead of
-  intersecting an untouched drift or standing in a cleared ring.
-  Snow also **slumps like real snow**: it never holds an interior
-  slope steeper than about 37°, so lift an object out of deep snow
-  and the hole it leaves relaxes into a smooth hollow instead of a
-  box-shaped pit with vertical walls. Objects above the snow don't
-  dent it. In Play, your character presses **footprints** and a
-  compressed path into drifts as you walk (they fade after ~25 s).
-  Imprints are computed from where objects are — nothing extra is
-  saved, so a reloaded scene has exactly the same imprints.
-- **Snow remembers being pushed (v4.6)** — dragging an object
-  through snow now **plows** it: the block shoves the snow out of
-  its way as it moves (a pile builds ahead of it and along its
-  sides), and when it passes, a **carved trail stays** — a trough at
-  the depth the block's underside reached, with **berm ridges**
-  along both edges where the pushed snow went. The snow isn't
-  deleted: what leaves the path is deposited ahead and to the
-  sides, volume for volume. The trail is real saved state (unlike
-  imprints): it is stored sparsely in the project file and is still
-  there when you reopen the project. Fresh snowfall gradually
-  fills trails back in (and melting lowers them); **Re-roll** in
-  Snow settings restores pristine snow, and so does clearing the
-  build-up. The packed floor of a trail holds its depth; the loose
-  berms slump to natural slopes like any other snow. Editor drags
-  are the full case; objects moved by node behaviours carve only
-  when a scene rebuild happens to observe their motion.
+- **Snow pushes back (v4.12)** — objects **compress** the snow they
+  touch: an object resting in a drift presses the snow under its
+  footprint down to the ground, and the sheet meets its sides
+  **exactly at the surrounding snow depth** — no bank piled against
+  the wall, no cleared moat — so it sits *in* the snow instead of
+  intersecting an untouched drift. Snow never piles up anywhere:
+  nothing ever rises above the undisturbed drift depth, except a
+  small lip (never more than about 10 cm) along the edge of a
+  depression. Lift an object out and it leaves a compressed patch
+  shaped like its footprint, which slowly fills back in. Objects
+  above the snow don't dent it. In Play, your character **wades**:
+  deep snow carves a body-depth trough around you as you push
+  through, with footprints pressed along your path; the trough
+  closes up slowly behind you. Carved deformation is worked out
+  from where objects are — it is session state and is **not saved**
+  in the project: reopen a project and the drift field is pristine
+  again, with objects re-seating themselves within seconds.
+- **Snow remembers being pushed (v4.12)** — dragging an object
+  through snow **carves** it: a trough stays at the depth the
+  block's underside reached, with a small raised lip along both
+  edges (never more than about 10 cm, and never above the
+  undisturbed depth plus that lip). The snow is **not** shoved
+  ahead of the block and does not pile up beside it — carving is
+  the only thing movement ever does to snow. The trough is
+  session state (it is not stored in the project file). It
+  gradually **refills** — noticeably while snow is falling, more
+  slowly when calm — and melting lowers it away as before;
+  **Re-roll** in Snow settings restores pristine snow, and so
+  does clearing the build-up. Editor drags are the full case;
+  objects moved by node behaviours carve only when a scene
+  rebuild happens to observe their motion.
 - **Temperature (v4.7)** (Weather → Snow settings… → **Temperature**) —
   temperature is **unset by default**, and unset means exactly the
   behaviour above: nothing changes until you set it. Tap **Set
@@ -218,44 +222,42 @@ in meaningful ways.
     blue-white ice and stop rippling; warming thaws them back
     to water (about 90 seconds at +10 °C). The objects panel
     shows the live state ("−4.5 °C — puddles freezing").
-- **Trails heal while it snows (v4.7)** — plowed trails used to
-  stop healing once the snow reached Max Snow Depth, because
-  healing was driven by how much the depth changed. Now the app
-  also keeps a running total of **how much snow has fallen**:
-  while snow is falling, trails fill in over about **0.25 m of
-  snowfall** — at full depth (2 m) and full intensity that is
-  roughly **12 seconds** of snowfall — even when the depth itself
-  can't rise any further. With no snowfall, a trail at full depth
-  stays exactly as you left it. Melt still lowers trails away
-  as before.
+- **Troughs heal over time (v4.12)** — carved troughs and tracks
+  refill gradually: while snow is falling a deep trough softens
+  back toward the drift depth over a few minutes; in calm weather
+  the same healing runs several times slower, and cold, dry snow
+  (well below freezing) blows back a little faster than snow near
+  melting point. Melt still lowers trails away as before.
 - **Snow ages per object** — cover on an object depends on how long
   *that object* has been out in the storm. An object spawned (or
   placed) while the scene is already deep in snow starts **clean**
-  and gathers its snow over time at the scene's build-up rate until
-  it matches its surroundings; objects that were there all along
-  keep the cover they have. The account is the object's own:
+  and gathers its coating over time at the scene's build-up rate
+  until it matches its surroundings; objects that were there all
+  along keep the cover they have. The coating **cakes** onto
+  up-facing surfaces and ledges in a patchy, broken layer — flat
+  tops whiten most, steep roofs only a little, and vertical sides
+  **never** hold snow at all. The account is the object's own:
   **height doesn't matter** — a clean block raised 5 m in the air
-  still stacks the full set depth on its top, just as slowly as
-  everything else, and a snowy block you lift carries its pile
-  with it.
+  coats just as slowly as everything else, and a coated block you
+  lift carries its coating with it.
 - The shaped weather field behind all this is computed into a texture
   when a project loads (and when you re-roll its pattern); levels are
   thresholds applied at render time, which is why build-up animation
   stays cheap.
 
-- **Snow and water are simulated now (v4.8)** — snow depth and
-  puddle water are no longer painted on or grown as a fixed
-  shape: they are a live **simulation** running on the GPU.
-  Snow falls toward a per-spot limit set by the drift pattern,
-  then **flows**: piles slump to natural slopes (about 37°) and
-  relax into soft, rounded mounds — no spiky, faceted masses.
-  Water **levels itself**: pools collect in dips with
+- **Snow and water (v4.8, snow model replaced in v4.12)** — puddle
+  water is a live **simulation** running on the GPU. Water
+  **levels itself**: pools collect in dips with
   near-flat surfaces, rounded blobby edges, and no climbing up
   the sides of blocks or standing in ledges at edges — at a
   support edge, water drains away. Frozen puddles stop flowing
-  entirely. Dragging, footprints, banking, trails and per-object
-  build-up all work as before — they now push the simulated
-  snow around instead of reshaping a fixed surface. Falling
+  entirely. Snow, since v4.12, follows the model the big games
+  use (Red Dead Redemption 2 is the reference): an authored
+  drift field that builds toward the set depth and never flows
+  sideways, **carve-only** deformation from objects and the
+  player, a fine-detailed sheet with a glinting sparkle, and
+  the caked coating on objects described above — no slumping,
+  no banking, no piles. Falling
   rain and snow were also redrawn: rain is thin soft streaks
   and snowflakes are soft round discs — neither can ever show
   as a square card.
