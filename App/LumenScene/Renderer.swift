@@ -3876,7 +3876,7 @@ final class Renderer {
     /// wait — safe between frame pumps, never on the render
     /// path. Returns nil if the pipeline/queue is unavailable.
     func reproSnowGateAudit() -> (vertical: Float, flat: Float, roof: Float)? {
-        guard let pipe = snowGatePipeline, let queue else { return nil }
+        guard let pipe = snowGatePipeline else { return nil }
         waitForSimTick()
         guard let out = device.makeBuffer(length: 3 * 4, options: .storageModeShared),
               let cmd = queue.makeCommandBuffer(),
