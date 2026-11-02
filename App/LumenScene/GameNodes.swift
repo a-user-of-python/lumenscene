@@ -566,6 +566,16 @@ enum NodeCatalog {
             ]),
 
         NodeKindSpec(
+            kind: "actGravity", title: "Applied Gravity", category: "Actions",
+            blurb: "Pulls an object with real gravity during Play: it falls, lands on whatever is beneath it, and rests there. Negative gravity falls up.",
+            hasIn: true, outs: ["out", "landed"],
+            params: [
+                NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
+                NodeParamSpec(key: "strength", label: "Gravity (m/s²)", type: .number, def: .number(9.8), min: -50, max: 50),
+                NodeParamSpec(key: "bounce", label: "Bounce", type: .number, def: .number(0), min: 0, max: 0.9),
+            ]),
+
+        NodeKindSpec(
             kind: "actSetGravity", title: "Set Gravity", category: "Actions",
             blurb: "Scales gravity for every particle in the scene (1 is normal, 0 is weightless).",
             hasIn: true, outs: ["out"],

@@ -263,6 +263,74 @@ enum ReproDriver {
             // the gate is evaluated on the GPU directly
             // (Renderer.reproSnowGateAudit) once the run is up.
             break
+        case "gravfall":
+            // v4.13 Applied Gravity audit (a)+(c)+(e): a bare
+            // 8x8 plane; a 1 m box 3 m above it wired to an
+            // Applied Gravity node at 9.8; a second box at the
+            // same height wired at strength 0 (must hang); a
+            // third box unwired (control — must never move).
+            // The phase machine turns the weather off, runs the
+            // save/load audit, then enters Play and samples.
+            var plane = SceneObject.primitive("plane", name: "Repro bare plane")
+            plane.params = ["w": 8, "d": 8]
+            plane.transform.position = [0, 0, 0]
+            var fall = SceneObject.primitive("box", name: "Repro fall box")
+            fall.transform.position = [0, 3.5, 0]
+            var floatBox = SceneObject.primitive("box", name: "Repro float box")
+            floatBox.transform.position = [-2.5, 3.5, 0]
+            var control = SceneObject.primitive("box", name: "Repro control box")
+            control.transform.position = [2.5, 3.5, 0]
+            p.scene.objects = [plane, fall, floatBox, control]
+            let start = LogicNode(kind: "evStart")
+            var gFall = LogicNode(kind: "actGravity", x: 220, y: 0)
+            gFall.params = ["object": .ref(fall.id),
+                            "strength": .number(9.8), "bounce": .number(0)]
+            var gFloat = LogicNode(kind: "actGravity", x: 220, y: 140)
+            gFloat.params = ["object": .ref(floatBox.id),
+                             "strength": .number(0), "bounce": .number(0)]
+            p.scene.graph.nodes = [start, gFall, gFloat]
+            p.scene.graph.links = [
+                NodeLink(id: UUID(), from: start.id, fromPin: "out", to: gFall.id, toPin: "in"),
+                NodeLink(id: UUID(), from: start.id, fromPin: "out", to: gFloat.id, toPin: "in"),
+            ]
+        case "gravstack":
+            // v4.13 Applied Gravity audit (b)+(d) + support
+            // removal: a faller lands on a lower box's top; the
+            // graph itself hides the lower box after 2.5 s
+            // (Delay → Hide Object) and the faller must fall
+            // again to the plane. A riser under negative gravity
+            // (−9.8) rises and rests against the underside of a
+            // ceiling box (its bottom at 2.5).
+            var plane = SceneObject.primitive("plane", name: "Repro bare plane")
+            plane.params = ["w": 8, "d": 8]
+            plane.transform.position = [0, 0, 0]
+            var lower = SceneObject.primitive("box", name: "Repro lower box")
+            lower.transform.position = [0, 0.5, 0]
+            var faller = SceneObject.primitive("box", name: "Repro stack faller")
+            faller.transform.position = [0, 3.5, 0]
+            var ceilingBox = SceneObject.primitive("box", name: "Repro ceiling box")
+            ceilingBox.transform.position = [3, 3.0, 0]
+            var riser = SceneObject.primitive("box", name: "Repro riser box")
+            riser.transform.position = [3, 0.5, 0]
+            p.scene.objects = [plane, lower, faller, ceilingBox, riser]
+            let start = LogicNode(kind: "evStart")
+            var gFall = LogicNode(kind: "actGravity", x: 220, y: 0)
+            gFall.params = ["object": .ref(faller.id),
+                            "strength": .number(9.8), "bounce": .number(0)]
+            var delay = LogicNode(kind: "logDelay", x: 220, y: 140)
+            delay.params = ["seconds": .number(2.5)]
+            var hide = LogicNode(kind: "actHide", x: 440, y: 140)
+            hide.params = ["object": .ref(lower.id)]
+            var gRise = LogicNode(kind: "actGravity", x: 220, y: 280)
+            gRise.params = ["object": .ref(riser.id),
+                            "strength": .number(-9.8), "bounce": .number(0)]
+            p.scene.graph.nodes = [start, gFall, delay, hide, gRise]
+            p.scene.graph.links = [
+                NodeLink(id: UUID(), from: start.id, fromPin: "out", to: gFall.id, toPin: "in"),
+                NodeLink(id: UUID(), from: start.id, fromPin: "out", to: delay.id, toPin: "in"),
+                NodeLink(id: UUID(), from: delay.id, fromPin: "out", to: hide.id, toPin: "in"),
+                NodeLink(id: UUID(), from: start.id, fromPin: "out", to: gRise.id, toPin: "in"),
+            ]
         default:
             break
         }
@@ -320,6 +388,212 @@ final class ReproRun {
     private var isSnowAuditVariant: Bool {
         ["wallbox", "walldeep", "carve", "refill", "snowgate"]
             .contains(ReproDriver.variant)
+    }
+
+    // Gravity-audit state (v4.13 variants gravfall / gravstack).
+    // Phase 0: weather off through the real funnel (start()
+    // forced snow on), save/load audit on the pristine project,
+    // a beat for the mode-0 rebuild, then Play via toggleMode.
+    // Phase 1: sample the tracked boxes' centre heights once
+    // per pump until the variant's time limit, then verdicts.
+    private var isGravityVariant: Bool {
+        ["gravfall", "gravstack"].contains(ReproDriver.variant)
+    }
+    private var gravPhase = 0
+    private var gravPrepared = false
+    private var gravPhaseSince: CFTimeInterval = 0
+    private var gravPlayStart: CFTimeInterval = 0
+    private var gravFallSamples: [(t: Double, y: Double)] = []
+    private var gravAuxSamples: [(t: Double, y: Double)] = []
+    private var gravCtlSamples: [(t: Double, y: Double)] = []
+
+    private func gravY(_ name: String) -> Double? {
+        session?.project.scene.objects
+            .first { $0.name == name }?.transform.position[1]
+    }
+
+    private func handleGravityAudit() {
+        guard let session else { return }
+        let now = CACurrentMediaTime()
+        switch gravPhase {
+        case 0:
+            if !gravPrepared {
+                gravPrepared = true
+                session.setWeatherMode(0)
+                runGravitySaveLoadChecks()
+                gravPhaseSince = now
+                return
+            }
+            if now - gravPhaseSince >= 0.6 {
+                session.toggleMode()
+                gravPlayStart = CACurrentMediaTime()
+                gravPhase = 1
+                ReproDriver.marker("gravity-play-entered mode=\(session.mode)")
+            }
+        case 1:
+            let t = now - gravPlayStart
+            let primary = ReproDriver.variant == "gravfall"
+                ? "Repro fall box" : "Repro stack faller"
+            let aux = ReproDriver.variant == "gravfall"
+                ? "Repro float box" : "Repro riser box"
+            if let y = gravY(primary) { gravFallSamples.append((t, y)) }
+            if let y = gravY(aux) { gravAuxSamples.append((t, y)) }
+            if ReproDriver.variant == "gravfall",
+               let y = gravY("Repro control box") {
+                gravCtlSamples.append((t, y))
+            }
+            let limit = ReproDriver.variant == "gravfall" ? 5.0 : 6.5
+            if t >= limit {
+                gravPhase = 2
+                if ReproDriver.variant == "gravfall" {
+                    emitGravfallChecks()
+                } else {
+                    emitGravstackChecks()
+                }
+                printTickMetric()
+                finishSnow()
+            }
+        default:
+            break
+        }
+    }
+
+    /// Save/load audit (both gravity variants, run pre-Play on
+    /// the pristine project): the project must round-trip
+    /// through the REAL ProjectStore with its Applied Gravity
+    /// nodes intact (kind, strength, object refs), and the same
+    /// project with the gravity nodes stripped — a v4.12-era
+    /// file — must still load (the new kind is additive).
+    private func runGravitySaveLoadChecks() {
+        guard let session else { return }
+        let project = session.project
+        let expected: [Double] = ReproDriver.variant == "gravfall"
+            ? [9.8, 0] : [9.8, -9.8]
+        ProjectStore.saveProject(project, thumbnailPNG: nil)
+        let loaded = ProjectStore.loadProject(id: project.id)
+        let grav = loaded?.scene.graph.nodes.filter { $0.kind == "actGravity" } ?? []
+        let strengths = grav.map { $0.num("strength", -999) }.sorted()
+        let refsOK = grav.allSatisfy { node in
+            guard let ref = node.ref("object") else { return false }
+            return loaded?.scene.object(id: ref) != nil
+        }
+        check("saveload",
+              loaded != nil && grav.count == expected.count
+                  && strengths == expected.sorted() && refsOK,
+              "nodes=\(grav.count) strengths=\(strengths) refsOK=\(refsOK)")
+        var legacy = project
+        legacy.id = UUID()
+        let gravIDs = Set(project.scene.graph.nodes
+            .filter { $0.kind == "actGravity" }.map { $0.id })
+        legacy.scene.graph.nodes.removeAll { $0.kind == "actGravity" }
+        legacy.scene.graph.links.removeAll {
+            gravIDs.contains($0.from) || gravIDs.contains($0.to)
+        }
+        ProjectStore.saveProject(legacy, thumbnailPNG: nil)
+        let legacyLoaded = ProjectStore.loadProject(id: legacy.id)
+        let legacyGrav = legacyLoaded?.scene.graph.nodes
+            .filter { $0.kind == "actGravity" }.count ?? -1
+        check("legacyload",
+              legacyLoaded != nil && legacyGrav == 0,
+              "loaded=\(legacyLoaded != nil) gravNodes=\(legacyGrav)")
+    }
+
+    /// gravfall verdicts: (a) the fall is accelerating (the
+    /// half-time fallen fraction sits in the quadratic band,
+    /// not the linear 0.5), lands in the analytic time window
+    /// with its base on the plane, and stays; (c) the strength-0
+    /// box hangs; (e) the unwired control never moves.
+    private func emitGravfallChecks() {
+        let s = gravFallSamples
+        guard s.count >= 10 else {
+            check("samples", false, "only \(s.count) samples")
+            return
+        }
+        // Landing = first sample at rest height (centre 0.5).
+        let landIdx = s.firstIndex { $0.y <= 0.515 }
+        check("landed", landIdx != nil,
+              "samples=\(s.count) finalY=\(s.last?.y ?? -1)")
+        guard let li = landIdx else { return }
+        let landT = s[li].t
+        // Analytic fall time for 3 m at 9.8 m/s² is 0.782 s;
+        // the band absorbs pump granularity and Euler error.
+        check("falltime", landT >= 0.55 && landT <= 1.10,
+              String(format: "landT=%.3f analytic=0.782", landT))
+        // Curve: fallen fraction at half the fall duration.
+        // Quadratic ≈ 0.25; a linear fall would read 0.50.
+        let halfT = landT / 2
+        let halfSample = s.first { $0.t >= halfT } ?? s[li]
+        let frac = (3.5 - halfSample.y) / 3.0
+        check("curve", frac >= 0.13 && frac <= 0.42,
+              String(format: "halfTimeFrac=%.3f quadratic=0.25 linear=0.50", frac))
+        // Monotone descent until landing (no upward steps).
+        var monotone = true
+        if li > 0 {
+            for i in 1...li where s[i].y > s[i - 1].y + 0.002 { monotone = false }
+        }
+        check("monotone", monotone, "checked \(li) fall samples")
+        // Rest: exact height, and the final second is still.
+        let rest = s.filter { $0.t >= landT + 0.3 }
+        let restOK = !rest.isEmpty
+            && rest.allSatisfy { abs($0.y - 0.5) <= 0.01 }
+        let tail = s.filter { $0.t >= (s.last?.t ?? 0) - 1.0 }
+        let tailSpan = (tail.map { $0.y }.max() ?? 0) - (tail.map { $0.y }.min() ?? 0)
+        check("rest", restOK && tailSpan <= 0.002,
+              String(format: "restY=%.4f tailSpan=%.4f", s.last?.y ?? -1, tailSpan))
+        // (c) strength 0 hangs motionless at its placed height.
+        let floatOK = !gravAuxSamples.isEmpty
+            && gravAuxSamples.allSatisfy { abs($0.y - 3.5) <= 0.001 }
+        check("float", floatOK,
+              "samples=\(gravAuxSamples.count) finalY=\(gravAuxSamples.last?.y ?? -1)")
+        // (e) the unwired control object never moves.
+        let ctlOK = !gravCtlSamples.isEmpty
+            && gravCtlSamples.allSatisfy { abs($0.y - 3.5) <= 0.001 }
+        check("control", ctlOK,
+              "samples=\(gravCtlSamples.count) finalY=\(gravCtlSamples.last?.y ?? -1)")
+    }
+
+    /// gravstack verdicts: (b) the faller rests on the lower
+    /// box's top (centre 1.5) before the graph hides that box
+    /// at 2.5 s, then falls again and rests on the plane
+    /// (centre 0.5); (d) the riser under −9.8 rises and rests
+    /// against the ceiling box's underside (centre 2.0).
+    private func emitGravstackChecks() {
+        guard let session else { return }
+        let s = gravFallSamples
+        // Sustained rest on the box top before the hide fires.
+        var runLength = 0
+        var onBox = false
+        for sample in s where sample.t < 2.4 {
+            if abs(sample.y - 1.5) <= 0.02 {
+                runLength += 1
+                if runLength >= 3 { onBox = true }
+            } else {
+                runLength = 0
+            }
+        }
+        check("landonbox", onBox, "samples=\(s.count)")
+        // After the support is hidden it falls again to the
+        // plane and stays there.
+        let late = s.filter { $0.t >= 4.5 }
+        let refellOK = !late.isEmpty
+            && late.allSatisfy { abs($0.y - 0.5) <= 0.01 }
+        check("refell", refellOK,
+              "late=\(late.count) finalY=\(s.last?.y ?? -1)")
+        if let lower = session.project.scene.objects
+            .first(where: { $0.name == "Repro lower box" }) {
+            check("supporthidden", !session.runtimeIsObjectVisible(lower.id),
+                  "lower visible at end=\(session.runtimeIsObjectVisible(lower.id))")
+        } else {
+            check("supporthidden", false, "lower box missing")
+        }
+        // The riser rose (past 1.9 by 2 s) and rests against
+        // the underside (centre 2.0) for the rest of the run.
+        let rose = gravAuxSamples.contains { $0.t <= 2.0 && $0.y >= 1.9 }
+        let riserLate = gravAuxSamples.filter { $0.t >= 2.0 }
+        let riserRestOK = !riserLate.isEmpty
+            && riserLate.allSatisfy { abs($0.y - 2.0) <= 0.01 }
+        check("riser", rose && riserRestOK,
+              "rose=\(rose) finalY=\(gravAuxSamples.last?.y ?? -1)")
     }
 
     /// LS-REPRO metrics: computed from the renderer's sim
@@ -1061,11 +1335,15 @@ final class ReproRun {
             handleSnowAudit()
             if finished { return }
         }
+        if isGravityVariant {
+            handleGravityAudit()
+            if finished { return }
+        }
 
         let simSatisfied = ReproToggles.simTick ? framesAfterSwap >= 90
                                                 : (sawTickTag && simTickFrames >= 5)
         let freezeSatisfied = !isFreezeVariant || freezeDone
-        if !isSnowAuditVariant, crossedA, firstStepCrossed, sawSwapAfterWeatherOn, simSatisfied, freezeSatisfied {
+        if !isSnowAuditVariant, !isGravityVariant, crossedA, firstStepCrossed, sawSwapAfterWeatherOn, simSatisfied, freezeSatisfied {
             finished = true
             ReproDriver.marker("settle A=\(a) pumps=\(pumpCount) simTicks=\(simTickFrames)")
             print("REPRO-DONE")
@@ -1085,6 +1363,7 @@ final class ReproRun {
         case "carve": watchdogLimit = 240
         case "refill": watchdogLimit = 300
         case "snowgate": watchdogLimit = 90
+        case "gravfall", "gravstack": watchdogLimit = 120
         default: watchdogLimit = 100
         }
         if CACurrentMediaTime() - startedAt > watchdogLimit {

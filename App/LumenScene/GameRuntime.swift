@@ -72,7 +72,7 @@ final class GameRuntime {
     // MARK: - Continuous-behaviour slots (recon §8.0)
 
     private enum MovementKind {
-        case oscillate, follow, chase, wander
+        case oscillate, follow, chase, wander, gravity
     }
 
     /// One Movement-slot occupant. Owns transform.position only.
@@ -101,6 +101,33 @@ final class GameRuntime {
         var pause: Double = 0
         var wanderTarget: SIMD3<Float>? = nil
         var idleUntil: Double = 0
+        // Gravity (v4.13, Applied Gravity): vertical-only
+        // integration. velY is the current vertical velocity
+        // (m/s, + up); strength is the node's acceleration in
+        // m/s² (+ pulls down, − falls up, 0 floats). While
+        // `resting`, the object's base sits on `restHeight`
+        // (a floor support, or — restOnCeiling — its top sits
+        // against a ceiling underside) and the support is
+        // re-verified every tick. `airTravel` arms the
+        // "landed" output: it accumulates distance travelled
+        // while airborne and resets at each rest, and "landed"
+        // fires only when a rest ends a fall/rise of more than
+        // a centimetre — never for an object that was already
+        // resting when the behaviour (re)started.
+        var strength: Double = 9.8
+        var bounce: Double = 0
+        var velY: Double = 0
+        var resting: Bool = false
+        var restOnCeiling: Bool = false
+        var airTravel: Double = 0
+        // Local mesh bounds captured at behaviour start (the
+        // footprint/base geometry); the world footprint is
+        // re-derived from these + the live transform each tick,
+        // so the Scale slot composes. Zero bounds = the object
+        // is treated as a point at its position (mesh-less
+        // fallback, e.g. an unloaded model).
+        var localBoundsMin: SIMD3<Float> = .zero
+        var localBoundsMax: SIMD3<Float> = .zero
     }
     private var movement: [UUID: MovementBehaviour] = [:]   // keyed by object id
 
@@ -1153,6 +1180,37 @@ final class GameRuntime {
             }
             enqueueFire(node.id, "out")
 
+        case "actGravity":
+            // v4.13 (Applied Gravity): install a Movement-slot
+            // gravity behaviour. Velocity starts at zero and the
+            // support test runs from the first advance tick — an
+            // object placed on a surface simply stays there.
+            if let id = node.ref("object"),
+               let obj = session.project.scene.object(id: id) {
+                var behaviour = MovementBehaviour(kind: .gravity, nodeID: node.id)
+                let s = node.num("strength", 9.8)
+                behaviour.strength = s.isFinite ? min(50, max(-50, s)) : 9.8
+                let b = node.num("bounce", 0)
+                behaviour.bounce = b.isFinite ? min(0.9, max(0, b)) : 0
+                // Footprint geometry from the object's local mesh
+                // (primitives regenerate from params; models use
+                // the loaded mesh — the same split the session's
+                // localMesh uses). No mesh = point-object fallback.
+                let mesh: MeshData?
+                if obj.source == "primitive" {
+                    mesh = MeshGen.primitive(kind: obj.primitiveKind, params: obj.params)
+                } else {
+                    mesh = session.meshes[obj.id]
+                }
+                if let mesh, !mesh.isEmpty {
+                    behaviour.localBoundsMin = mesh.bounds.min
+                    behaviour.localBoundsMax = mesh.bounds.max
+                }
+                movement[id] = behaviour
+                tweens[id] = nil   // slot rule: cancels the MoveTo tween
+            }
+            enqueueFire(node.id, "out")
+
         case "actLookAt":
             if let id = node.ref("object"),
                session.project.scene.object(id: id) != nil {
@@ -1766,7 +1824,170 @@ final class GameRuntime {
                     applyTransform(id, t)
                 }
                 movement[id] = behaviour
+
+            case .gravity:
+                // v4.13: a hidden object neither falls nor lands
+                // (the Chase rule — the slot is kept, a later
+                // Show resumes the fall where it froze).
+                if !session.runtimeIsObjectVisible(id) {
+                    movement[id] = behaviour
+                    break
+                }
+                advanceGravity(id: id, obj: obj, behaviour: &behaviour, dt: dt)
+                movement[id] = behaviour
             }
+        }
+    }
+
+    /// v4.13 (Applied Gravity): one tick of vertical physics for
+    /// one object. Semi-implicit Euler in substeps of at most
+    /// 1/120 s (the tick dt can reach the 0.1 s clamp at a hitch;
+    /// substeps keep the fall curve honest and bounce timing
+    /// smooth). Collisions use the particle integrator's swept
+    /// contract — support is queried from the height the base
+    /// started the step at — so pure vertical motion can never
+    /// tunnel through a thin support, however fast it gets.
+    /// The support under the object is the HIGHEST surface found
+    /// at the footprint's sample points (the local bounds'
+    /// bottom-face corners + centre, transformed live, so the
+    /// Scale slot composes); negative gravity mirrors everything
+    /// against ceilings (the bounds' top face, lowest underside).
+    private func advanceGravity(id: UUID, obj: SceneObject,
+                                behaviour: inout MovementBehaviour, dt: Double) {
+        guard dt > 0 else { return }
+        let g = behaviour.strength
+        let t0 = currentTransform(of: obj)
+        guard t0.position.count >= 3 else { return }
+        let m = t0.matrix
+        let lo = behaviour.localBoundsMin, hi = behaviour.localBoundsMax
+        func world(_ x: Float, _ y: Float, _ z: Float) -> SIMD3<Float> {
+            (m * SIMD4<Float>(x, y, z, 1)).xyz
+        }
+        var base = Float.greatestFiniteMagnitude
+        var top = -Float.greatestFiniteMagnitude
+        for cx in [lo.x, hi.x] {
+            for cy in [lo.y, hi.y] {
+                for cz in [lo.z, hi.z] {
+                    let w = world(cx, cy, cz)
+                    base = min(base, w.y)
+                    top = max(top, w.y)
+                }
+            }
+        }
+        guard base.isFinite, top.isFinite else { return }
+        let midX = (lo.x + hi.x) / 2, midZ = (lo.z + hi.z) / 2
+        let bottomSamples = [world(lo.x, lo.y, lo.z), world(hi.x, lo.y, lo.z),
+                             world(lo.x, lo.y, hi.z), world(hi.x, lo.y, hi.z),
+                             world(midX, lo.y, midZ)]
+        let topSamples = [world(lo.x, hi.y, lo.z), world(hi.x, hi.y, lo.z),
+                          world(lo.x, hi.y, hi.z), world(hi.x, hi.y, hi.z),
+                          world(midX, hi.y, midZ)]
+        // Highest floor support under the footprint, swept from
+        // the base height the step started at.
+        func floorSupport(fromBase: Float) -> Float? {
+            var best: Float?
+            for s in bottomSamples {
+                if let sup = support(atX: s.x, z: s.z, fromY: fromBase) {
+                    best = max(best ?? -Float.greatestFiniteMagnitude, sup.height)
+                }
+            }
+            return best
+        }
+        // Lowest ceiling underside over the footprint, swept
+        // from the top height the step started at.
+        func ceilingSupport(fromTop: Float) -> Float? {
+            var best: Float?
+            for s in topSamples {
+                if let cel = ceiling(atX: s.x, z: s.z, fromY: fromTop) {
+                    best = min(best ?? Float.greatestFiniteMagnitude, cel.height)
+                }
+            }
+            return best
+        }
+
+        // Resting: re-verify the support every tick (the F12
+        // particle pattern). Still resting = silent — no
+        // transform is written, so there is no jitter and no
+        // sinking. Support gone or moved out of the 0.02 m
+        // band: fall (or rise) again from zero velocity.
+        if behaviour.resting {
+            let stillThere: Bool
+            if behaviour.restOnCeiling {
+                stillThere = ceilingSupport(fromTop: top)
+                    .map { abs($0 - top) <= 0.02 } ?? false
+            } else {
+                stillThere = floorSupport(fromBase: base)
+                    .map { abs($0 - base) <= 0.02 } ?? false
+            }
+            if stillThere { return }
+            behaviour.resting = false
+            behaviour.velY = 0
+        }
+
+        let steps = max(1, min(16, Int(ceil(dt / (1.0 / 120.0)))))
+        let h = dt / Double(steps)
+        var curBase = base
+        var curTop = top
+        var newPosY = t0.position[1]
+        for _ in 0..<steps {
+            if behaviour.resting { break }
+            behaviour.velY -= g * h
+            let dy = behaviour.velY * h
+            behaviour.airTravel += abs(dy)
+            if behaviour.velY <= 0 {
+                let newBase = curBase + Float(dy)
+                if let s = floorSupport(fromBase: curBase), newBase <= s {
+                    // Landed on the highest support beneath.
+                    newPosY += Double(s - curBase)
+                    curTop += (s - curBase)
+                    curBase = s
+                    let impact = -behaviour.velY
+                    if behaviour.bounce > 0 && impact > 0.8 {
+                        behaviour.velY = impact * behaviour.bounce
+                    } else {
+                        behaviour.velY = 0
+                        behaviour.resting = true
+                        behaviour.restOnCeiling = false
+                        if behaviour.airTravel > 0.01 {
+                            enqueueFire(behaviour.nodeID, "landed")
+                        }
+                        behaviour.airTravel = 0
+                    }
+                } else {
+                    newPosY += dy
+                    curBase = newBase
+                    curTop += Float(dy)
+                }
+            } else {
+                let newTop = curTop + Float(dy)
+                if let c = ceilingSupport(fromTop: curTop), newTop >= c {
+                    // Came to rest against an underside.
+                    newPosY += Double(c - curTop)
+                    curBase += (c - curTop)
+                    curTop = c
+                    let impact = behaviour.velY
+                    if behaviour.bounce > 0 && impact > 0.8 {
+                        behaviour.velY = -impact * behaviour.bounce
+                    } else {
+                        behaviour.velY = 0
+                        behaviour.resting = true
+                        behaviour.restOnCeiling = true
+                        if behaviour.airTravel > 0.01 {
+                            enqueueFire(behaviour.nodeID, "landed")
+                        }
+                        behaviour.airTravel = 0
+                    }
+                } else {
+                    newPosY += dy
+                    curBase += Float(dy)
+                    curTop = newTop
+                }
+            }
+        }
+        if newPosY != t0.position[1] {
+            var t = currentTransform(of: obj)
+            t.position[1] = newPosY
+            applyTransform(id, t)
         }
     }
 
@@ -1939,6 +2160,44 @@ final class GameRuntime {
             if w0 < -1e-5 || w1 < -1e-5 || w2 < -1e-5 { return }
             let h = w0 * a.y + w1 * b.y + w2 * c.y
             if h <= fromY + 0.05 && (best == nil || h > best!.height) {
+                best = Support(height: h, normal: n)
+            }
+        }
+        let key = CellKey(x: Int(floor(x / cellSize)), z: Int(floor(z / cellSize)))
+        if let indices = collisionGrid[key] {
+            for index in indices { consider(index) }
+        }
+        for index in bigCollisionTris { consider(index) }
+        return best
+    }
+
+    /// v4.13: the mirror of `support` for negative gravity —
+    /// the LOWEST down-facing (normal.y < −0.3) triangle surface
+    /// at (x, z) that lies at or above fromY − 0.05: the underside
+    /// a rising object comes to rest against. Same candidate set
+    /// (query cell + always-scanned big list) and the same swept
+    /// contract: querying from the height the object's top
+    /// started the step at means a fast rise can never tunnel
+    /// through a thin ceiling.
+    private func ceiling(atX x: Float, z: Float, fromY: Float) -> Support? {
+        var best: Support?
+        func consider(_ index: Int) {
+            let tri = collisionTris[index]
+            let a = tri.0, b = tri.1, c = tri.2
+            let normalRaw = simd_cross(b - a, c - a)
+            let len = simd_length(normalRaw)
+            if len < 1e-9 { return }
+            let n = normalRaw / len
+            if n.y >= -0.3 { return }
+            // Barycentric test in the XZ projection.
+            let denom = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z)
+            if abs(denom) < 1e-9 { return }
+            let w0 = ((b.z - c.z) * (x - c.x) + (c.x - b.x) * (z - c.z)) / denom
+            let w1 = ((c.z - a.z) * (x - c.x) + (a.x - c.x) * (z - c.z)) / denom
+            let w2 = 1 - w0 - w1
+            if w0 < -1e-5 || w1 < -1e-5 || w2 < -1e-5 { return }
+            let h = w0 * a.y + w1 * b.y + w2 * c.y
+            if h >= fromY - 0.05 && (best == nil || h < best!.height) {
                 best = Support(height: h, normal: n)
             }
         }
