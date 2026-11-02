@@ -9,7 +9,7 @@ HTML comment — remove the comment markers once the files exist):
 | --- | --- |
 | `editor.png` | The editor: object tree, viewport, properties |
 | `play.png` | Play mode: first-person walk-around |
-| `weather-snow.png` | A scene with deep snow / weather running |
+| `weather-rain.png` | A scene with rain running |
 | `nodes.png` | The node editor with a working graph |
 | `final-render.png` | A finished Final Render (Render Image…) |
 

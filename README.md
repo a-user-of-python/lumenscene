@@ -1,19 +1,20 @@
 # LumenScene
 
 [![Build IPA](https://github.com/a-user-of-python/lumenscene/actions/workflows/build-ipa.yml/badge.svg)](https://github.com/a-user-of-python/lumenscene/actions/workflows/build-ipa.yml)
-[![Repro (snow accumulation)](https://github.com/a-user-of-python/lumenscene/actions/workflows/repro.yml/badge.svg)](https://github.com/a-user-of-python/lumenscene/actions/workflows/repro.yml)
+[![Repro](https://github.com/a-user-of-python/lumenscene/actions/workflows/repro.yml/badge.svg)](https://github.com/a-user-of-python/lumenscene/actions/workflows/repro.yml)
 
 **A ray-traced 3D scene editor for iPad** — a real Metal hardware
 path tracer you can edit in: any object can become a light, glass
-refracts, weather is a live GPU simulation, and a 55-kind node
-system turns scenes into little games.
+refracts, rain streaks over ground that gets visibly wetter, and a
+56-kind node system turns scenes into little games.
 
 LumenScene targets the iPad Air M3 (2360×1640) and renders with
 Metal's hardware ray tracing: scenes are lit by actual light, not
 tricks — emissive objects genuinely illuminate their surroundings
-in their own colour, glass bends and reflects, and snow and water
-live on the GPU: snow builds into drifts and carves where things
-move through it, and water pools and freezes over time.
+in their own colour, glass bends and reflects, and rain is
+honest about what it is: falling streaks over ground that gets
+darker, glossier and more reflective the longer it rains — and
+dries out again when it stops.
 
 ## Screenshots
 
@@ -25,7 +26,7 @@ image lines._
 <!-- Once the files exist in docs/screenshots/, remove this comment block's markers:
 ![The editor](docs/screenshots/editor.png)
 ![Play mode](docs/screenshots/play.png)
-![Deep snow](docs/screenshots/weather-snow.png)
+![Rain](docs/screenshots/weather-rain.png)
 ![The node editor](docs/screenshots/nodes.png)
 ![A final render](docs/screenshots/final-render.png)
 -->
@@ -34,7 +35,7 @@ image lines._
 | --- | --- |
 | `editor.png` | The editor: object tree, viewport, properties |
 | `play.png` | Play mode: first-person walk-around |
-| `weather-snow.png` | A scene with deep snow / weather running |
+| `weather-rain.png` | A scene with rain running |
 | `nodes.png` | The node editor with a working graph |
 | `final-render.png` | A finished Final Render |
 
@@ -76,36 +77,33 @@ image lines._
 
 ### The node system
 
-- **55 node kinds**, wired in a visual editor over named variables:
+- **56 node kinds**, wired in a visual editor over named variables:
   spawn objects and seeded patterns, behaviours (including Chase
   Player), trigger areas with area streaming, checkpoints and
-  respawn, weather control, gravity, sequences, physics and simple
-  particles (with cloth-like drape), messages and value displays.
+  respawn, weather control, gravity (including an Applied Gravity
+  node that makes wired objects fall and land), sequences, physics
+  and simple particles (with cloth-like drape), messages and value
+  displays.
 - Trigger areas are invisible zones that group objects for node
   logic — walk into one and the graph reacts.
 
-### Weather simulation
+### Weather
 
-- A **persistent GPU compute simulation**, not a growing mesh:
-  snow accumulates on a ~0.20 m lattice with per-object exposure
-  (fresh objects start clean and gather snow at the ambient rate),
-  a multi-scale drift field with a per-project seed, a settable
-  maximum depth (0.05–2.0 m), and carve-only deformation —
-  drag something through deep snow and it carves a trench;
-  nothing ever piles up (the only raise is a small capped lip
-  along a trench's edge), and troughs heal gradually, faster
-  under fresh snowfall. Snow on objects is a caked shader
-  coating on up-facing surfaces — vertical faces hold exactly
-  none.
-- **Water** pools where it can collect — round puddles confined to
-  up-facing support, never climbing vertical faces or forming
-  ledges — and a **temperature slider** (−20…+30 °C) drives the
-  phase behaviour: rain turns to snow at or below freezing,
-  puddles freeze into pale mirror ice, warm air melts the pack.
-- Procedural precipitation: soft round snowflakes and capsule rain
-  streaks — no square silhouettes at any angle. A water-reflections
-  quality picker (Full/Half/Quarter) trades reflection sharpness
-  for speed.
+- **Rain, kept simple on purpose**: falling streaks (procedural,
+  soft, never square) plus one flat **ground-wetness** value.
+  The longer it rains, the wetter the ground reads — darker,
+  glossier, more reflective, with ripple rings shimmering while
+  it falls — and when the rain stops the ground dries again.
+  Wetness is scene state, breathes with the weather's surge
+  cycle, and nodes can steer it in Play.
+- **Snow and the 3D puddle water were removed in v4.13.** Both
+  had grown into full simulations that device testing showed
+  tearing and climbing where they shouldn't (deep-snow sheets
+  ripped around objects that were moved in and out; puddle
+  water crept up surfaces). They are out until a snow model
+  proves itself in a separate test app. Projects saved with
+  snow still open fine — the stored snow state is ignored and
+  the weather starts off.
 
 ### Rendering
 
@@ -161,6 +159,7 @@ image lines._
 | 4.10.4 | 2026-11-01 | Drag-through-snow and spawn snow fixes; on iPhone the app now shows an iPad-required notice |
 | 4.11 | 2026-11-02 | Snow rebuilt as a granular physics simulation (mass, density, repose flow) with a physics audit suite — retired on device evidence the same day; the games-standard model is in development as 4.12 |
 | 4.12 | 2026-11-02 | Snow rebuilt on the games-standard model (Red Dead Redemption 2 the named reference): authored drift field, carve-only deformation with a capped edge lip, caked shader coating on objects, glint/sparkle stage; the granular simulation is retired |
+| 4.13 | 2026-11-02 | Applied Gravity node (56 kinds: wired objects fall and land in Play); snow and 3D water removed on device evidence — rain is streaks + flat wetness; app-wide optimisation (weather no longer rebuilds scene geometry) |
 
 Full details in the [Version History](docs/VERSION-HISTORY.md).
 
@@ -187,20 +186,20 @@ Requires iOS 17+ and an iPad with Metal hardware ray tracing
 Weather and lifecycle changes are gated on host-side audits, and
 crashes get reproduced rather than guessed at:
 
-- **Weather-sim audit** — 33 checks over the water simulation's
-  kernel math (pooling, phase timing, conservation).
-- **Snow-model audits (v4.12)** — a host mirror of the new snow
-  kernels (15 checks: carve-only invariant, wall contact, refill,
-  rim confinement) plus in-simulator REPRO-CHECK audits: wall
-  contact at the user's own settings and in deep snow, the
-  drag-carve invariant, trough persistence and refill, and a
-  GPU shader-gate proof that a vertical face accumulates
-  exactly zero.
-- **Idle-freeze audit** — 51 checks (a 600-second freeze advances
-  scene time by exactly zero, wake input is never swallowed, and
-  more).
+- **Gravity audits** — in-simulator REPRO-CHECK audits: a box
+  falls on the true acceleration curve and lands at the exact
+  support height, lands on another box, floats at zero
+  strength, rises under negative strength, re-falls when its
+  support is hidden, and a no-node control never moves; graphs
+  using the node save and reload intact, and a graph without
+  it (a v4.12-era file) still loads.
+- **Performance bench** — a controlled harness variant
+  measures frame-tick CPU time at rest in the rain and the
+  wall time of geometry-edit rebuilds (host CPU numbers,
+  labelled as such; device smoothness stays the device's
+  verdict).
 - **Simulator repro** ([`.github/workflows/repro.yml`](.github/workflows/repro.yml))
-  — the `-LSRepro` driver runs real accumulation sequences in the
+  — the `-LSRepro` driver runs real weather and gravity sequences in the
   iOS Simulator on CI. It is how the v4.10.3 snow crash was pinned:
   reproduced in 10 of 11 configurations before the fix, passing in
   all of them after.
@@ -217,15 +216,15 @@ App/
     EditorView.swift          editor shell (tree / viewport / properties)
     EditorSession.swift       editor state, undo, weather controls
     Viewport.swift            Metal viewport and input
-    Renderer.swift            path tracer + weather-simulation host
-    Shaders.metal             trace, denoise and weather kernels
+    Renderer.swift            path tracer
+    Shaders.metal             trace, denoise and precipitation kernels
     Models.swift              scene model
     ProjectStore.swift        project persistence (JSON + assets)
     MeshGen.swift             primitive meshes
     ModelImport.swift         ModelIO import (STL/OBJ/USD/USDZ)
     Textures.swift            procedural PBR texture sets
     TextureDesigner.swift     the Texture Designer
-    GameNodes.swift           node definitions (55 kinds)
+    GameNodes.swift           node definitions (56 kinds)
     NodeEditorView.swift      the visual node editor
     GameRuntime.swift         node runtime, particles, areas
     PlayerModel.swift         the procedural humanoid player

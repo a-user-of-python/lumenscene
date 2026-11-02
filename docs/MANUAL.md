@@ -79,7 +79,7 @@ in meaningful ways.
   actually changes. The settled picture, the weather rates, and
   every control behave exactly as in v4.8 — it should simply feel
   smoother and run cooler, most noticeably while dragging objects
-  through deep snow and while node-driven objects move in Play.
+  and while node-driven objects move in Play.
 
 - **Idle freeze (v4.10)** — when no input is detected for a while,
   the scene **freezes** exactly as it stands until the next input:
@@ -88,7 +88,7 @@ in meaningful ways.
   nothing at all while frozen. Any input — a tap anywhere, a drag,
   a key press, the joystick, a menu action — wakes it instantly,
   and the wake is seamless: no time jump, so nothing lurches,
-  teleports, or fast-forwards to "catch up". Rain or snow hanging
+  teleports, or fast-forwards to "catch up". Rain hanging
   mid-air in the frozen frame is the freeze working as intended.
   The delay is adjustable in the **More (…) menu → Idle freeze**:
   **Off / 15 s / 30 s / 1 min (default) / 2 min / 5 min**, and a
@@ -123,153 +123,42 @@ in meaningful ways.
   36 triangles each**) and traced with the same transmission
   machinery as scene glass, at **water IOR 1.33**. Each drop
   genuinely refracts the scene behind it and catches highlights;
-  there are no flat streak cards in a finished still. Snow in a
-  final render gets no geometry (rain only). The ordinary PNG
+  there are no flat streak cards in a finished still. The ordinary PNG
   export and save thumbnails are unchanged — they show no
   precipitation at all, as before.
 
 ## 3. Weather
 
-- **Rain and snow** fall around the camera (GPU precipitation) while their
-  mode is on in the Weather menu. Intensity **surges and eases** over tens
-  of seconds; gusting wind slants the fall.
-- **Build-up is scene state** and saves with the project. Rain wets
-  up-facing surfaces (~75 s to full: darker, glossy, strongly reflective),
-  snow covers them (~100 s), rain melts snow; with weather off, wetness
-  dries (~10 min) and snow melts (~15 min). "Clear build-up" resets
-  instantly. Nodes can steer all of it in Play (§6, Weather Control) —
-  Play-time changes never leak into the saved scene.
-- **Puddles** — standing water appears as wetness rises: guaranteed even
-  on a perfectly flat floor, but depressions, holes, and slope feet fill
-  first and deepest; slants shed water; wet runnels streak downhill.
-  Puddles are thin **sheets of geometry** floating millimetres above the
-  floor with a sloped rim — look at one from a low angle and it has an
-  edge and parallax. Ripples shimmer across puddles while it rains.
-- **Snow drifts** — ground snow is **its own surface**: a fine lattice
-  sheet (about 20 cm across) lying on the ground and terrain, at the
-  height of the drift field, so drifts build smoothly **regardless of
-  how the ground underneath is built**: a plain two-triangle plane
-  gets the same rounded piles as a detailed mesh. The raised sheet
-  occludes, reflects, and casts shadows like any solid, and it is
-  **always snow** — opaque white snow material with fine surface
-  detail and a sparkle that glints as you move. Snow on **objects**
-  is not geometry: rooftops, box tops and other up-facing surfaces
-  get a caked-on snow **coating** (see "Snow ages per object" below);
-  vertical sides stay completely bare. The drift
-  pattern is **different in every project**: each project stores a
-  random pattern seed, and the field mixes broad wind-stretched
-  swells, medium lumps, and fine detail, so cover builds patchily —
-  hollows and sheltered spots fill first, exposed spots last. Snow
-  rises in small steps as it builds (geometry rebuilds are stepped so
-  they never cost the frame rate). In **Weather → Snow settings…** you
-  can **Re-roll** the pattern for a fresh layout.
-- **Max Snow Depth** (Weather → Snow settings…) — snowfall keeps going
-  until the snow reaches the depth you set (**0.05–2 m**, default
-  0.3 m). The setting is the target the drift field builds to: drifts
-  and hollows end up proportionally deeper, exposed spots shallower —
-  it is not a uniform slab. Raising it on a snowy scene resumes the
-  build-up toward the new depth; lowering it does **not** bulldoze
-  existing snow — deep snow settles down only slowly while it snows,
-  and melts as usual when the weather turns. The objects panel shows
-  both readings: **Snow cover %** is progress toward the set depth, and
-  **Snow depth** is the current accumulation in metres.
-- **Snow pushes back (v4.12)** — objects **compress** the snow they
-  touch: an object resting in a drift presses the snow under its
-  footprint down to the ground, and the sheet meets its sides
-  **exactly at the surrounding snow depth** — no bank piled against
-  the wall, no cleared moat — so it sits *in* the snow instead of
-  intersecting an untouched drift. Snow never piles up anywhere:
-  nothing ever rises above the undisturbed drift depth, except a
-  small lip (never more than about 10 cm) along the edge of a
-  depression. Lift an object out and it leaves a compressed patch
-  shaped like its footprint, which slowly fills back in. Objects
-  above the snow don't dent it. In Play, your character **wades**:
-  deep snow carves a body-depth trough around you as you push
-  through, with footprints pressed along your path; the trough
-  closes up slowly behind you. Carved deformation is worked out
-  from where objects are — it is session state and is **not saved**
-  in the project: reopen a project and the drift field is pristine
-  again, with objects re-seating themselves within seconds.
-- **Snow remembers being pushed (v4.12)** — dragging an object
-  through snow **carves** it: a trough stays at the depth the
-  block's underside reached, with a small raised lip along both
-  edges (never more than about 10 cm, and never above the
-  undisturbed depth plus that lip). The snow is **not** shoved
-  ahead of the block and does not pile up beside it — carving is
-  the only thing movement ever does to snow. The trough is
-  session state (it is not stored in the project file). It
-  gradually **refills** — noticeably while snow is falling, more
-  slowly when calm — and melting lowers it away as before;
-  **Re-roll** in Snow settings restores pristine snow, and so
-  does clearing the build-up. Editor drags are the full case;
-  objects moved by node behaviours carve only when a scene
-  rebuild happens to observe their motion.
-- **Temperature (v4.7)** (Weather → Snow settings… → **Temperature**) —
-  temperature is **unset by default**, and unset means exactly the
-  behaviour above: nothing changes until you set it. Tap **Set
-  temperature** to start at +10 °C, then slide **−20…+30 °C**;
-  **Clear temperature** returns to unset. While it is set:
-  - **Phase** — at or below 0 °C, Rain falls as **snow**; above
-    0 °C, Snow falls as **rain**. The Weather menu (and weather
-    nodes) keep saying what you picked — temperature converts it.
-  - **Snowpack melt** — above freezing the snowpack melts at a
-    rate set by the warmth: a full pack lasts about **15 minutes
-    at +2.5 °C, 7½ minutes at +5 °C, under 4 minutes at +10 °C,
-    and under 2 minutes at +20 °C**. Melting snow wets the ground.
-  - **Puddles freeze** — at or below freezing, puddles ice over:
-    fully frozen in about **4 minutes at 0 °C, 2 minutes at
-    −5 °C, under a minute at −20 °C**. Frozen puddles turn pale
-    blue-white ice and stop rippling; warming thaws them back
-    to water (about 90 seconds at +10 °C). The objects panel
-    shows the live state ("−4.5 °C — puddles freezing").
-- **Troughs heal over time (v4.12)** — carved troughs and tracks
-  refill gradually: while snow is falling a deep trough softens
-  back toward the drift depth over a few minutes; in calm weather
-  the same healing runs several times slower, and cold, dry snow
-  (well below freezing) blows back a little faster than snow near
-  melting point. Melt still lowers trails away as before.
-- **Snow ages per object** — cover on an object depends on how long
-  *that object* has been out in the storm. An object spawned (or
-  placed) while the scene is already deep in snow starts **clean**
-  and gathers its coating over time at the scene's build-up rate
-  until it matches its surroundings; objects that were there all
-  along keep the cover they have. The coating **cakes** onto
-  up-facing surfaces and ledges in a patchy, broken layer — flat
-  tops whiten most, steep roofs only a little, and vertical sides
-  **never** hold snow at all. The account is the object's own:
-  **height doesn't matter** — a clean block raised 5 m in the air
-  coats just as slowly as everything else, and a coated block you
-  lift carries its coating with it.
-- The shaped weather field behind all this is computed into a texture
-  when a project loads (and when you re-roll its pattern); levels are
-  thresholds applied at render time, which is why build-up animation
-  stays cheap.
-
-- **Snow and water (v4.8, snow model replaced in v4.12)** — puddle
-  water is a live **simulation** running on the GPU. Water
-  **levels itself**: pools collect in dips with
-  near-flat surfaces, rounded blobby edges, and no climbing up
-  the sides of blocks or standing in ledges at edges — at a
-  support edge, water drains away. Frozen puddles stop flowing
-  entirely. Snow, since v4.12, follows the model the big games
-  use (Red Dead Redemption 2 is the reference): an authored
-  drift field that builds toward the set depth and never flows
-  sideways, **carve-only** deformation from objects and the
-  player, a fine-detailed sheet with a glinting sparkle, and
-  the caked coating on objects described above — no slumping,
-  no banking, no piles. Falling
-  rain and snow were also redrawn: rain is thin soft streaks
-  and snowflakes are soft round discs — neither can ever show
-  as a square card.
-- **Water reflection quality (v4.8)** — a **Water reflections**
-  setting (Full / Half / Quarter) lives with the render and
-  weather settings. **Full is the default and is exactly the
-  quality you have always had.** Half and Quarter trace the
-  true scene reflection on only that fraction of water pixels
-  per frame (the selection rotates frame to frame, so coverage
-  cycles) and fill the rest from the sky/environment — reflections
-  look flatter on water, and the renderer does proportionally
-  less reflection work. It only ever affects water.
+- **Rain** falls around the camera (GPU precipitation) while
+  Rain is on in the Weather menu. Intensity **surges and eases**
+  over tens of seconds; gusting wind slants the fall. The
+  streaks are thin and soft — no square silhouettes at any
+  angle.
+- **Ground wetness** is the whole ground effect: one flat
+  value that ramps up while it rains (~75 s to fully wet,
+  faster in a surge) and dries slowly when the rain stops
+  (~10 min). As it rises, up-facing ground and objects get
+  **darker, glossier and more reflective** — a wet sheen,
+  strongest at glancing angles — and while it rains, faint
+  ripple rings shimmer across the wet ground. There is no
+  standing water: nothing pools, nothing climbs, nothing is
+  simulated in 3D.
+- Wetness is scene state and saves with the project; the
+  footer shows "Ground: N% wet". **Clear ground build-up**
+  (Weather menu, shown when anything is wet) resets it
+  instantly. Nodes can steer it in Play (§6, Weather
+  Control) — Play-time changes never leak into the saved
+  scene.
+- **Snow is gone (v4.13).** The snow system (accumulation,
+  drifts, carving, the coating on objects, temperature and
+  its phases) and the 3D puddle system were removed in
+  v4.13 after device testing showed deep-snow scenes
+  tearing around moved objects and both systems trying to
+  climb surfaces they shouldn't. A good snow version is
+  being worked out in a separate test app before it comes
+  back. Projects saved with snow (or a temperature) still
+  open normally — the stored snow state is simply ignored,
+  and such projects open with the weather off.
 
 ## 4. Textures and the Texture Designer
 
@@ -380,6 +269,7 @@ Both spawn nodes take an **Offset** (X/Y/Z, −50…50) so clones land displaced
 | Chase Player | an object hunts you; **Caught** fires in range | Speed, Stop distance, Fly |
 | Wander | an object roams randomly around a home area | Radius, Speed, Pause |
 | Look At | an object turns to face the player or another object | Target, Turn speed |
+| Applied Gravity | gives an object real gravity in Play: it falls from where it was placed, lands on the surface below (ground or another object's top) and rests there; if the support is removed it falls again. **Landed** fires when it comes to rest after a real fall | Gravity (m/s², default 9.8 — 0 floats, negative falls up), Bounce |
 
 ### Actions — light, material, display
 
@@ -410,8 +300,8 @@ Both spawn nodes take an **Offset** (X/Y/Z, −50…50) so clones land displaced
 |---|---|---|
 | Load Area / Unload Area | streams an area's objects in / out of the world | Area |
 | Show Area / Hide Area | shows/hides an area's objects without unloading | Area |
-| Set Weather | changes weather from a graph | Mode (Off/Rain/Snow) |
-| Weather Control | the deep version: build-up rate, intensity scale, direct wet/snow levels | Rate, Intensity, Wet, Snow |
+| Set Weather | changes weather from a graph | Mode (Off/Rain) |
+| Weather Control | the deep version: build-up rate, intensity scale, direct wet level | Rate, Intensity, Wet |
 | Set Environment Light | sets ambient environment brightness (0–4) | Level |
 | Set Gravity | scales gravity for physics particles (0–4) | Scale |
 | Impulse Burst | a radial shove that wakes and throws resting particles | Anchor, Radius, Strength |
@@ -530,6 +420,10 @@ through area unloading (§6) instead.
   the whole project.
 - Objects animated by nodes live in a separate dynamic layer; editing is
   unaffected, and exiting Play restores the scene exactly as it was.
+- Projects saved by the snow-era versions (through v4.12) open
+  normally: their stored snow, temperature and puddle state is
+  ignored (v4.13 removed those systems), and the weather starts
+  off; everything else — scenes, graphs, textures — is unchanged.
 
 ## 10. Known limits, honestly
 
@@ -539,10 +433,9 @@ through area unloading (§6) instead.
 - Leaf drape is a hinge approximation, not cloth.
 - Node graphs pass values through variables only — no value wires.
 - Custom textures aren't embedded in exported projects (see §4).
-- Snow detail finer than the ~0.2 m snow lattice (very small parts,
-  tightly curved bits) stays shading-only; beyond the
-  weather-geometry triangle budget, the snow sheet stops growing
-  rather than endangering the frame rate.
+- There is no snow (v4.13) — it was removed after device
+  testing showed the deep-snow sheet tearing; a replacement is
+  being proven in a separate test app before it returns.
 - Everything in this manual describes the software as built and
   build-verified; the final word on feel — joystick, node-editor
   dragging, drape believability — belongs to the device in your hands.

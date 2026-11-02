@@ -1035,6 +1035,86 @@ RDR2) found the industry stack, and v4.12 is that stack:
   tick (encode time only, not GPU or device frame time —
   the device remains the judge of smoothness, as always).
 
+## Version 4.13 — Applied Gravity; snow and 3D water removed (2026-11-02)
+
+Two commissions landed, and one system left.
+
+**Applied Gravity node (56 kinds).** A new Actions node: wire
+an object to it and in Play the object falls from where it
+was placed, accelerates at the node's Gravity strength
+(m/s², default 9.8, editable −50…50 — 0 floats, negative
+falls up), and lands on the highest support beneath it —
+ground or another object's top — coming to rest exactly on
+the surface. It is substepped (≤1/120 s) and swept against
+the runtime collision grid, so it cannot tunnel through
+thin supports; resting objects re-verify their support
+every tick and fall again if it is removed mid-Play (Hide a
+box out from under a landed box and the landed box falls).
+**out** fires when gravity takes hold, **Landed** when the
+object comes to rest after a real fall (>1 cm of travel);
+an optional Bounce (default 0) rebounds off hard impacts.
+Editor state is untouched — Play works on the snapshot, as
+with every other behaviour. Host audits: a box dropped 3 m
+lands at the analytic fall time (0.783 s measured vs
+0.782 s), follows the quadratic curve (half-time fraction
+0.262), rests with zero drift; strength 0 hangs motionless;
+an unwired control never moves; a −9.8 box rises and rests
+under a ceiling; box-on-box landing and the
+support-removed refall both pass; graphs using the node
+save and reload intact, and pre-4.13 projects load
+unchanged (the kind is purely additive).
+
+**Snow and 3D water are removed.** v4.12's snow was
+accepted in the morning ("Looks good") and condemned the
+same morning by harder use: at maximum depth the sheet
+tore around a buried box being put back (dark slits, a
+stray fin), a slit appeared in the open field after the
+box was lifted out, walking through deep snow left a chain
+of jagged craters instead of a wading trough, and the
+whole scene was, in the user's words, "laggy as hell". The
+user's call: "just remove snow entirely until we can get a
+good working version — there is so much wrong with it."
+The 3D pooling/puddle water went the same way an hour
+later ("make rain just a slowly sheening wet ground… no
+3D") — it had the same climbing instincts. So v4.13
+deletes both systems outright (the sheet, the lattice
+simulation, the coating, temperature and its phases, the
+puddle model and its reflection controls) rather than
+patching them. A good snow version is being proven in a
+separate test app first. Rain is now exactly two things:
+the falling streaks (unchanged) and one flat ground-wetness
+value that ramps while it rains and dries when it stops,
+darkening and glossing up-facing surfaces. Projects saved
+by the snow-era versions open normally — their stored snow
+state is ignored and the weather starts off.
+
+**Optimisation is the third headline.** The deep-snow lag
+had a structural cause: weather build-up was quantised
+into geometry steps, and every step rebuilt the scene's
+geometry and acceleration structures — dozens of full
+rebuilds a minute while weather ran, more while objects
+moved. With the weather systems gone, weather never
+touches geometry at all: the per-frame weather cost in the
+rain bench scene is 0.16 ms of CPU (mean frame-tick time),
+and a geometry edit costs one rebuild (35 ms in the bench
+scene) only when an edit actually happens. The removal
+itself is the rest of the optimisation: Renderer.swift
+shrinks from ~7,400 to ~4,480 lines and the shader from
+2,254 to 1,403, and the per-frame tick no longer runs a
+snow simulation, a sheet pass, or a weather-field bake.
+Settled image quality is unchanged — same samples,
+bounces and resolution at rest; the savings are all
+work-not-done, not quality-not-rendered. True device FPS
+remains the device's verdict.
+
+One cross-cutting fix fell out of the gravity audits: the
+runtime collision grid now follows promoted-object
+visibility (Hide/Show in Play). It previously only
+followed the legacy static path, so a hidden box kept
+colliding — nothing could fall through where it had stood.
+
+---
+
 *Every version above was verified by automated build and inspection before
 delivery; the final judge of each was the device it runs on, and several
 versions (3.1, 3.2, 3.3, 3.4) exist because device reports sent the work
