@@ -862,6 +862,7 @@ final class ReproRun {
                     let r = hypotf(x, z)
                     return r < 1.2 ? 1.6 * (1 - r / 1.2) : 0
                 }
+                emitMetric("injected")
                 session.setWeatherMode(0)
                 physPhase = .running
             case "settle", "longrun":
@@ -878,10 +879,12 @@ final class ReproRun {
                     }
                     return d
                 }
+                emitMetric("injected")
                 session.setWeatherMode(0)
                 physPhase = variant == "longrun" ? .longrunA : .running
             case "drag2":
                 injectField { _, _, sup in abs(sup) < 0.05 ? 1.8 : 0 }
+                emitMetric("injected")
                 session.setWeatherMode(0)
                 if let idx = session.project.scene.objects.firstIndex(where: { $0.primitiveKind == "box" }) {
                     dragStartX = session.project.scene.objects[idx].transform.position[0]
@@ -911,6 +914,7 @@ final class ReproRun {
                 injectField { x, z, sup in
                     (sup > 0.9 && sup < 3.7 && abs(x) <= 1.55 && abs(z) <= 1.05) ? 0.5 : 0
                 }
+                emitMetric("injected")
                 session.setWeatherMode(0)
                 physPhase = .running
             default:
