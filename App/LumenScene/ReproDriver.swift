@@ -587,6 +587,19 @@ final class ReproRun {
                 loc.sort()
                 let flank: Float = loc.isEmpty ? 0 : loc[loc.count / 2]
                 line += String(format: " coneFlank=%.2f", flank)
+                // v4.11 diagnostic: the cone's radial surface
+                // profile along +x (support+snow), 9 samples —
+                // discriminates dome vs shallow-cone vs
+                // flat-top shapes behind the flank reading.
+                var prof: [String] = []
+                for r in 0...8 {
+                    let ii = ci + r
+                    if ii < s.vx {
+                        let h = clean(s.support[cj * s.vx + ii]) + clean(s.snow[cj * s.vx + ii])
+                        prof.append(String(format: "%.3f", h))
+                    }
+                }
+                line += " profile=" + prof.joined(separator: ",")
             case "drag2":
                 var sum: Float = 0, cnt = 0
                 for j in 0..<s.vz {
