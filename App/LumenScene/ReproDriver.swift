@@ -266,7 +266,14 @@ enum ReproDriver {
                 p.scene.camera.target = [0, 1, 0]
             }
             p.scene.weather.maxDepth = 2.0
-            p.scene.weather.snowAmount = 0.05
+            // v4.11 fix round: physics scenes run at the full
+            // 2.0 m amount so the deposition GATE sits at 2.0 m —
+            // at 0.05 the gate-compaction term (depth above the
+            // gate densifies) ate the injected pile from the top
+            // (flank 24 deg instead of repose in run 41368850510).
+            // Injections overwrite the whole field, so the deep
+            // initial condition this loads is immaterial.
+            p.scene.weather.snowAmount = 2.0
             p.scene.weather.snow = 0.9
             p.scene.weather.temperature = -8
         default:
