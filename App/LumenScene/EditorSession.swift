@@ -1407,6 +1407,7 @@ final class EditorSession: ObservableObject {
         let shouldShow = !hiddenPromotedIDs.contains(id)
             && !areaHiddenPromotedIDs.contains(id)
         let hasEntry = dynamicEntries.contains { $0.key == id }
+        var structureChanged = false
         if shouldShow, !hasEntry, let mesh = localMesh(for: obj), !mesh.isEmpty {
             dynamicEntries.append(DynamicEntry(
                 key: id, mesh: mesh, matrix: obj.transform.matrix,
@@ -1414,10 +1415,20 @@ final class EditorSession: ObservableObject {
             // v4.1 (§7.1): the renderer's entry list is ALWAYS
             // promoted entries (in order) + clone entries.
             renderer.setDynamicEntries(dynamicEntries + cloneEntries)
+            structureChanged = true
         } else if !shouldShow, hasEntry {
             dynamicEntries.removeAll { $0.key == id }
             renderer.removeDynamicEntry(key: id)
+            structureChanged = true
         }
+        // v4.13: the runtime's collision grid must follow entry
+        // structure exactly as it follows the legacy static path
+        // (F29) and the area funnels — without this, a hidden
+        // promoted object kept colliding (an Applied Gravity
+        // object resting on it never fell when it was hidden:
+        // gravstack refell). Entry add/remove changes the
+        // renderer's collision triangle set, so notify.
+        if structureChanged { runtime.collisionDidChange() }
         kickRender()
     }
 
