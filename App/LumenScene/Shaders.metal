@@ -2124,12 +2124,27 @@ kernel void snowSourcesKernel(
     if (depth > sp.gateUniform) {
         rho += (1.0f - rho) * (1.0f - exp(-0.02f * sp.dt));
     }
-    // Intruder compaction: snow under an object is pressed
-    // toward full density fast — this is the "compact first"
-    // half of displacement; the rest vacates in step 3.
+    // Intruder compaction: snow actually OVERLAPPED by an
+    // object is pressed toward full density fast — this is
+    // the "compact first" half of displacement; the rest
+    // vacates in step 3. The overlap test is the same one
+    // the displacement step uses (v4.11 fix round 4: the
+    // coverage mask alone also matches the SUPPORT ITSELF —
+    // the ground plane is an "intruder" covering every
+    // column with zero overlap — and compacting on coverage
+    // alone densified ALL ground snow to rho ~ 1 within
+    // seconds, collapsing pile depths by the fresh-density
+    // factor; the in-app PILE audit caught it: volume fell
+    // 2.41 -> 1.09 at constant mass).
     if (occCov[idx] > 0.0f) {
-        rho += (1.0f - rho) * (1.0f - exp(-3.0f * sp.dt));
-        age = 0.0f;
+        float depthNow = m / max(rho, 0.05f);
+        float ovTop = min(occHi[idx] - supportY[idx], depthNow);
+        float ovBot = max(occLo[idx] - supportY[idx], 0.0f);
+        float ovFrac = clamp((ovTop - ovBot) / max(depthNow, 1e-6f), 0.0f, 1.0f);
+        if (ovFrac > 0.0f) {
+            rho += (1.0f - rho) * (1.0f - exp(-3.0f * ovFrac * sp.dt));
+            age = 0.0f;
+        }
     }
     // Footprint press (player steps, CPU-stamped per-vertex
     // compress factors): depth scales down at constant mass

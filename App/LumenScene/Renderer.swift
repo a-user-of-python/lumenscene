@@ -3806,10 +3806,26 @@ final class Renderer {
                     let hostMoved = (sx != x || sz != z)
                     func sampleField(_ f: [Float]) -> Float? {
                         if hostMoved {
-                            return simSampleBilinearMasked(
+                            if let v = simSampleBilinearMasked(
                                 f, hosts: oldHosts, want: hostIDs[i],
                                 ox: oldOX, oz: oldOZ, cs: oldCS,
-                                vx: oldVX, vz: oldVZ, x: sx, z: sz)
+                                vx: oldVX, vz: oldVZ, x: sx, z: sz) {
+                                return v
+                            }
+                            // v4.11 fix round 4: a failed masked
+                            // sample (the host's leading edge,
+                            // where same-host taps are scarce)
+                            // falls back to the WORLD-position
+                            // sample — never to the closed-form
+                            // initial condition. The closed form
+                            // is the deep equilibrium field; using
+                            // it here refilled a moving object's
+                            // leading-edge columns to full depth
+                            // on every rebuild — a mass pump the
+                            // in-app DRAG audit measured at
+                            // +0.5% per drag.
+                            return simSampleBilinear(f, ox: oldOX, oz: oldOZ, cs: oldCS,
+                                                     vx: oldVX, vz: oldVZ, x: x, z: z)
                         }
                         return simSampleBilinear(f, ox: oldOX, oz: oldOZ, cs: oldCS,
                                                  vx: oldVX, vz: oldVZ, x: sx, z: sz)
