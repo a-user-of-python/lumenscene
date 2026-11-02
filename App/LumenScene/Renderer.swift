@@ -1902,21 +1902,6 @@ final class Renderer {
     // appear for free because a drag rebuilds at the object's
     // live transform, and nothing sculpted is ever stored.
 
-    /// v4.6: one intruder's footprint as the plow recorder
-    /// last saw it. The recorder is rebuild-to-rebuild
-    /// memory: an intruder whose world footprint CENTRE moved
-    /// since the previous rebuild AND whose body reaches the
-    /// snow plows the span between the two positions.
-
-    /// v4.6: the previous rebuild's intruder footprints, keyed
-    /// by intruder identity (see plowIdentityKey). Replaced
-    /// wholesale at the end of every sheet pass.
-    private var prevPlowIntruders: [Int: PlowPrev] = [:]
-
-    /// Identity for the plow recorder: statics by their
-    /// object id; dynamic entries by the hash of the key the
-    /// session gave them — an entry whose key changes between
-    /// rebuilds simply starts fresh (no trail that step).
 
 
 
