@@ -189,6 +189,20 @@ enum ReproDriver {
             // The demo minus every box/other object: only the
             // floor plane remains as support.
             p.scene.objects.removeAll { $0.primitiveKind != "plane" }
+        case "perfbench":
+            // Controlled perf baseline scene: a 24x24 m plane
+            // (the sheet/sim lattice size class Sean's deep
+            // scenes use) plus six boxes. Weather is driven by
+            // the variant's own phase machine (rain).
+            p.scene.objects.removeAll()
+            var big = SceneObject.primitive("plane", name: "Repro bench plane")
+            big.params = ["w": 24, "d": 24]
+            p.scene.objects.append(big)
+            for i in 0..<6 {
+                var b = SceneObject.primitive("box", name: "Repro bench box \(i)")
+                b.transform.position = [Float(-7 + i * 3), 0.5, Float((i % 2) * 6 - 3)]
+                p.scene.objects.append(b)
+            }
         case "scaled":
             var zero = SceneObject.primitive("box", name: "Repro zero-scale box")
             zero.transform.position = [0.8, 0.5, 0.8]
@@ -399,6 +413,7 @@ final class ReproRun {
     private var isGravityVariant: Bool {
         ["gravfall", "gravstack"].contains(ReproDriver.variant)
     }
+    private var isPerfVariant: Bool { ReproDriver.variant == "perfbench" }
     private var gravPhase = 0
     private var gravPrepared = false
     private var gravPhaseSince: CFTimeInterval = 0
@@ -701,6 +716,82 @@ final class ReproRun {
         print(line)
         fflush(stdout)
         NSLog("%@", line)
+    }
+
+    // MARK: perfbench — controlled performance baseline (rain
+    // scene; valid on every build): frameTick CPU ms at rest
+    // with rain active, and the wall time of a geometry edit's
+    // staged rebuild, on the simulator's host CPU. Metrics only
+    // — device FPS stays the device's verdict.
+    private var perfPhase = 0
+    private var perfFrameSamples: [Double] = []
+    private var perfEditsDone = 0
+    private var perfEditStart: CFTimeInterval = 0
+    private var perfEditInFlight = false
+    private var perfEditTimes: [Double] = []
+
+    private func perfMetric(_ name: String, _ values: [Double]) {
+        guard !values.isEmpty else {
+            ReproDriver.marker("PERF \(name) n=0")
+            return
+        }
+        let mean = values.reduce(0, +) / Double(values.count)
+        let mx = values.max() ?? 0
+        ReproDriver.marker(String(format: "PERF %@ meanMs=%.3f maxMs=%.3f n=%d",
+                                  name, mean, mx, values.count))
+    }
+
+    private func pumpPerf() {
+        guard let session else { return }
+        switch perfPhase {
+        case 0:
+            if session.project.scene.weather.mode != 1 {
+                session.setWeatherMode(1)
+            }
+            if session.liveWetAmount > 0.05 {
+                perfFrameSamples.removeAll()
+                perfPhase = 1
+                ReproDriver.marker("perfbench rain-established wet=\(session.liveWetAmount)")
+            }
+        case 1:
+            if perfFrameSamples.count >= 90 {
+                perfMetric("rainRestFrameTick", perfFrameSamples)
+                perfFrameSamples.removeAll()
+                perfPhase = 2
+            }
+        case 2:
+            let renderer = session.renderer
+            if !perfEditInFlight {
+                let boxes = session.project.objects.indices.filter {
+                    session.project.objects[$0].primitiveKind == "box"
+                }
+                guard perfEditsDone < 6, !boxes.isEmpty else { perfPhase = 3; return }
+                let idx = boxes[perfEditsDone % boxes.count]
+                session.project.objects[idx].position.x += 0.5
+                renderer.scheduleRebuild(geometry: true)
+                perfEditStart = CACurrentMediaTime()
+                perfEditInFlight = true
+            } else if renderer.weatherStep == "rebuild:swap"
+                        || CACurrentMediaTime() - perfEditStart > 20 {
+                perfEditTimes.append((CACurrentMediaTime() - perfEditStart) * 1000)
+                perfEditsDone += 1
+                perfEditInFlight = false
+                if perfEditsDone >= 6 {
+                    perfMetric("rainEditRebuild", perfEditTimes)
+                    perfPhase = 3
+                }
+            }
+        default:
+            // Save/load sanity on the surviving weather model:
+            // the project round-trips with rain mode intact.
+            let project = session.project
+            ProjectStore.saveProject(project, thumbnailPNG: nil)
+            let loaded = ProjectStore.loadProject(id: project.id)
+            check("saveload", loaded?.scene.weather.mode == 1,
+                  "mode=\(String(describing: loaded?.scene.weather.mode))")
+            session.renderer.printTickMetric()
+            finishSnow()
+        }
     }
 
     private func finishSnow() {
@@ -1248,7 +1339,11 @@ final class ReproRun {
         if phase != .armingFreeze && phase != .frozen {
             session.noteUserInput()
         }
+        let perfT0 = isPerfVariant ? CACurrentMediaTime() : 0
         session.frameTick(view: view)
+        if isPerfVariant {
+            perfFrameSamples.append((CACurrentMediaTime() - perfT0) * 1000)
+        }
         pumpCount += 1
 
         if phase == .armingFreeze {
@@ -1335,6 +1430,7 @@ final class ReproRun {
             handleSnowAudit()
             if finished { return }
         }
+        if isPerfVariant { pumpPerf() }
         if isGravityVariant {
             handleGravityAudit()
             if finished { return }

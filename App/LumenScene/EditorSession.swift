@@ -2302,6 +2302,7 @@ final class EditorSession: ObservableObject {
 
     /// Read-only live snow figures for the Weather sheet.
     var liveSnowAmount: Double { buildupSnow }
+    var liveWetAmount: Double { buildupWet }
     var liveSnowProgress: Double { snowProgressClamped }
 
     /// Clear rain wetness / snow cover back to dry ground.
