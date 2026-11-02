@@ -675,7 +675,7 @@ final class EditorSession: ObservableObject {
         // mode opens with weather off; its stored snow state
         // (amount, exposures, plow layer, freeze) is ignored.
         if project.scene.weather.mode == 2 {
-            project.scene.weather.mode = 0
+            self.project.scene.weather.mode = 0
         }
         renderer.onNeedsFrame = { [weak self] in self?.kickRender() }
         _ = renderer.reloadTextureArraysIfNeeded()
@@ -1347,10 +1347,6 @@ final class EditorSession: ObservableObject {
         guard let snap = try? JSONDecoder().decode(Snapshot.self, from: data) else { return }
         project.scene.objects = snap.objects
         noteSceneObjectsChanged()
-        // v4.3: restored objects carry their Play-entry snapshot
-        // exposures (absent = caught up); prune anything else.
-        ensureExposuresForSceneObjects()
-        pruneExposures()
         renderer.rebuild(scene: project.scene, meshes: meshes)
         kickRender()
     }
