@@ -4396,9 +4396,8 @@ final class Renderer {
               let bcmd = queue.makeCommandBuffer(),
               let blit = bcmd.makeBlitCommandEncoder() else { return nil }
         blit.copy(from: accum,
-                  sourceOffset: 0,
-                  sourceBytesPerRow: width * 8,
-                  sourceBytesPerImage: byteCount,
+                  sourceSlice: 0, sourceLevel: 0,
+                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
                   sourceSize: MTLSize(width: width, height: height, depth: 1),
                   to: buf, destinationOffset: 0,
                   destinationBytesPerRow: width * 8,
