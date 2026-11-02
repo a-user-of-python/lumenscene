@@ -46,6 +46,16 @@
 //   gravfall / gravstack — v4.13 Applied Gravity audits
 //              (fall curve, landing, stacking, negative
 //              strength, save/load).
+//   loopmove — v4.14 Loop audits: a Loop drives Move Object
+//              and Rotate Object through repeated cycles,
+//              stops dead at Play exit, and starts fresh on
+//              re-entry; graph save/load round-trips.
+//   playernodes — v4.14 player targets: Move Object glides
+//              the player to a target; Rotate Object turns
+//              the player camera and writes through to the
+//              real look state (an audit-applied look drag
+//              must survive — no snap-back); a Loop drives
+//              the camera rotate forever.
 //
 // Retired with v4.13's weather removal: freeze / freeze2
 // (their establishment witness was the snow build-up) and
@@ -255,6 +265,91 @@ enum ReproDriver {
                 NodeLink(id: UUID(), from: start.id, fromPin: "out", to: gRise.id, toPin: "in"),
                 NodeLink(id: UUID(), from: start.id, fromPin: "out", to: delay2.id, toPin: "in"),
                 NodeLink(id: UUID(), from: delay2.id, fromPin: "out", to: hide2.id, toPin: "in"),
+            ]
+        case "loopmove":
+            // v4.14 Loop audit (object movers): one Loop drives
+            // a Move Object (By Offset +1.5 m, 0.8 s) with a
+            // 0.25 s repeat delay — the box must march one
+            // offset per cycle, continuously, for as long as
+            // Play runs; a second Loop drives a Rotate Object
+            // (120°/s × 0.5 s = 60° per cycle, 0.4 s delay).
+            // The phase machine also checks Play-exit stillness
+            // (the snapshot restore returns the box, and nothing
+            // may keep driving it) and a fresh second session.
+            var plane = SceneObject.primitive("plane", name: "Repro bare plane")
+            plane.params = ["w": 8, "d": 8]
+            plane.transform.position = [0, 0, 0]
+            var march = SceneObject.primitive("box", name: "Repro march box")
+            march.transform.position = [0, 0.5, 0]
+            var spin = SceneObject.primitive("box", name: "Repro spin box")
+            spin.transform.position = [-3, 0.5, 0]
+            p.scene.objects = [plane, march, spin]
+            let start = LogicNode(kind: "evStart")
+            var move = LogicNode(kind: "actMoveTo", x: 440, y: 0)
+            move.params = ["subject": .text("Object"),
+                           "object": .ref(march.id),
+                           "mode": .text("By Offset"),
+                           "dx": .number(1.5), "dy": .number(0), "dz": .number(0),
+                           "duration": .number(0.8)]
+            var loopMove = LogicNode(kind: "logLoop", x: 220, y: 0)
+            loopMove.params = ["node": .ref(move.id), "delay": .number(0.25)]
+            var rotate = LogicNode(kind: "actRotate", x: 440, y: 140)
+            rotate.params = ["subject": .text("Object"),
+                             "object": .ref(spin.id),
+                             "speed": .number(120), "duration": .number(0.5)]
+            var loopSpin = LogicNode(kind: "logLoop", x: 220, y: 140)
+            loopSpin.params = ["node": .ref(rotate.id), "delay": .number(0.4)]
+            p.scene.graph.nodes = [start, loopMove, move, loopSpin, rotate]
+            p.scene.graph.links = [
+                NodeLink(id: UUID(), from: start.id, fromPin: "out", to: loopMove.id, toPin: "in"),
+                NodeLink(id: UUID(), from: start.id, fromPin: "out", to: loopSpin.id, toPin: "in"),
+            ]
+        case "playernodes":
+            // v4.14 player-target audit: Move Object with
+            // Move = Player glides the viewpoint to a target
+            // box (the eye rule puts the eye at 2.2 over its
+            // 0.5 centre); Rotate Object with Rotate = Player
+            // Camera then turns the view +90° over 1 s (after a
+            // 2 s Delay); the audit drags the look +30° itself
+            // (the Viewport gesture's exact write) and the yaw
+            // must KEEP the dragged value — no snap-back. From
+            // 5.5 s a Loop drives a second Player Camera rotate
+            // (180°/s × 0.5 s = 90°/cycle, 0.5 s delay) forever.
+            var plane = SceneObject.primitive("plane", name: "Repro bare plane")
+            plane.params = ["w": 12, "d": 12]
+            plane.transform.position = [0, 0, 0]
+            var target = SceneObject.primitive("box", name: "Repro player target")
+            target.transform.position = [4, 0.5, 0]
+            p.scene.objects = [plane, target]
+            p.scene.camera.playPosition = [0, 1.7, 0]
+            p.scene.camera.playYaw = 0
+            p.scene.camera.playPitch = 0
+            let start = LogicNode(kind: "evStart")
+            var pMove = LogicNode(kind: "actMoveTo", x: 220, y: 0)
+            pMove.params = ["subject": .text("Player"),
+                            "mode": .text("To Object"),
+                            "target": .ref(target.id),
+                            "dx": .number(0), "dy": .number(0), "dz": .number(0),
+                            "duration": .number(1.2)]
+            var delay = LogicNode(kind: "logDelay", x: 220, y: 140)
+            delay.params = ["seconds": .number(2.0)]
+            var camRot = LogicNode(kind: "actRotate", x: 440, y: 140)
+            camRot.params = ["subject": .text("Player Camera"),
+                             "speed": .number(90), "duration": .number(1.0)]
+            var delay2 = LogicNode(kind: "logDelay", x: 220, y: 280)
+            delay2.params = ["seconds": .number(5.5)]
+            var camRot2 = LogicNode(kind: "actRotate", x: 660, y: 280)
+            camRot2.params = ["subject": .text("Player Camera"),
+                              "speed": .number(180), "duration": .number(0.5)]
+            var camLoop = LogicNode(kind: "logLoop", x: 440, y: 280)
+            camLoop.params = ["node": .ref(camRot2.id), "delay": .number(0.5)]
+            p.scene.graph.nodes = [start, pMove, delay, camRot, delay2, camLoop, camRot2]
+            p.scene.graph.links = [
+                NodeLink(id: UUID(), from: start.id, fromPin: "out", to: pMove.id, toPin: "in"),
+                NodeLink(id: UUID(), from: start.id, fromPin: "out", to: delay.id, toPin: "in"),
+                NodeLink(id: UUID(), from: delay.id, fromPin: "out", to: camRot.id, toPin: "in"),
+                NodeLink(id: UUID(), from: start.id, fromPin: "out", to: delay2.id, toPin: "in"),
+                NodeLink(id: UUID(), from: delay2.id, fromPin: "out", to: camLoop.id, toPin: "in"),
             ]
         default:
             break
@@ -498,6 +593,288 @@ final class ReproRun {
         }
     }
 
+    // MARK: - v4.14 audits (loopmove / playernodes)
+    //
+    // Same phase shape as the gravity audits: phase 0 turns
+    // the weather off through the real funnel, runs the
+    // save/load audit on the pristine project, waits a beat,
+    // then enters Play via toggleMode. Phase 1 samples once
+    // per pump until the variant's limit, then verdicts.
+    // loopmove continues: phase 2 exits Play and samples the
+    // restored scene for stillness (a leaked loop would keep
+    // writing — or the restore would not hold); phase 3
+    // re-enters Play and confirms the loop starts fresh from
+    // the authored position (no state leaked across sessions).
+    private var isLoopVariant: Bool {
+        ["loopmove", "playernodes"].contains(ReproDriver.variant)
+    }
+    private var loopPhase = 0
+    private var loopPrepared = false
+    private var loopPhaseSince: CFTimeInterval = 0
+    private var loopPlayStart: CFTimeInterval = 0
+    private var loopMarchSamples: [(t: Double, x: Double)] = []
+    private var loopSpinTotal: [(t: Double, deg: Double)] = []
+    private var loopSpinLastYaw: Double? = nil
+    private var loopSpinAccum: Double = 0
+    private var loopMaxStep: Double = 0
+    private var loopPosSamples: [(t: Double, x: Double, y: Double, z: Double)] = []
+    private var loopYawSamples: [(t: Double, deg: Double)] = []
+    private var loopYawLast: Double? = nil
+    private var loopYawAccum: Double = 0
+    private var loopDragApplied = false
+    private var loopExitSamples: [Double] = []
+
+    /// Accumulates a wrapped 0..<360 angle into an unwrapped
+    /// total (per-step deltas folded into −180...180; the
+    /// per-pump steps here are a few degrees, far from the
+    /// fold).
+    private func unwrap(_ raw: Double, last: inout Double?,
+                        accum: inout Double) -> Double {
+        if let prev = last {
+            var d = raw - prev
+            while d > 180 { d -= 360 }
+            while d < -180 { d += 360 }
+            accum += d
+        }
+        last = raw
+        return accum
+    }
+
+    private func loopX(_ name: String) -> Double? {
+        session?.project.scene.objects
+            .first { $0.name == name }?.transform.position[0]
+    }
+
+    private func handleLoopAudit() {
+        guard let session else { return }
+        let now = CACurrentMediaTime()
+        switch loopPhase {
+        case 0:
+            if !loopPrepared {
+                loopPrepared = true
+                session.setWeatherMode(0)
+                runLoopSaveLoadChecks()
+                loopPhaseSince = now
+                return
+            }
+            if now - loopPhaseSince >= 0.6 {
+                session.toggleMode()
+                loopPlayStart = CACurrentMediaTime()
+                loopPhase = 1
+                ReproDriver.marker("loop-play-entered mode=\(session.mode)")
+            }
+        case 1:
+            let t = now - loopPlayStart
+            if ReproDriver.variant == "loopmove" {
+                if let x = loopX("Repro march box") {
+                    if let prev = loopMarchSamples.last {
+                        loopMaxStep = max(loopMaxStep, abs(x - prev.x))
+                    }
+                    loopMarchSamples.append((t, x))
+                }
+                if let spin = session.project.scene.objects
+                    .first(where: { $0.name == "Repro spin box" }),
+                   spin.transform.rotation.count > 1 {
+                    let total = unwrap(spin.transform.rotation[1],
+                                       last: &loopSpinLastYaw,
+                                       accum: &loopSpinAccum)
+                    loopSpinTotal.append((t, total))
+                }
+                if t >= 4.6 {
+                    emitLoopmoveChecks()
+                    session.toggleMode()
+                    loopPhaseSince = now
+                    loopPhase = 2
+                }
+            } else {   // playernodes
+                let cam = session.project.scene.camera
+                if cam.playPosition.count >= 3 {
+                    loopPosSamples.append((t, cam.playPosition[0],
+                                           cam.playPosition[1],
+                                           cam.playPosition[2]))
+                }
+                let total = unwrap(cam.playYaw, last: &loopYawLast,
+                                   accum: &loopYawAccum)
+                loopYawSamples.append((t, total))
+                if t >= 3.6, !loopDragApplied {
+                    loopDragApplied = true
+                    // The Viewport drag-look gesture's exact
+                    // write path: mutate the camera value and
+                    // assign it back (Viewport.swift).
+                    var dragged = session.project.scene.camera
+                    dragged.playYaw += 30
+                    session.project.scene.camera = dragged
+                    ReproDriver.marker("loop-drag-applied yaw=\(dragged.playYaw)")
+                }
+                if t >= 10.2 {
+                    emitPlayernodeChecks()
+                    finishSnow()
+                }
+            }
+        case 2:
+            // loopmove, Play exited: the snapshot restore has
+            // returned the march box to its authored x = 0.
+            if let x = loopX("Repro march box") {
+                loopExitSamples.append(x)
+            }
+            if now - loopPhaseSince >= 1.2 {
+                let still = !loopExitSamples.isEmpty
+                    && loopExitSamples.allSatisfy { abs($0) <= 0.001 }
+                check("postexit", still,
+                      "samples=\(loopExitSamples.count) last=\(loopExitSamples.last ?? -999)")
+                session.toggleMode()
+                loopPlayStart = CACurrentMediaTime()
+                loopMarchSamples.removeAll()
+                loopPhase = 3
+            }
+        case 3:
+            let t = now - loopPlayStart
+            if let x = loopX("Repro march box") {
+                loopMarchSamples.append((t, x))
+            }
+            if t >= 1.7 {
+                let x = loopMarchSamples.last?.x ?? -999
+                check("restart", x >= 1.4 && x <= 3.1,
+                      String(format: "x@1.7s=%.3f (fresh session: cycle 1 done, cycle 2 under way)", x))
+                finishSnow()
+            }
+        default:
+            break
+        }
+    }
+
+    /// loopmove verdicts: the marched box completes at least
+    /// three full +1.5 m cycles by 4.6 s (0.8 s tween + 0.25 s
+    /// delay per cycle), gliding — never jumping; the spun box
+    /// accumulates at least four 60° cycles (0.5 s at 120°/s +
+    /// 0.4 s delay per cycle).
+    private func emitLoopmoveChecks() {
+        let s = loopMarchSamples
+        guard s.count >= 20 else {
+            check("samples", false, "only \(s.count) samples")
+            return
+        }
+        let finalX = s.last?.x ?? -999
+        check("movecycles", finalX >= 4.4 && finalX <= 7.6,
+              String(format: "finalX=%.3f (>=3 cycles of +1.5 m)", finalX))
+        check("glide", loopMaxStep <= 0.25,
+              String(format: "maxStep=%.3f (a teleporting loop would jump 1.5)", loopMaxStep))
+        let spin = loopSpinTotal.last?.deg ?? -999
+        check("spincycles", spin >= 230 && spin <= 400,
+              String(format: "unwrapped=%.1f deg (>=4 cycles of 60)", spin))
+    }
+
+    /// playernodes verdicts: the player glide lands on the
+    /// eye-rule destination and stays; the camera rotation is
+    /// gradual, lands at +90 and HOLDS it; the audit's own +30
+    /// drag survives untouched (no snap-back); and the Loop ×
+    /// Player Camera composition keeps turning the view at
+    /// ~90° per 1 s cycle.
+    private func emitPlayernodeChecks() {
+        func posNear(_ t0: Double, _ t1: Double) -> Bool {
+            let win = loopPosSamples.filter { $0.t >= t0 && $0.t <= t1 }
+            return !win.isEmpty && win.allSatisfy {
+                abs($0.x - 4) <= 0.06 && abs($0.y - 2.2) <= 0.06
+                    && abs($0.z) <= 0.06
+            }
+        }
+        check("playermove", posNear(1.7, 2.1),
+              "samples=\(loopPosSamples.count) dest=(4, 2.2, 0) by the teleport eye rule")
+        let lastPos = loopPosSamples.last
+        check("playerstays", posNear(9.6, 10.2),
+              "final=\(lastPos.map { "(\($0.x), \($0.y), \($0.z))" } ?? "none")")
+        let mid = loopYawSamples.filter { $0.t >= 2.35 && $0.t <= 2.65 }
+        let midOK = !mid.isEmpty
+            && mid.allSatisfy { $0.deg >= 25 && $0.deg <= 65 }
+        check("camspin", midOK,
+              String(format: "midYaw=%.1f (half of the 90-degree turn)", mid.last?.deg ?? -999))
+        func yawNear(_ t0: Double, _ t1: Double, _ want: Double) -> (Bool, Double) {
+            let win = loopYawSamples.filter { $0.t >= t0 && $0.t <= t1 }
+            guard let last = win.last else { return (false, -999) }
+            return (win.allSatisfy { abs($0.deg - want) <= 5 }, last.deg)
+        }
+        let (rotOK, rotYaw) = yawNear(3.15, 3.5, 90)
+        check("camrotate", rotOK,
+              String(format: "yaw=%.2f want=90", rotYaw))
+        let (dragOK, dragYaw) = yawNear(4.2, 5.2, 120)
+        check("nosnapback", dragOK,
+              String(format: "yaw=%.2f want=120 (node's 90 + the audit's own +30 drag)", dragYaw))
+        let a = loopYawSamples.last { $0.t <= 5.9 }?.deg ?? 0
+        let b = loopYawSamples.last { $0.t <= 9.9 }?.deg ?? 0
+        check("loopcam", b - a >= 250 && b - a <= 430,
+              String(format: "gain=%.1f deg over 4 s (~90 per 1 s cycle)", b - a))
+    }
+
+    /// Save/load audit (both loop variants, pre-Play on the
+    /// pristine project), mirroring the gravity audit's shape:
+    /// the v4.14 graph round-trips through the REAL
+    /// ProjectStore with its Loop nodes, subject params and
+    /// refs intact; a pre-v4.14 file (Loop nodes stripped —
+    /// and, for playernodes, the subject params too, which the
+    /// catalogue default merge then supplies as "Object") still
+    /// loads.
+    private func runLoopSaveLoadChecks() {
+        guard let session else { return }
+        let project = session.project
+        ProjectStore.saveProject(project, thumbnailPNG: nil)
+        let loaded = ProjectStore.loadProject(id: project.id)
+        let nodes = loaded?.scene.graph.nodes ?? []
+        if ReproDriver.variant == "loopmove" {
+            let loops = nodes.filter { $0.kind == "logLoop" }
+            let delays = loops.map { $0.num("delay", -1) }.sorted()
+            let refsOK = loops.allSatisfy { loop in
+                guard let ref = loop.ref("node") else { return false }
+                return nodes.contains { $0.id == ref }
+            }
+            let move = nodes.first { $0.kind == "actMoveTo" }
+            let rotate = nodes.first { $0.kind == "actRotate" }
+            check("saveload",
+                  loaded != nil && loops.count == 2 && refsOK
+                      && delays == [0.25, 0.4]
+                      && move?.num("dx", 0) == 1.5
+                      && move?.txt("subject", "") == "Object"
+                      && rotate?.num("speed", 0) == 120
+                      && rotate?.txt("subject", "") == "Object",
+                  "loops=\(loops.count) delays=\(delays) refsOK=\(refsOK)")
+        } else {
+            let loops = nodes.filter { $0.kind == "logLoop" }
+            let refsOK = loops.allSatisfy { loop in
+                guard let ref = loop.ref("node") else { return false }
+                return nodes.contains { $0.id == ref }
+            }
+            let move = nodes.first { $0.kind == "actMoveTo" }
+            let rotates = nodes.filter { $0.kind == "actRotate" }
+            let targetOK = move.flatMap { $0.ref("target") }
+                .map { id in loaded?.scene.object(id: id) != nil } ?? false
+            check("saveload",
+                  loaded != nil && loops.count == 1 && refsOK && targetOK
+                      && move?.txt("subject", "") == "Player"
+                      && rotates.count == 2
+                      && rotates.allSatisfy { $0.txt("subject", "") == "Player Camera" },
+                  "loops=\(loops.count) refsOK=\(refsOK) targetOK=\(targetOK)")
+        }
+        var legacy = project
+        legacy.id = UUID()
+        let loopIDs = Set(project.scene.graph.nodes
+            .filter { $0.kind == "logLoop" }.map { $0.id })
+        legacy.scene.graph.nodes.removeAll { $0.kind == "logLoop" }
+        legacy.scene.graph.links.removeAll {
+            loopIDs.contains($0.from) || loopIDs.contains($0.to)
+        }
+        if ReproDriver.variant == "playernodes" {
+            for i in legacy.scene.graph.nodes.indices {
+                legacy.scene.graph.nodes[i].params["subject"] = nil
+            }
+        }
+        ProjectStore.saveProject(legacy, thumbnailPNG: nil)
+        let legacyLoaded = ProjectStore.loadProject(id: legacy.id)
+        let legacyLoops = legacyLoaded?.scene.graph.nodes
+            .filter { $0.kind == "logLoop" }.count ?? -1
+        check("legacyload",
+              legacyLoaded != nil && legacyLoops == 0,
+              "loaded=\(legacyLoaded != nil) loopNodes=\(legacyLoops)")
+    }
+
     /// LS-REPRO metrics: computed from the renderer's sim
     /// snapshot. Surface height = support + snow at each
     /// lattice vertex. Emits exactly one REPRO-METRIC line.
@@ -685,8 +1062,12 @@ final class ReproRun {
             handleGravityAudit()
             if finished { return }
         }
+        if isLoopVariant {
+            handleLoopAudit()
+            if finished { return }
+        }
 
-        if !isGravityVariant, !isPerfVariant, crossedA, firstStepCrossed, pumpCount >= 90 {
+        if !isGravityVariant, !isPerfVariant, !isLoopVariant, crossedA, firstStepCrossed, pumpCount >= 90 {
             finished = true
             ReproDriver.marker("settle W=\(a) pumps=\(pumpCount)")
             print("REPRO-DONE")

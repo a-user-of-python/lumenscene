@@ -250,8 +250,8 @@ layer, so the static scene is never rebuilt for animation.
 | Node | Does… | Key parameters |
 |---|---|---|
 | Show / Hide | makes an object appear / disappear | Object |
-| Move Object | tweens an object to a captured destination; its **Arrived** output fires on arrival | Object, destination (captured live), duration |
-| Rotate Object | rotates an object (movement slot) | Object, angle, duration |
+| Move Object | tweens an object to a captured destination; its **Arrived** output fires on arrival. Set **Move** to **Player** and it glides *you* instead — same destination and duration; a To Object destination lands you standing at the target (the same eye rule as Teleport Player) | Move (Object/Player), Object, destination (captured live), duration |
+| Rotate Object | rotates an object (movement slot). Set **Rotate** to **Player Camera** and it turns your view instead — it writes the real look direction, so grabbing the look mid-turn never snaps back | Rotate (Object/Player Camera), Object, angle, duration |
 | Scale Object | grows/shrinks an object to a uniform scale; **Arrived** on completion | Object, scale, duration |
 | Spawn Object | clones an object into the world at another object's position | Source, At object, Lifetime, Offset X/Y/Z, Spawn at Player |
 | Spawn Pattern | clones in a **Grid, Ring, Scatter, or Line** — one batch, reproducible | Source, pattern, Count (≤64), Spacing, Radius, Seed, Random yaw, Offset X/Y/Z, Centre on Player |
@@ -327,6 +327,25 @@ Both spawn nodes take an **Offset** (X/Y/Z, −50…50) so clones land displaced
 | Counter | counts firings; fires **Reached** at the target | Out (each count), Reached |
 | Fire Once | passes the flow exactly once, until its **Reset** input fires | Out, Reset input |
 | Sequence | steps through 2–4 outputs in order, optionally wrapping | Out 1…4, Reset input |
+| Loop | runs the node picked on its card again every time that node finishes — forever, until Play stops | Out (fires once per cycle) |
+
+**Loop, and aiming nodes at the player (v4.14).** Loop is how a
+motion repeats forever: wire any trigger into Loop, pick the node it
+drives on its card — **Move Object**, **Rotate Object**, **Scale
+Object**, or **Follow Object** (in its Once mode) — and set a repeat
+delay if you want a pause between cycles. The driven node needs no
+wire back; Loop listens for it to finish and runs it again. Loop
+stops the moment Play stops and starts fresh next Play. The other
+kinds aren't loopable on purpose: continuous behaviours (Oscillate,
+Chase, Wander, Pulse…) already run until stopped, one-shot actions
+finish instantly (looping one is just a timer — use Timer), and a
+Loop can't drive a Loop. Two compositions to try: **Loop + Move
+Object (Move = Player, By Offset)** starts a fresh glide the moment
+the last one lands, carrying you steadily across a scene; **Loop +
+Rotate Object (Rotate = Player Camera)** keeps your view turning
+forever. A player glide takes over your position while it runs
+(your look stays yours); when it arrives, you walk from where it
+left you.
 
 ### Trigger Areas
 

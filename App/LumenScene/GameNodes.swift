@@ -176,10 +176,12 @@ extension NodeGraph {
 // MARK: - Catalogue
 
 /// How the editor should present one parameter. `objectRef` picks a
-/// scene object, `areaRef` picks a trigger area, `colorText` edits a
-/// "#RRGGBB" string, and `choice` picks from `choices` in the spec.
+/// scene object, `areaRef` picks a trigger area, `nodeRef` picks
+/// another node in the same graph (v4.14, for Loop), `colorText`
+/// edits a "#RRGGBB" string, and `choice` picks from `choices` in
+/// the spec.
 enum NodeParamType {
-    case number, bool, text, objectRef, areaRef, colorText, choice
+    case number, bool, text, objectRef, areaRef, nodeRef, colorText, choice
 }
 
 /// One parameter of a node kind: its storage key, inspector label,
@@ -299,9 +301,15 @@ enum NodeCatalog {
 
         NodeKindSpec(
             kind: "actMoveTo", title: "Move Object", category: "Actions",
-            blurb: "Moves an object to another object, or by an offset, over a few seconds.",
+            blurb: "Moves an object — or the player — to another object, or by an offset, over a few seconds.",
             hasIn: true, outs: ["out", "arrived"],
             params: [
+                // v4.14: "subject" chooses WHAT moves. Absent in
+                // pre-4.14 projects; the catalogue default merge
+                // supplies "Object", so old graphs move objects
+                // exactly as before. "Player" glides the Play
+                // viewpoint instead (the Object field is ignored).
+                NodeParamSpec(key: "subject", label: "Move", type: .choice, def: .text("Object"), choices: ["Object", "Player"]),
                 NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
                 NodeParamSpec(key: "mode", label: "Mode", type: .choice, def: .text("To Object"), choices: ["To Object", "By Offset"]),
                 NodeParamSpec(key: "target", label: "Target Object", type: .objectRef, def: .ref(nil)),
@@ -313,9 +321,14 @@ enum NodeCatalog {
 
         NodeKindSpec(
             kind: "actRotate", title: "Rotate Object", category: "Actions",
-            blurb: "Spins an object at a steady speed; a duration of 0 spins it forever.",
+            blurb: "Spins an object at a steady speed — or turns the player's camera instead. A duration of 0 goes forever.",
             hasIn: true, outs: ["out"],
             params: [
+                // v4.14: "subject" chooses WHAT rotates. Absent in
+                // pre-4.14 projects; the default merge supplies
+                // "Object". "Player Camera" turns the Play view
+                // itself (the Object field is ignored).
+                NodeParamSpec(key: "subject", label: "Rotate", type: .choice, def: .text("Object"), choices: ["Object", "Player Camera"]),
                 NodeParamSpec(key: "object", label: "Object", type: .objectRef, def: .ref(nil)),
                 NodeParamSpec(key: "speed", label: "Speed (°/s)", type: .number, def: .number(45), min: -360, max: 360),
                 NodeParamSpec(key: "duration", label: "Duration (seconds)", type: .number, def: .number(0), min: 0, max: 3600),
@@ -753,6 +766,34 @@ enum NodeCatalog {
                 NodeParamSpec(key: "steps", label: "Steps", type: .number, def: .number(2), min: 2, max: 4),
                 NodeParamSpec(key: "wrap", label: "Wrap Around", type: .bool, def: .bool(true)),
             ]),
+
+        NodeKindSpec(
+            kind: "logLoop", title: "Loop", category: "Logic",
+            blurb: "Runs the chosen node again every time it finishes — forever, until Play stops. Wire a trigger in; the node it drives needs no wire back.",
+            hasIn: true, outs: ["out"],
+            params: [
+                NodeParamSpec(key: "node", label: "Node", type: .nodeRef, def: .ref(nil)),
+                NodeParamSpec(key: "delay", label: "Repeat Delay (seconds)", type: .number, def: .number(0), min: 0, max: 600),
+            ]),
+    ]
+
+    /// v4.14: the node kinds Loop may drive — the time-based
+    /// movers whose run has a definite end the runtime can see:
+    /// Move Object and Scale Object fire "arrived", Follow
+    /// Object fires "arrived" when it completes (its "Once"
+    /// mode), and Rotate Object ends when its duration runs out
+    /// (a duration of 0 already spins forever on its own, so a
+    /// loop simply starts it). Everything else is excluded on
+    /// purpose: continuous behaviours (Oscillate, Chase, Wander,
+    /// Look At, Pulse, Cycle, Applied Gravity) already run until
+    /// stopped, so looping them would mean nothing; one-shot
+    /// actions (Show, Message, Set Variable, …) finish the
+    /// instant they start, so "looping" one is just a timer —
+    /// use Timer or Delay for that; and a Loop may never drive
+    /// another Loop. Shared by the editor's node picker and the
+    /// runtime's activation guard so they can never disagree.
+    static let loopableKinds: Set<String> = [
+        "actMoveTo", "actRotate", "actScaleTo", "actFollowPath",
     ]
 
     /// The spec for a kind string, or nil for an unknown kind (a

@@ -1607,7 +1607,9 @@ final class EditorSession: ObservableObject {
     /// target is a floor point (eye = y + 1.7); from 1.0 to 2.7
     /// the added offset blends linearly down from 1.7 to 0; at or
     /// above 2.7 the target IS the eye. Shared by teleport + pose.
-    private func teleportEyeY(forTargetY y: Double) -> Double {
+    /// v4.14: internal (was private) — GameRuntime's player
+    /// Move Object converts its destination with the same rule.
+    func teleportEyeY(forTargetY y: Double) -> Double {
         if y < 1.0 { return y + 1.7 }
         if y < 2.7 { return y + (2.7 - y) / 1.7 * 1.7 }
         return y

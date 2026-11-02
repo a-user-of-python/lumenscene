@@ -111,6 +111,8 @@ jobs:
               ("perfbench", ["-LSVariant", "perfbench"]),
               ("gravfall", ["-LSVariant", "gravfall"]),
               ("gravstack", ["-LSVariant", "gravstack"]),
+              ("loopmove", ["-LSVariant", "loopmove"]),
+              ("playernodes", ["-LSVariant", "playernodes"]),
               ("toggle-syncas", ["-LSToggle", "syncas"]),
               ("toggle-norefit", ["-LSToggle", "norefit"]),
           ]

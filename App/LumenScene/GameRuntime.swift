@@ -223,11 +223,56 @@ final class GameRuntime {
     private var tweens: [UUID: MoveTween] = [:]   // keyed by object id
 
     private struct RotateState {
+        var nodeID: UUID         // v4.14: Loop watches for the end
         var speed: Double        // degrees / second, may be negative
         var duration: Double     // 0 = forever
         var elapsed: Double
     }
     private var rotations: [UUID: RotateState] = [:]   // keyed by object id
+
+    // MARK: - v4.14: Loop + player-targeted motion
+
+    /// Loop nodes (logLoop) currently cycling: the loop node id,
+    /// and the node it drives (captured at activation, so editing
+    /// the snapshot mid-Play is impossible anyway — the graph is
+    /// a snapshot — but the pairing is what completion watches).
+    private var loopActive: Set<UUID> = []
+    private var loopTargets: [UUID: UUID] = [:]   // loop id -> driven node id
+
+    private struct PendingLoopRefire {
+        var fireTime: Double
+        var loopID: UUID
+    }
+    private var pendingLoopRefires: [PendingLoopRefire] = []
+
+    /// Move Object with Move = Player: a MoveTo tween for the
+    /// Play viewpoint itself. Positions are EYE positions (the
+    /// space playPosition lives in). Written per tick through
+    /// runtimeSetPlayerPose with the live yaw/pitch, so look
+    /// input keeps working during the glide and nothing snaps
+    /// when it ends.
+    private struct PlayerMoveTween {
+        var nodeID: UUID
+        var startPos: SIMD3<Float>
+        var destPos: SIMD3<Float>
+        var duration: Double
+        var elapsed: Double
+    }
+    private var playerTween: PlayerMoveTween? = nil
+
+    /// Rotate Object with Rotate = Player Camera: turns the
+    /// view by advancing camera.playYaw itself — the very field
+    /// the drag-look gesture owns — so the rotation composes
+    /// with (and yields to) the player's own look input instead
+    /// of fighting it, and there is no stored "real" yaw to
+    /// snap back to when it ends.
+    private struct CameraRotateState {
+        var nodeID: UUID
+        var speed: Double        // degrees / second, may be negative
+        var duration: Double     // 0 = forever
+        var elapsed: Double
+    }
+    private var cameraRotation: CameraRotateState? = nil
 
     // MARK: - Trigger queue
 
@@ -425,6 +470,11 @@ final class GameRuntime {
         trackedMaterials = [:]
         tweens = [:]
         rotations = [:]
+        loopActive = []
+        loopTargets = [:]
+        pendingLoopRefires = []
+        playerTween = nil
+        cameraRotation = nil
         movement = [:]
         facing = [:]
         scaleTweens = [:]
@@ -455,6 +505,10 @@ final class GameRuntime {
         guard running else { return false }
         if !tweens.isEmpty || !rotations.isEmpty { return true }
         if !pendingDelays.isEmpty || !timers.isEmpty { return true }
+        // v4.14: player-targeted motion and a pending loop
+        // refire pin the frame loop like their object kin.
+        if playerTween != nil || cameraRotation != nil { return true }
+        if !pendingLoopRefires.isEmpty { return true }
         // F31: an emitting emitter pins the frame loop only while
         // it can still produce something — positive rate, a finite
         // emission window still open, or live particles. (A rate-0
@@ -496,6 +550,7 @@ final class GameRuntime {
 
         fireDueTimers()
         fireDueDelays()
+        fireDueLoopRefires()
         checkAreas(playerPos: playerPos)
         checkProximityAndFall(playerPos: playerPos)
         // v4.2: ONE delivery budget per tick, shared by both
@@ -508,6 +563,8 @@ final class GameRuntime {
 
         advanceTweens(dt: step)
         advanceRotations(dt: step)
+        advancePlayerTween(dt: step)
+        advanceCameraRotation(dt: step)
         advanceMovement(dt: step)
         advanceFacing(dt: step)
         advanceScaleTweens(dt: step)
@@ -623,6 +680,30 @@ final class GameRuntime {
         pendingDelays = kept
     }
 
+    /// v4.14: loop refires whose repeat delay has elapsed run
+    /// their driven node again (and re-fire the Loop's own "out",
+    /// so downstream wiring sees one signal per cycle). A refire
+    /// whose loop stopped being active — Play ended and the
+    /// state was cleared, or the pairing dissolved — drops
+    /// quietly.
+    private func fireDueLoopRefires() {
+        guard !pendingLoopRefires.isEmpty else { return }
+        var kept: [PendingLoopRefire] = []
+        for refire in pendingLoopRefires {
+            if clock >= refire.fireTime {
+                guard loopActive.contains(refire.loopID),
+                      let loopNode = nodesByID[refire.loopID],
+                      let targetID = loopTargets[refire.loopID],
+                      let target = nodesByID[targetID] else { continue }
+                enqueueFire(loopNode.id, "out")
+                execute(target, inputPin: "in")
+            } else {
+                kept.append(refire)
+            }
+        }
+        pendingLoopRefires = kept
+    }
+
     private func checkAreas(playerPos: SIMD3<Float>) {
         guard let session, hasAreaEvents || !insideAreas.isEmpty else { return }
         var current: Set<UUID> = []
@@ -683,6 +764,9 @@ final class GameRuntime {
 
     private func enqueueFire(_ nodeID: UUID, _ pin: String) {
         fireQueue.append((from: nodeID, pin: pin))
+        // v4.14: an "arrived" fire is also a motion completion —
+        // any Loop driving that node schedules its next cycle.
+        if pin == "arrived" { noteMotionCompleted(nodeID: nodeID) }
     }
 
     /// Drains the fire queue: each fire delivers to every link
@@ -813,15 +897,31 @@ final class GameRuntime {
             // instant (duration 0) move's consumers see out ->
             // arrived, matching the tweened path's ordering.
             enqueueFire(node.id, "out")
-            startMoveTo(node)
+            // v4.14: Move = Player glides the viewpoint itself,
+            // with the same destination/duration semantics.
+            if node.txt("subject", "Object") == "Player" {
+                startPlayerMoveTo(node)
+            } else {
+                startMoveTo(node)
+            }
 
         case "actRotate":
-            if let id = node.ref("object") {
+            // v4.14: Rotate = Player Camera turns the view (see
+            // advanceCameraRotation); the Object field is ignored.
+            if node.txt("subject", "Object") == "Player Camera" {
+                // Replace-on-retrigger, like the object slot.
+                cameraRotation = CameraRotateState(
+                    nodeID: node.id,
+                    speed: node.num("speed", 45),
+                    duration: node.num("duration", 0),
+                    elapsed: 0)
+            } else if let id = node.ref("object") {
                 // Slot rule: Rotate is a Facing occupant — starting
                 // it cancels any LookAt on the same object.
                 facing[id] = nil
                 // Replace-on-retrigger: assigning over any old entry.
-                rotations[id] = RotateState(speed: node.num("speed", 45),
+                rotations[id] = RotateState(nodeID: node.id,
+                                            speed: node.num("speed", 45),
                                             duration: node.num("duration", 0),
                                             elapsed: 0)
             }
@@ -901,6 +1001,10 @@ final class GameRuntime {
         case "actTeleport":
             if let targetID = node.ref("target"),
                let target = session.project.scene.object(id: targetID) {
+                // v4.14: a teleport supersedes a player Move
+                // Object glide — otherwise the stale tween would
+                // drag the player back next tick.
+                playerTween = nil
                 let t = currentTransform(of: target)
                 session.runtimeTeleportPlayer(to: SIMD3<Float>(Float(t.position[0]),
                                                                Float(t.position[1]),
@@ -1349,6 +1453,10 @@ final class GameRuntime {
             enqueueFire(node.id, "out")
 
         case "actRespawnPlayer":
+            // v4.14: an absolute pose set supersedes any
+            // in-flight player glide / camera rotation.
+            playerTween = nil
+            cameraRotation = nil
             let pose = checkpointPose ?? playEntryPose
             session.runtimeSetPlayerPose(position: pose.position,
                                          yaw: pose.yaw, pitch: pose.pitch)
@@ -1360,6 +1468,10 @@ final class GameRuntime {
             enqueueFire(node.id, "out")
 
         case "actCutToView":
+            // v4.14: an absolute view set supersedes any
+            // in-flight player glide / camera rotation.
+            playerTween = nil
+            cameraRotation = nil
             let camera = session.project.scene.camera
             let currentPos = SIMD3<Float>(
                 Float(camera.playPosition.count > 0 ? camera.playPosition[0] : 0.0),
@@ -1495,6 +1607,9 @@ final class GameRuntime {
                     sequenceStep[node.id] = step + 1
                 }   // non-wrap: after the last step, inputs drop until reset
             }
+
+        case "logLoop":
+            activateLoop(node)
 
         default:
             // Event nodes (and unknown kinds) are sources, not
@@ -1679,9 +1794,172 @@ final class GameRuntime {
             applyTransform(id, t)
             if state.duration > 0 && state.elapsed >= state.duration {
                 rotations[id] = nil
+                // v4.14: a timed rotation ending is a motion
+                // completion — a Loop driving this node refires.
+                noteMotionCompleted(nodeID: state.nodeID)
             } else {
                 rotations[id] = state
             }
+        }
+    }
+
+    // MARK: - v4.14: Loop + player-targeted motion (advance)
+
+    /// Loop activation: the Loop node starts driving its target
+    /// node directly (the target's own execution IS its "in"
+    /// delivery — no wire back is needed), and from then on
+    /// every completion of that node schedules the next run
+    /// (noteMotionCompleted). A loop already cycling ignores
+    /// further triggers — it is already running forever, and a
+    /// second activation would double-drive the target. With no
+    /// valid target (none picked, deleted, the loop itself, or
+    /// a kind Loop may not drive — see NodeCatalog.loopableKinds)
+    /// the signal simply passes through "out", so downstream
+    /// wiring still works.
+    private func activateLoop(_ node: LogicNode) {
+        guard !loopActive.contains(node.id) else { return }
+        guard let targetID = node.ref("node"),
+              targetID != node.id,
+              let target = nodesByID[targetID],
+              NodeCatalog.loopableKinds.contains(target.kind) else {
+            enqueueFire(node.id, "out")
+            return
+        }
+        loopActive.insert(node.id)
+        loopTargets[node.id] = targetID
+        enqueueFire(node.id, "out")
+        execute(target, inputPin: "in")
+    }
+
+    /// A driven motion finished. Called for every "arrived"
+    /// fire (MoveTo / ScaleTo / FollowPath, object or player)
+    /// and when a timed Rotate ends (advanceRotations /
+    /// advanceCameraRotation). Every active Loop watching the
+    /// finished node schedules exactly one refire at
+    /// clock + its repeat delay (a refire already pending is
+    /// not duplicated). Play exit clears all of this state, so
+    /// nothing can leak into the next session.
+    private func noteMotionCompleted(nodeID: UUID) {
+        guard !loopTargets.isEmpty,
+              let finished = nodesByID[nodeID] else { return }
+        // Follow Object fires "arrived" at every leg in its
+        // PingPong/Loop modes; only a "Once" follow ever truly
+        // completes. (Its Loop mode already loops on its own.)
+        if finished.kind == "actFollowPath",
+           finished.txt("mode", "PingPong") != "Once" { return }
+        for (loopID, targetID) in loopTargets where targetID == nodeID {
+            guard loopActive.contains(loopID),
+                  let loopNode = nodesByID[loopID],
+                  !pendingLoopRefires.contains(where: { $0.loopID == loopID })
+            else { continue }
+            let delay = loopNode.num("delay", 0)
+            pendingLoopRefires.append(PendingLoopRefire(
+                fireTime: clock + (delay.isFinite ? max(0, delay) : 0),
+                loopID: loopID))
+        }
+    }
+
+    /// The player's current eye position, with the same element
+    /// fallbacks the checkpoint/pose code uses (a short
+    /// playPosition array reads as the default Play start).
+    private func currentPlayerEye() -> SIMD3<Float> {
+        guard let session else { return lastPlayerPos }
+        let p = session.project.scene.camera.playPosition
+        return SIMD3<Float>(Float(p.count > 0 ? p[0] : 0.0),
+                            Float(p.count > 1 ? p[1] : 1.7),
+                            Float(p.count > 2 ? p[2] : 3.5))
+    }
+
+    /// Move Object, Move = Player: destination and duration
+    /// mean exactly what they mean for an object. "To Object"
+    /// takes the target's CURRENT position and converts it with
+    /// the session's teleport eye rule (the same rule Teleport
+    /// Player uses), so the player ends standing at the target
+    /// rather than sunk inside it or floating at its centre;
+    /// the offset shifts that stand point. "By Offset" glides
+    /// from the live eye position by the offset. Note the
+    /// player's position has no collision model of its own —
+    /// Play movement writes playPosition directly and eye
+    /// height is locked — so the glide follows the same
+    /// convention: the written path is the path taken.
+    private func startPlayerMoveTo(_ node: LogicNode) {
+        guard let session else { return }
+        let start = currentPlayerEye()
+        let offset = SIMD3<Float>(Float(node.num("dx", 0)),
+                                  Float(node.num("dy", 0)),
+                                  Float(node.num("dz", 0)))
+        let dest: SIMD3<Float>
+        if node.txt("mode", "To Object") != "By Offset",
+           let targetID = node.ref("target"),
+           let target = session.project.scene.object(id: targetID) {
+            let stand = position(of: currentTransform(of: target)) + offset
+            dest = SIMD3<Float>(stand.x,
+                                Float(session.teleportEyeY(forTargetY: Double(stand.y))),
+                                stand.z)
+        } else {
+            dest = start + offset
+        }
+        let duration = node.num("duration", 1)
+        if duration <= 0 {
+            playerTween = nil
+            let camera = session.project.scene.camera
+            session.runtimeSetPlayerPose(position: dest,
+                                         yaw: camera.playYaw,
+                                         pitch: camera.playPitch)
+            enqueueFire(node.id, "arrived")
+        } else {
+            // Replace-on-retrigger, like object tweens (F10):
+            // the replaced glide's "arrived" never fires.
+            playerTween = PlayerMoveTween(nodeID: node.id, startPos: start,
+                                          destPos: dest, duration: duration,
+                                          elapsed: 0)
+        }
+    }
+
+    private func advancePlayerTween(dt: Double) {
+        guard var tween = playerTween, let session else { return }
+        tween.elapsed += dt
+        let raw = min(1, tween.elapsed / tween.duration)
+        // Same smoothstep easing as object MoveTo tweens.
+        let s = raw * raw * (3 - 2 * raw)
+        let pos = tween.startPos + (tween.destPos - tween.startPos) * Float(s)
+        let camera = session.project.scene.camera
+        if raw >= 1 {
+            playerTween = nil
+            session.runtimeSetPlayerPose(position: tween.destPos,
+                                         yaw: camera.playYaw,
+                                         pitch: camera.playPitch)
+            enqueueFire(tween.nodeID, "arrived")
+        } else {
+            playerTween = tween
+            session.runtimeSetPlayerPose(position: pos,
+                                         yaw: camera.playYaw,
+                                         pitch: camera.playPitch)
+        }
+    }
+
+    /// Rotate Object, Rotate = Player Camera: advance the LIVE
+    /// playYaw by speed × dt — read-modify-write of the one
+    /// field the drag-look gesture also owns, through the pose
+    /// funnel with the current position/pitch. Because there is
+    /// no second, stored orientation anywhere, ending the
+    /// rotation (or grabbing the look mid-spin) cannot snap
+    /// back: whatever yaw is current is simply where the view
+    /// is. Mirrors advanceRotations' end condition exactly.
+    private func advanceCameraRotation(dt: Double) {
+        guard var state = cameraRotation, let session else { return }
+        state.elapsed += dt
+        let camera = session.project.scene.camera
+        var yaw = camera.playYaw + state.speed * dt
+        yaw = yaw.truncatingRemainder(dividingBy: 360)
+        if yaw < 0 { yaw += 360 }
+        session.runtimeSetPlayerPose(position: currentPlayerEye(),
+                                     yaw: yaw, pitch: camera.playPitch)
+        if state.duration > 0 && state.elapsed >= state.duration {
+            cameraRotation = nil
+            noteMotionCompleted(nodeID: state.nodeID)
+        } else {
+            cameraRotation = state
         }
     }
 

@@ -428,6 +428,11 @@ struct NodeEditorView: View {
             return s.isEmpty ? "—" : s
         case .ref(let id):
             guard let id else { return "None" }
+            if pspec.type == .nodeRef {
+                guard let target = graph.nodes.first(where: { $0.id == id })
+                else { return "Missing" }
+                return NodeCatalog.spec(target.kind)?.title ?? "Unknown"
+            }
             if pspec.type == .areaRef {
                 return session.project.scene.areas.first { $0.id == id }?.name ?? "Missing"
             }
@@ -561,6 +566,8 @@ struct NodeEditorView: View {
                 refPickerRow(node: node, pspec: pspec, isArea: false, nodeIndex: nodeIndex)
             case .areaRef:
                 refPickerRow(node: node, pspec: pspec, isArea: true, nodeIndex: nodeIndex)
+            case .nodeRef:
+                nodeRefPickerRow(node: node, pspec: pspec, nodeIndex: nodeIndex)
             }
         }
     }
@@ -588,6 +595,57 @@ struct NodeEditorView: View {
             }
         }
         .font(.callout)
+    }
+
+    /// v4.14: the Loop node's driven-node picker. Lists only
+    /// the kinds Loop may drive (NodeCatalog.loopableKinds —
+    /// the same set the runtime enforces), never the Loop node
+    /// itself. Labels carry the driven node's own target
+    /// object where it has one, so two Move Object nodes are
+    /// tellable apart.
+    private func nodeRefPickerRow(node: LogicNode, pspec: NodeParamSpec, nodeIndex: [UUID: LogicNode]) -> some View {
+        let options = graph.nodes.filter {
+            $0.id != node.id && NodeCatalog.loopableKinds.contains($0.kind)
+        }
+        return HStack {
+            Text(pspec.label)
+            Spacer()
+            Menu {
+                Button("None") { setParam(node.id, pspec.key, .ref(nil)) }
+                ForEach(options, id: \.id) { option in
+                    Button(nodeOptionLabel(option)) {
+                        setParam(node.id, pspec.key, .ref(option.id))
+                    }
+                }
+            } label: {
+                HStack {
+                    Text(nodeRefDisplayName(node, pspec, nodeIndex: nodeIndex))
+                    Image(systemName: "chevron.up.chevron.down").font(.caption)
+                }
+            }
+        }
+        .font(.callout)
+    }
+
+    /// "Move Object · Box 2" — catalog title plus the node's own
+    /// object target's name when it picks one, for telling
+    /// same-kind nodes apart in pickers and summaries.
+    private func nodeOptionLabel(_ option: LogicNode) -> String {
+        let title = NodeCatalog.spec(option.kind)?.title ?? "Unknown node"
+        if let spec = NodeCatalog.spec(option.kind),
+           let objectSpec = spec.params.first(where: { $0.type == .objectRef }),
+           let objectID = option.ref(objectSpec.key),
+           let object = session.project.scene.objects.first(where: { $0.id == objectID }) {
+            return "\(title) · \(object.name)"
+        }
+        return title
+    }
+
+    private func nodeRefDisplayName(_ node: LogicNode, _ pspec: NodeParamSpec,
+                                    nodeIndex: [UUID: LogicNode]) -> String {
+        guard case .ref(let id) = rawParam(node.id, pspec, nodeIndex: nodeIndex),
+              let id, let target = nodeIndex[id] else { return "None" }
+        return nodeOptionLabel(target)
     }
 
     private func linksSection(_ node: LogicNode, nodeIndex: [UUID: LogicNode]) -> some View {

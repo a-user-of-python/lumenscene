@@ -6,7 +6,7 @@
 **A ray-traced 3D scene editor for iPad** — a real Metal hardware
 path tracer you can edit in: any object can become a light, glass
 refracts, rain streaks over ground that gets visibly wetter, and a
-56-kind node system turns scenes into little games.
+57-kind node system turns scenes into little games.
 
 LumenScene targets the iPad Air M3 (2360×1640) and renders with
 Metal's hardware ray tracing: scenes are lit by actual light, not
@@ -77,13 +77,15 @@ image lines._
 
 ### The node system
 
-- **56 node kinds**, wired in a visual editor over named variables:
+- **57 node kinds**, wired in a visual editor over named variables:
   spawn objects and seeded patterns, behaviours (including Chase
   Player), trigger areas with area streaming, checkpoints and
   respawn, weather control, gravity (including an Applied Gravity
   node that makes wired objects fall and land), sequences, physics
   and simple particles (with cloth-like drape), messages and value
-  displays.
+  displays. A **Loop** node re-runs a motion node forever in Play,
+  and Move/Rotate Object can target the **player** and the
+  **player camera**.
 - Trigger areas are invisible zones that group objects for node
   logic — walk into one and the graph reacts.
 
@@ -160,6 +162,7 @@ image lines._
 | 4.11 | 2026-11-02 | Snow rebuilt as a granular physics simulation (mass, density, repose flow) with a physics audit suite — retired on device evidence the same day; the games-standard model is in development as 4.12 |
 | 4.12 | 2026-11-02 | Snow rebuilt on the games-standard model (Red Dead Redemption 2 the named reference): authored drift field, carve-only deformation with a capped edge lip, caked shader coating on objects, glint/sparkle stage; the granular simulation is retired |
 | 4.13 | 2026-11-02 | Applied Gravity node (56 kinds: wired objects fall and land in Play); snow and 3D water removed on device evidence — rain is streaks + flat wetness; app-wide optimisation (weather no longer rebuilds scene geometry) |
+| 4.14 | 2026-11-02 | Loop node (57 kinds) re-runs Move/Rotate/Scale/Follow nodes forever in Play; Move Object can move the player; Rotate Object can turn the player camera (writes through to the real look state — no snap-back) |
 
 Full details in the [Version History](docs/VERSION-HISTORY.md).
 
@@ -193,6 +196,15 @@ crashes get reproduced rather than guessed at:
   support is hidden, and a no-node control never moves; graphs
   using the node save and reload intact, and a graph without
   it (a v4.12-era file) still loads.
+- **Loop / player-node audits** — in-simulator REPRO-CHECK
+  audits: a Loop drives Move Object and Rotate Object through
+  repeated cycles (gliding, never teleporting), stops dead at
+  Play exit and restarts fresh on re-entry; Move Object with
+  Move = Player lands the viewpoint on the exact eye-rule
+  destination; Rotate Object with Rotate = Player Camera
+  turns the view and an audit-applied look drag survives it
+  (no snap-back); a Loop drives the camera rotation forever;
+  graphs round-trip and pre-4.14 files still load.
 - **Performance bench** — a controlled harness variant
   measures frame-tick CPU time at rest in the rain and the
   wall time of geometry-edit rebuilds (host CPU numbers,
@@ -224,7 +236,7 @@ App/
     ModelImport.swift         ModelIO import (STL/OBJ/USD/USDZ)
     Textures.swift            procedural PBR texture sets
     TextureDesigner.swift     the Texture Designer
-    GameNodes.swift           node definitions (56 kinds)
+    GameNodes.swift           node definitions (57 kinds)
     NodeEditorView.swift      the visual node editor
     GameRuntime.swift         node runtime, particles, areas
     PlayerModel.swift         the procedural humanoid player
