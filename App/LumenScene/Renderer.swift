@@ -61,7 +61,7 @@ struct GPUUniforms {
     var maxBounces: UInt32 = 5
     var triCount: UInt32 = 0
     var emissiveCount: UInt32 = 0
-    var totalEmissiveArea: Float = 0
+    var totalEmissiveArea: Float = 0   // v4.15: carries the light-selection weight total W = sum(area x lum(Le)); the kernel divides by the picked light's luminance. Name/layout unchanged from the Metal mirror.
     var envIntensity: Float = 1
     var historyCap: Float = 768
     var glassRefractBudget: UInt32 = 4
@@ -74,7 +74,7 @@ struct GPUUniforms {
     var freezeFrac: Float = 0  // v4.7: puddle freeze fraction 0...1 (tail field; mirrors Shaders.metal Uniforms)
     var waterReflScale: Float = 1  // v4.8: water reflection resolution (tail; mirrors Uniforms)
     var frameCounter: UInt32 = 0   // v4.8: rotating reflection pattern (tail; mirrors Uniforms)
-    var reflPad: UInt32 = 0
+    var traceFlags: UInt32 = 0     // v4.15 (was reflPad; layout unchanged): bit0 adaptive variance gate, bit1 track sample moments — live path only
 }
 
 /// v4.8: parameters for the weather simulation kernels (mirrors
@@ -245,7 +245,7 @@ final class Renderer {
     private var emisCDFBuffer: MTLBuffer?
     private var triCount: Int = 0
     private var emissiveCount: Int = 0
-    private var totalEmissiveArea: Float = 0
+    private var totalEmissiveWeight: Float = 0   // v4.15: W = sum(area x lum(Le)) over the active emissive set (was an area total pre-v4.15)
 
     // MARK: - v4.9 optimisation state
     //
@@ -416,7 +416,7 @@ final class Renderer {
     /// geometry+materials are untouched since that scan; full
     /// rebuilds and material-only updates rescan and refill it.
     private var cachedStaticEmisTris: [UInt32] = []
-    private var cachedStaticEmisAreas: [Float] = []
+    private var cachedStaticEmisWeights: [Float] = []
     private var cachedStaticEmisCentroids: [SIMD3<Float>] = []
     private var staticEmisCacheValid: Bool = false
     /// v4.1 (F11): unified emissive id -> index in the full
@@ -426,15 +426,15 @@ final class Renderer {
 
     // v4 light culling: full emissive set + culled set. The
     // active pair is what emisTriBuffer/emisCDFBuffer and
-    // emissiveCount/totalEmissiveArea currently describe.
+    // emissiveCount/totalEmissiveWeight currently describe.
     private var fullEmisTris: [UInt32] = []
     private var fullEmisCDF: [Float] = []
-    private var fullEmisAreas: [Float] = []
+    private var fullEmisWeights: [Float] = []
     private var fullEmisCentroids: [SIMD3<Float>] = []
-    private var fullTotalEmissiveArea: Float = 0
+    private var fullTotalEmissiveWeight: Float = 0
     private var culledEmisTris: [UInt32] = []
     private var culledEmisCDF: [Float] = []
-    private var culledTotalEmissiveArea: Float = 0
+    private var culledTotalEmissiveWeight: Float = 0
     private var cullingActive: Bool = false
     private var lastCullCamera: CameraBasis?
     private var lastCullTime: CFTimeInterval = 0
@@ -506,6 +506,11 @@ final class Renderer {
     // (rgba16F, denoise guide). `displayTex` is the single
     // (non-ping-ponged) denoise output the tonemap can read.
     private var accumTex: [MTLTexture?] = [nil, nil]
+    // v4.15: per-pixel sample moments (ΣL, ΣL² of sample
+    // luminance) paired with accumTex — the variance gate's
+    // state. Buffers (not textures) since they must be zeroed
+    // by blit fill, not render clears.
+    private var momentBufs: [MTLBuffer?] = [nil, nil]
     private var guideTex: [MTLTexture?] = [nil, nil]
     private var guideNormalTex: [MTLTexture?] = [nil, nil]
     private var displayTex: MTLTexture?
@@ -1328,7 +1333,7 @@ final class Renderer {
         let savedCullCamera = lastCullCamera
         let savedCullTime = lastCullTime
         var emisTris: [UInt32] = []
-        var emisAreas: [Float] = []
+        var emisWeights: [Float] = [] // v4.15: area x luminance(Le) — the light-selection weight
         var emisCentroids: [SIMD3<Float>] = []
         if rescanStatic || !staticEmisCacheValid {
             if triCount > 0 {
@@ -1342,18 +1347,22 @@ final class Renderer {
                     let area = 0.5 * simd_length(simd_cross(p1 - p0, p2 - p0))
                     if area > 1e-9 {
                         emisTris.append(UInt32(t))
-                        emisAreas.append(area)
+                        // v4.15: selection weight = area x
+                        // luminance of the emitted radiance (the
+                        // SAME weights the kernel divides by).
+                        let le = SIMD3<Float>(m.emissive.x, m.emissive.y, m.emissive.z) * m.emissive.w
+                        emisWeights.append(area * (le.x * 0.2126 + le.y * 0.7152 + le.z * 0.0722))
                         emisCentroids.append((p0 + p1 + p2) / 3)
                     }
                 }
             }
             cachedStaticEmisTris = emisTris
-            cachedStaticEmisAreas = emisAreas
+            cachedStaticEmisWeights = emisWeights
             cachedStaticEmisCentroids = emisCentroids
             staticEmisCacheValid = true
         } else {
             emisTris = cachedStaticEmisTris
-            emisAreas = cachedStaticEmisAreas
+            emisWeights = cachedStaticEmisWeights
             emisCentroids = cachedStaticEmisCentroids
         }
         var dynEmis = 0
@@ -1373,7 +1382,8 @@ final class Renderer {
                     let area = 0.5 * simd_length(simd_cross(p1 - p0, p2 - p0))
                     if area > 1e-9 {
                         emisTris.append(UInt32(triCount + dt))
-                        emisAreas.append(area)
+                        let le = SIMD3<Float>(m.emissive.x, m.emissive.y, m.emissive.z) * m.emissive.w
+                        emisWeights.append(area * (le.x * 0.2126 + le.y * 0.7152 + le.z * 0.0722))
                         emisCentroids.append((p0 + p1 + p2) / 3)
                         dynEmis += 1
                     }
@@ -1383,12 +1393,12 @@ final class Renderer {
         dynEmissiveTriCount = dynEmis
         var cdf: [Float] = []
         var acc: Float = 0
-        for a in emisAreas { acc += a; cdf.append(acc) }
+        for w in emisWeights { acc += w; cdf.append(acc) }
         fullEmisTris = emisTris
         fullEmisCDF = cdf
-        fullEmisAreas = emisAreas
+        fullEmisWeights = emisWeights
         fullEmisCentroids = emisCentroids
-        fullTotalEmissiveArea = acc
+        fullTotalEmissiveWeight = acc
         // v4.1 (F11): unified-id -> full-set index map for
         // flushDynamic's centroid refresh.
         var indexByID: [UInt32: Int] = [:]
@@ -1405,14 +1415,14 @@ final class Renderer {
             let culled = computeCulledSet(camera: cam)
             culledEmisTris = culled.tris
             culledEmisCDF = culled.cdf
-            culledTotalEmissiveArea = culled.total
+            culledTotalEmissiveWeight = culled.total
             lastCullCamera = cam
             lastCullTime = savedCullTime
             activateCulledEmissive()
         } else {
             culledEmisTris = []
             culledEmisCDF = []
-            culledTotalEmissiveArea = 0
+            culledTotalEmissiveWeight = 0
             cullingActive = false
             lastCullCamera = nil
             lastCullTime = 0
@@ -1423,7 +1433,7 @@ final class Renderer {
     /// Point the active emissive buffers/counts at one set.
     private func applyEmissiveSet(tris: [UInt32], cdf: [Float], total: Float) {
         emissiveCount = tris.count
-        totalEmissiveArea = total
+        totalEmissiveWeight = total
         emisTriBuffer = makeBuffer(tris)
         emisCDFBuffer = makeBuffer(cdf)
     }
@@ -1433,14 +1443,14 @@ final class Renderer {
     private func restoreFullEmissive() {
         cullingActive = false
         applyEmissiveSet(tris: fullEmisTris, cdf: fullEmisCDF,
-                         total: fullTotalEmissiveArea)
+                         total: fullTotalEmissiveWeight)
     }
 
     /// Re-activate the stored culled set (used around stills).
     private func activateCulledEmissive() {
         cullingActive = true
         applyEmissiveSet(tris: culledEmisTris, cdf: culledEmisCDF,
-                         total: culledTotalEmissiveArea)
+                         total: culledTotalEmissiveWeight)
     }
 
     /// Compute the culled CDF for a camera: keep every emissive
@@ -1464,7 +1474,7 @@ final class Renderer {
             }
             if keep {
                 tris.append(fullEmisTris[i])
-                acc += fullEmisAreas[i]
+                acc += fullEmisWeights[i]
                 cdf.append(acc)
             }
         }
@@ -3019,7 +3029,7 @@ final class Renderer {
             if culled.tris != culledEmisTris {
                 culledEmisTris = culled.tris
                 culledEmisCDF = culled.cdf
-                culledTotalEmissiveArea = culled.total
+                culledTotalEmissiveWeight = culled.total
                 activateCulledEmissive()
             }
         }
@@ -3222,6 +3232,17 @@ final class Renderer {
         }
     }
 
+    /// v4.15: zero a sample-moments buffer (blit fill — moments
+    /// live in a buffer, not a renderable texture, so a render
+    /// clear cannot reach them). Called wherever the matching
+    /// accumulation is cleared, so the variance gate never reads
+    /// moments from a previous frame's pixel.
+    private func clearMoments(_ buffer: MTLBuffer?, cmd: MTLCommandBuffer) {
+        guard let buffer, let blit = cmd.makeBlitCommandEncoder() else { return }
+        blit.fill(buffer: buffer, range: 0..<buffer.length, value: 0)
+        blit.endEncoding()
+    }
+
     // MARK: Adaptive quality
 
     private struct FrameTargets {
@@ -3309,7 +3330,7 @@ final class Renderer {
         u.maxBounces = bounces
         u.triCount = UInt32(triCount)
         u.emissiveCount = UInt32(emissiveCount)
-        u.totalEmissiveArea = totalEmissiveArea
+        u.totalEmissiveArea = totalEmissiveWeight
         u.envIntensity = envIntensity
         u.historyCap = cap
         u.glassRefractBudget = glassBudget
@@ -3370,6 +3391,7 @@ final class Renderer {
 
     private func encodeReproject(prevAccum: MTLTexture, prevGuide: MTLTexture,
                                  curGuide: MTLTexture, curAccum: MTLTexture,
+                                 prevMoments: MTLBuffer, curMoments: MTLBuffer,
                                  reuseCap: Float, cmd: MTLCommandBuffer) -> Bool {
         guard let reprojectPipeline, let prevCamera,
               let enc = cmd.makeComputeCommandEncoder() else { return false }
@@ -3378,6 +3400,8 @@ final class Renderer {
         enc.setTexture(prevGuide, index: 1)
         enc.setTexture(curGuide, index: 2)
         enc.setTexture(curAccum, index: 3)
+        enc.setBuffer(prevMoments, offset: 0, index: 1)
+        enc.setBuffer(curMoments, offset: 0, index: 2)
         var u = ReprojUniforms()
         u.prevOrigin = SIMD4<Float>(prevCamera.origin, 0)
         u.prevRight = SIMD4<Float>(prevCamera.right, 0)
@@ -3396,7 +3420,9 @@ final class Renderer {
     private func encodeTrace(accum: MTLTexture, camera: CameraBasis,
                              count: Int, seedStart: UInt32,
                              bounces: UInt32, cap: Float, glassBudget: UInt32,
-                             cmd: MTLCommandBuffer) -> Bool {
+                             cmd: MTLCommandBuffer,
+                             momentBuffer: MTLBuffer? = nil,
+                             traceFlags: UInt32 = 0) -> Bool {
         // v4.1 (N1): the road arrays are NOT a gate on tracing —
         // a missing road array binds the dummy array instead.
         // The dummy is never sampled: roadsAvailable is
@@ -3436,16 +3462,37 @@ final class Renderer {
         enc.setBuffer(emisCDFBuffer, offset: 0, index: 9)
         enc.setAccelerationStructure(accel, bufferIndex: 10)
         bindDynamicBuffers(enc)
+        // v4.15: per-pixel sample moments at buffer(18) — the
+        // live path binds the frame's moments; stills and the
+        // Final Render pass no buffer + flags 0, and a dummy is
+        // bound so the kernel's argument is always valid (the
+        // kernel touches it only when the flags say so).
+        let momentsBind = momentBuffer ?? dummyMomentBuffer()
+        enc.setBuffer(momentsBind, offset: 0, index: 18)
         let aspect = Float(accum.width) / Float(max(accum.height, 1))
         for i in 0..<count {
             var u = uniforms(camera: camera, aspect: aspect,
                              seed: seedStart + UInt32(i),
                              bounces: bounces, cap: cap, glassBudget: glassBudget)
+            u.traceFlags = traceFlags
             enc.setBytes(&u, length: MemoryLayout<GPUUniforms>.stride, index: 0)
             dispatch(enc, pipeline: tracePipeline, width: accum.width, height: accum.height)
         }
         enc.endEncoding()
         return true
+    }
+
+    /// One tiny shared buffer satisfying the trace kernel's
+    /// moments argument when moments are not tracked (stills,
+    /// Final Render — the kernel never reads or writes it with
+    /// traceFlags == 0).
+    private var dummyMomentStorage: MTLBuffer?
+    private func dummyMomentBuffer() -> MTLBuffer? {
+        if let b = dummyMomentStorage { return b }
+        let b = device.makeBuffer(length: MemoryLayout<SIMD2<Float>>.stride,
+                                  options: [.storageModePrivate])
+        dummyMomentStorage = b
+        return b
     }
 
     /// Spatial denoise of the current accumulation into the
@@ -3649,7 +3696,7 @@ final class Renderer {
                     let changed = culled.tris != activeTris
                     culledEmisTris = culled.tris
                     culledEmisCDF = culled.cdf
-                    culledTotalEmissiveArea = culled.total
+                    culledTotalEmissiveWeight = culled.total
                     activateCulledEmissive()
                     if changed { resetAccumulation() }
                 }
@@ -3690,6 +3737,10 @@ final class Renderer {
             guideNormalTex = [makeGuideNormalTexture(width: pixelW, height: pixelH),
                               makeGuideNormalTexture(width: pixelW, height: pixelH)]
             displayTex = makeAccumTexture(width: pixelW, height: pixelH)
+            momentBufs = [device.makeBuffer(length: pixelW * pixelH * MemoryLayout<SIMD2<Float>>.stride,
+                                            options: [.storageModePrivate]),
+                          device.makeBuffer(length: pixelW * pixelH * MemoryLayout<SIMD2<Float>>.stride,
+                                            options: [.storageModePrivate])]
             historyValid = false
             sampleCount = 0
         }
@@ -3751,7 +3802,7 @@ final class Renderer {
             }
             let camMoved = prevCamera.map { cameraChanged($0, camera) } ?? true
             if historyValid, let prevAccum = accumTex[src], let prevGuide = guideTex[src],
-               prevCamera != nil {
+               prevCamera != nil, let prevMom = momentBufs[src], let curMom = momentBufs[dst] {
                 var reuse = t.reuseCap
                 if let pc = prevCamera {
                     let dOrigin = simd_length(camera.origin - pc.origin)
@@ -3767,6 +3818,7 @@ final class Renderer {
                 }
                 _ = encodeReproject(prevAccum: prevAccum, prevGuide: prevGuide,
                                     curGuide: curGuide, curAccum: curAccum,
+                                    prevMoments: prevMom, curMoments: curMom,
                                     reuseCap: reuse, cmd: cmd)
                 if wasMoving && !moving {
                     // Settle bookkeeping: per-pixel history after
@@ -3775,6 +3827,7 @@ final class Renderer {
                 }
             } else {
                 clearAccum(curAccum, cmd: cmd)
+                clearMoments(momentBufs[dst], cmd: cmd)
                 sampleCount = 0
             }
             // Trace more samples unless settled and the camera
@@ -3783,10 +3836,15 @@ final class Renderer {
             // tier's spp): precipitation frames keep refreshing
             // the wet/snow shading instead of freezing.
             if moving || camMoved || sampleCount < t.maxSettle || weatherMode != 0 {
+                // v4.15: the live path is the ONLY one that sets
+                // traceFlags — per-pixel moments are tracked and
+                // the variance gate may retire converged pixels.
+                // Stills / Final Render call encodeTrace without
+                // them and trace exactly as pre-v4.15.
                 if encodeTrace(accum: curAccum, camera: camera, count: t.spp,
                                seedStart: frameSeedCounter, bounces: t.bounces,
                                cap: Float(t.maxSettle), glassBudget: t.glassBudget,
-                               cmd: cmd) {
+                               cmd: cmd, momentBuffer: momentBufs[dst], traceFlags: 3) {
                     traced = true
                     lastTracedWet = weatherWet
                     sampleCount += UInt32(t.spp)
@@ -3808,6 +3866,7 @@ final class Renderer {
             curIdx = src
         } else if !historyValid {
             clearAccum(curAccum, cmd: cmd)
+            clearMoments(momentBufs[dst], cmd: cmd)
             historyValid = true // empty scene is now presented
             sampleCount = 0
         }
@@ -4370,6 +4429,10 @@ final class Renderer {
         -> (wallMs: Double, regions: [Double], overall: Double)? {
         flushPendingStaticBuild()
         flushMaterialTable()
+        // Diagnostics: name the resource encodeTrace is
+        // missing, if any, in the repro log (this print is how
+        // the CI simulator's missing ray-tracing support was
+        // identified in v4.15 development).
         print("AUDIT-PREP accel=\(accel != nil) pipe=\(tracePipeline != nil) "
               + "pos=\(posBuffer != nil) nrm=\(nrmBuffer != nil) uv=\(uvBuffer != nil) "
               + "col=\(colBuffer != nil) idx=\(idxBuffer != nil) triMat=\(triMatBuffer != nil) "
@@ -4438,6 +4501,139 @@ final class Renderer {
             totCnt += regionCnt[i]
         }
         return (wallMs, regions, totCnt > 0 ? totSum / totCnt : 0)
+    }
+
+    /// v4.15 audit support: read an audit accumulation back to
+    /// CPU arrays (rgb sums + alpha), Float16-decoded.
+    private func auditReadAccum(_ accum: MTLTexture, width: Int, height: Int)
+        -> (rgb: [Float], alpha: [Float])? {
+        let byteCount = width * height * 8
+        guard let buf = device.makeBuffer(length: byteCount,
+                                          options: .storageModeShared),
+              let bcmd = queue.makeCommandBuffer(),
+              let blit = bcmd.makeBlitCommandEncoder() else { return nil }
+        blit.copy(from: accum,
+                  sourceSlice: 0, sourceLevel: 0,
+                  sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: width, height: height, depth: 1),
+                  to: buf, destinationOffset: 0,
+                  destinationBytesPerRow: width * 8,
+                  destinationBytesPerImage: byteCount)
+        blit.endEncoding()
+        bcmd.commit()
+        bcmd.waitUntilCompleted()
+        let base = buf.contents().bindMemory(to: Float16.self,
+                                             capacity: width * height * 4)
+        var rgb = [Float](repeating: 0, count: width * height * 3)
+        var alpha = [Float](repeating: 0, count: width * height)
+        for i in 0..<(width * height) {
+            rgb[3 * i] = Float(base[4 * i])
+            rgb[3 * i + 1] = Float(base[4 * i + 1])
+            rgb[3 * i + 2] = Float(base[4 * i + 2])
+            alpha[i] = Float(base[4 * i + 3])
+        }
+        return (rgb, alpha)
+    }
+
+    /// v4.15 audit: LIVE-path convergence race for the adaptive
+    /// sampling claim. Traces one sample per dispatch into a
+    /// fresh accumulation with the audit's own moments buffer,
+    /// checking every 25 dispatches how many pixels satisfy the
+    /// SAME rule the variance gate uses (n >= 32 and standard
+    /// error <= 2% of the mean + 0.0015). Stops at 95%
+    /// converged or 400 dispatches. `adaptive: false` runs the
+    /// identical path with the gate disabled (moments still
+    /// tracked) — the honest A/B. Returns wall time, dispatches
+    /// used, the converged fraction, and the 6x4 region means.
+    func renderAuditLive(camera: CameraBasis, width: Int, height: Int,
+                         adaptive: Bool)
+        -> (wallMs: Double, dispatches: Int, convergedFrac: Double, regions: [Double])? {
+        flushPendingStaticBuild()
+        flushMaterialTable()
+        print("AUDIT-PREP-LIVE accel=\(accel != nil) pipe=\(tracePipeline != nil) "
+              + "emisT=\(emisTriBuffer != nil) emisC=\(emisCDFBuffer != nil) "
+              + "texA=\(texAlbedo != nil) wf=\(weatherFieldTex != nil) "
+              + "triCount=\(triCount) emisCount=\(emissiveCount)")
+        fflush(stdout)
+        guard width > 0, height > 0,
+              let accum = makeAccumTexture(width: width, height: height),
+              let moments = device.makeBuffer(
+                length: width * height * MemoryLayout<SIMD2<Float>>.stride,
+                options: .storageModeShared)
+        else { return nil }
+        memset(moments.contents(), 0, moments.length)
+        let wasCulling = cullingActive
+        if wasCulling { restoreFullEmissive() }
+        defer { if wasCulling { activateCulledEmissive() } }
+        guard let cmd0 = queue.makeCommandBuffer() else { return nil }
+        clearAccum(accum, cmd: cmd0)
+        cmd0.commit()
+        cmd0.waitUntilCompleted()
+        let flags: UInt32 = adaptive ? 3 : 2
+        var dispatches = 0
+        var convergedFrac = 0.0
+        let t0 = CACurrentMediaTime()
+        while dispatches < 400 {
+            guard let cmd = queue.makeCommandBuffer(),
+                  encodeTrace(accum: accum, camera: camera, count: 1,
+                              seedStart: UInt32(dispatches), bounces: 5,
+                              cap: 768, glassBudget: 4, cmd: cmd,
+                              momentBuffer: moments, traceFlags: flags)
+            else { return nil }
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            dispatches += 1
+            if dispatches % 25 == 0 {
+                convergedFrac = auditConvergedFraction(accum: accum, moments: moments,
+                                                        width: width, height: height)
+                if convergedFrac >= 0.95 { break }
+            }
+        }
+        let wallMs = (CACurrentMediaTime() - t0) * 1000
+        guard let read = auditReadAccum(accum, width: width, height: height)
+        else { return nil }
+        let cols = 6, rows = 4
+        var regionSum = [Double](repeating: 0, count: cols * rows)
+        var regionCnt = [Double](repeating: 0, count: cols * rows)
+        for y in 0..<height {
+            let r = min(y * rows / height, rows - 1)
+            for x in 0..<width {
+                let c = min(x * cols / width, cols - 1)
+                let i = y * width + x
+                let a = Double(read.alpha[i])
+                guard a > 0.5 else { continue }
+                let lum = (0.2126 * Double(read.rgb[3 * i])
+                           + 0.7152 * Double(read.rgb[3 * i + 1])
+                           + 0.0722 * Double(read.rgb[3 * i + 2])) / a
+                regionSum[r * cols + c] += lum
+                regionCnt[r * cols + c] += 1
+            }
+        }
+        var regions: [Double] = []
+        for i in 0..<(cols * rows) {
+            regions.append(regionCnt[i] > 0 ? regionSum[i] / regionCnt[i] : 0)
+        }
+        return (wallMs, dispatches, convergedFrac, regions)
+    }
+
+    /// Fraction of pixels meeting the variance gate's rule,
+    /// computed from an audit accumulation + its moments.
+    private func auditConvergedFraction(accum: MTLTexture, moments: MTLBuffer,
+                                        width: Int, height: Int) -> Double {
+        guard let read = auditReadAccum(accum, width: width, height: height)
+        else { return 0 }
+        let mp = moments.contents().bindMemory(to: SIMD2<Float>.self,
+                                                capacity: width * height)
+        var conv = 0
+        for i in 0..<(width * height) {
+            let n = Double(read.alpha[i])
+            guard n >= 32 else { continue }
+            let m = mp[i]
+            let mean = Double(m.x) / n
+            let varL = max(0.0, Double(m.y) / n - mean * mean)
+            if sqrt(varL / n) <= 0.02 * mean + 0.0015 { conv += 1 }
+        }
+        return Double(conv) / Double(width * height)
     }
 
     // MARK: Picking (CPU raycast over the merged world triangles)

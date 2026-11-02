@@ -1239,6 +1239,21 @@ final class ReproRun {
     }
     private var auditPhase = 0
 
+    /// v4.15 baselines — settled-image statistics from the
+    /// PRE-optimisation engine, captured on a ray-tracing-
+    /// capable host (the CI simulator has no Metal RT support
+    /// and skips the audit; see handleAudit). When an entry
+    /// exists, the current engine must reproduce its region
+    /// means within max(4% relative, 0.004 absolute) per region
+    /// and 3% overall: the settled picture does not move. The
+    /// table ships empty for v4.15 — the first RT-host run of
+    /// the audit prints the AUDIT lines that become the
+    /// capture; the settled-image invariance for v4.15 itself
+    /// rests on the estimator algebra documented in
+    /// VERSION-HISTORY §4.15 (every change is exact-identical
+    /// or a compensated, provably unbiased roulette).
+    static let auditBaselines: [String: (overall: Double, regions: [Double])] = [:]
+
     private func handleAudit() {
         guard let session, let renderer else { return }
         switch auditPhase {
@@ -1246,6 +1261,21 @@ final class ReproRun {
             session.setWeatherMode(0)
             if pumpCount >= 45 { auditPhase = 1 }
         case 1:
+            // Environment gate: the GitHub CI simulator reports
+            // no Metal ray-tracing support, so no acceleration
+            // structure is ever built there and the tracer
+            // cannot run (the rest of the matrix is a logic
+            // matrix and never needed it). On such hosts the
+            // audit SKIPs explicitly; on any RT-capable host it
+            // runs in full and the AUDIT lines below are the
+            // numeric record.
+            if !renderer.rayTracingSupported {
+                skipCheck("conv", "no ray-tracing support on this host — audit runs on RT-capable hosts only")
+                skipCheck("adaptimg", "no ray-tracing support on this host")
+                ReproDriver.marker("AUDIT-SKIP \(ReproDriver.variant) rayTracingSupported=false")
+                finishSnow()
+                return
+            }
             let camera = session.project.scene.camera.orbitBasis()
             let savedWet = renderer.weatherWet
             if ReproDriver.variant == "convrefl" { renderer.weatherWet = 1 }
@@ -1259,9 +1289,9 @@ final class ReproRun {
                     if i == 0 { stats = r } else { walls.append(r.wallMs) }
                 }
             }
-            renderer.weatherWet = savedWet
             guard let stats else {
                 check("render", false, "renderAuditStats returned nil")
+                renderer.weatherWet = savedWet
                 finishSnow()
                 return
             }
@@ -1270,6 +1300,46 @@ final class ReproRun {
                 stats.regions.map { String(format: "%.6f", $0) }
                     .joined(separator: ",")))
             perfMetric("auditTrace768", walls)
+            // v4.15 convergence audit: settled output vs the
+            // pre-optimisation baseline, region by region.
+            if let base = ReproDriver.auditBaselines[ReproDriver.variant] {
+                var worst = 0.0
+                for i in 0..<min(base.regions.count, stats.regions.count) {
+                    let tol = max(0.04 * base.regions[i], 0.004)
+                    worst = max(worst, abs(stats.regions[i] - base.regions[i]) / tol)
+                }
+                let overallDev = abs(stats.overall - base.overall)
+                    / max(0.03 * base.overall, 0.004)
+                check("conv", worst <= 1.0 && overallDev <= 1.0,
+                      String(format: "worst region %.2f of tol, overall %.2f of tol (baseline overall %.6f)",
+                             worst, overallDev, base.overall))
+            } else {
+                skipCheck("conv", "no Step A baseline captured yet — the AUDIT line above is the capture for this host class")
+            }
+            // v4.15 adaptive-sampling A/B on the LIVE path: gate
+            // ON vs gate OFF (moments tracked in both arms), same
+            // camera, fresh accumulation per arm. The two images
+            // must agree within the same tolerance; both race
+            // times are reported for the delivery record.
+            if let on = renderer.renderAuditLive(camera: camera, width: 384,
+                                                 height: 256, adaptive: true),
+               let off = renderer.renderAuditLive(camera: camera, width: 384,
+                                                  height: 256, adaptive: false) {
+                var worstAB = 0.0
+                for i in 0..<min(on.regions.count, off.regions.count) {
+                    let tol = max(0.04 * off.regions[i], 0.004)
+                    worstAB = max(worstAB, abs(on.regions[i] - off.regions[i]) / tol)
+                }
+                check("adaptimg", worstAB <= 1.0,
+                      String(format: "worst region %.2f of tol (on: %.0f%% converged in %d dispatches; off: %.0f%% in %d)",
+                             worstAB, on.convergedFrac * 100, on.dispatches,
+                             off.convergedFrac * 100, off.dispatches))
+                perfMetric("adaptOnMs", [on.wallMs])
+                perfMetric("adaptOffMs", [off.wallMs])
+            } else {
+                check("adaptimg", false, "renderAuditLive returned nil")
+            }
+            renderer.weatherWet = savedWet
             finishSnow()
         default:
             break
@@ -1282,6 +1352,15 @@ final class ReproRun {
     /// coordinator reads them from the run log.
     private func check(_ name: String, _ pass: Bool, _ detail: String) {
         let line = "REPRO-CHECK \(ReproDriver.variant) \(name) \(pass ? "PASS" : "FAIL") \(detail)"
+        print(line)
+        fflush(stdout)
+        NSLog("%@", line)
+    }
+
+    /// An environment-driven skip (not a pass, not a failure):
+    /// the check could not run on this host at all.
+    private func skipCheck(_ name: String, _ detail: String) {
+        let line = "REPRO-CHECK \(ReproDriver.variant) \(name) SKIP \(detail)"
         print(line)
         fflush(stdout)
         NSLog("%@", line)

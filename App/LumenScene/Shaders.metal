@@ -55,6 +55,31 @@
 //     their bounces toward glossy sheen; snow whitens them and
 //     flattens the shading normal. Precipitation (rain streaks /
 //     snow sprites) is a separate camera-box overlay pass.
+//
+// V4.15 additions (engine optimisation round 2 — every change
+// is expectation-preserving: the settled image converges to
+// the same values, reached with less work):
+//   * Light: emissive triangles are selected for next-event
+//     estimation by area x luminance (importance) instead of
+//     area alone — same integral, far less variance when dim
+//     panels and hot spots share a scene; deep-bounce NEE is
+//     thinned by compensated Russian roulette.
+//   * Reflections: the glossy specular roll gets a
+//     roughness-aware continuation roulette (rough reflections
+//     end early, survivors are compensated), and path Russian
+//     roulette starts one bounce earlier.
+//   * Glass: the reflect/refract decision is taken BEFORE any
+//     texture fetch (a pure glass event never pays for PBR
+//     sampling it cannot use), nested interfaces past the
+//     second crossing face a throughput roulette, and the
+//     Beer-Lambert step is skipped for untinted glass.
+//   * Emissive hits resolve before attribute interpolation
+//     (their radiance needs the material alone).
+//   * Live path only: per-pixel sample moments feed a
+//     variance gate — a pixel whose accumulated mean is
+//     already tight stops consuming samples (stills and the
+//     Final Render never set the flag and trace exactly as
+//     before).
 
 #include <metal_stdlib>
 #include <metal_raytracing>
@@ -72,7 +97,7 @@ struct Uniforms {
     uint maxBounces;
     uint triCount;
     uint emissiveCount;
-    float totalEmissiveArea;
+    float totalEmissiveArea;   // v4.15: the light-selection weight total W = sum(area_i * lum(Le_i)) — the field keeps its name/layout; the NEE estimator divides by the picked light's luminance (see pathTraceKernel)
     float envIntensity;
     float historyCap;          // max effective samples kept per pixel
     uint glassRefractBudget;   // max refraction events per path
@@ -85,7 +110,7 @@ struct Uniforms {
     float freezeFrac;          // v4.7: puddle freeze fraction 0...1 (tail field; mirrors Renderer.swift GPUUniforms)
     float waterReflScale;      // v4.8: water reflection resolution 1.0 / 0.5 / 0.25 (tail; mirrors GPUUniforms)
     uint frameCounter;         // v4.8: per-presented-frame counter for the rotating reflection pattern (tail; mirrors GPUUniforms)
-    uint reflPad;
+    uint traceFlags;           // v4.15 (was reflPad; layout unchanged): bit0 = variance-gated adaptive sampling, bit1 = track per-pixel sample moments. Set ONLY by the live draw path; stills and the Final Render pass 0 and trace exactly as pre-v4.15.
 };
 
 struct Material {
@@ -300,11 +325,40 @@ kernel void pathTraceKernel(
     device const uint* dynIndices [[buffer(15)]],
     device const uint* dynTriMat [[buffer(16)]],
     acceleration_structure<> dynAccel [[buffer(17)]],
+    device float2* moments [[buffer(18)]],
     uint2 pixel [[thread_position_in_grid]])
 {
     uint width = accum.get_width();
     uint height = accum.get_height();
     if (pixel.x >= width || pixel.y >= height) return;
+
+    // v4.15: the previous accumulation is read ONCE, up front —
+    // the variance gate below needs it before tracing, and the
+    // firefly clamp + accumulation at the end reuse the same
+    // registers (this thread is the only writer of this pixel).
+    float4 prevA = accum.read(pixel);
+    // Per-pixel sample moments (sum of sample luminance, sum of
+    // its square), maintained alongside the accumulation in the
+    // live path only (traceFlags bit1). The buffer is bound but
+    // never touched when the flags are clear (stills / Final
+    // Render bind a dummy).
+    float2 momentsIn = float2(0);
+    if (u.traceFlags & 2u) {
+        momentsIn = moments[pixel.y * width + pixel.x];
+        // Variance gate (bit0): a pixel whose accumulated mean
+        // is already tight stops consuming samples. The
+        // threshold is a standard error of 2% of the mean plus
+        // a small absolute floor for near-black pixels; noisy
+        // pixels (glass, reflections, caustic paths) carry
+        // large variance and keep sampling on their own.
+        if ((u.traceFlags & 1u) && prevA.a >= 32.0f) {
+            float n = prevA.a;
+            float meanL = momentsIn.x / n;
+            float varL = momentsIn.y / n - meanL * meanL;
+            float se = sqrt(max(varL, 0.0f) / n);
+            if (se <= 0.02f * meanL + 0.0015f) return;
+        }
+    }
 
     RNG rng;
     uint seedBase = hash32((pixel.y * width + pixel.x) ^ hash32(u.frameSeed * 2654435761u));
@@ -395,7 +449,9 @@ kernel void pathTraceKernel(
             break;
         }
         // Attenuate the segment just travelled inside glass.
-        if (inMedium) {
+        // v4.15: untinted glass (tint exactly 1) has a zero log
+        // and exp(0 * d) is exactly 1 — skip the transcendental.
+        if (inMedium && any(mediumLog != float3(0.0f))) {
             throughput *= exp(mediumLog * hitDist);
         }
 
@@ -406,6 +462,21 @@ kernel void pathTraceKernel(
         device const uint* hIndices = isDynHit ? dynIndices : indices;
         device const uint* hTriMat = isDynHit ? dynTriMat : triMat;
         uint tri = primID;
+        Material mat = materials[hTriMat[tri]];
+        // ---- Emissive surface: it's a light. Count it when the path
+        // arrived specularly (or from the camera); diffuse paths were
+        // already lit by next-event estimation below.
+        // v4.15: resolved BEFORE the attribute interpolation —
+        // the emissive contribution needs the material alone, so
+        // an emissive hit no longer pays for the 33-float
+        // interpolation (in light-heavy scenes, emissive hits
+        // are a large share of all hits).
+        if (mat.flags & FLAG_EMISSIVE) {
+            if (prevSpecular) {
+                radiance += throughput * mat.emissive.rgb * mat.emissive.a;
+            }
+            break;
+        }
         uint i0 = hIndices[3 * tri], i1 = hIndices[3 * tri + 1], i2 = hIndices[3 * tri + 2];
         float3 p0 = float3(hPositions[3 * i0], hPositions[3 * i0 + 1], hPositions[3 * i0 + 2]);
         float3 p1 = float3(hPositions[3 * i1], hPositions[3 * i1 + 1], hPositions[3 * i1 + 2]);
@@ -427,20 +498,76 @@ kernel void pathTraceKernel(
             float2(hUVs[2 * i1], hUVs[2 * i1 + 1]) * bc1 +
             float2(hUVs[2 * i2], hUVs[2 * i2 + 1]) * bc2;
 
-        Material mat = materials[hTriMat[tri]];
         bool front = hitFront;
         float3 ns = front ? nInterp : -nInterp; // shading normal, against the ray
         float3 geoN = normalize(cross(p1 - p0, p2 - p0));
         if (dot(geoN, ns) < 0) geoN = -geoN;
 
-        // ---- Emissive surface: it's a light. Count it when the path
-        // arrived specularly (or from the camera); diffuse paths were
-        // already lit by next-event estimation below.
-        if (mat.flags & FLAG_EMISSIVE) {
-            if (prevSpecular) {
-                radiance += throughput * mat.emissive.rgb * mat.emissive.a;
+        // ---- Glass: reflect / refract with Fresnel. Past the
+        // refraction budget the surface falls through to diffuse
+        // shading (tinted), which bounds transmission cost in
+        // glass-heavy views.
+        // v4.15: the decision is taken BEFORE any texture fetch.
+        // A pure glass event uses only the material's glass
+        // parameters and the interpolated normal — the PBR
+        // sampling below (up to 9 texture reads for triplanar
+        // materials) was pure waste on every glass interface.
+        // The fetch consumes no RNG, so the random stream — and
+        // every downstream value — is identical; only the
+        // fall-through path still pays for textures, exactly as
+        // before.
+        bool glassPath = (mat.flags & FLAG_GLASS) && refracts < u.glassRefractBudget
+                         && rng.nextFloat() < mat.glassParams.x;
+        if (glassPath) {
+            float ior = mat.glassParams.z;
+            float eta = front ? (1.0f / ior) : ior;
+            float f0 = (ior - 1.0f) / (ior + 1.0f);
+            f0 *= f0;
+            float cosT = clamp(dot(-ray.direction, ns), 0.0f, 1.0f);
+            float F = fresnelSchlick(cosT, f0);
+            float3 newDir;
+            if (rng.nextFloat() < F) {
+                newDir = reflect(ray.direction, ns);
+                newDir = jitterDirection(newDir, mat.glassParams.y * 0.45f, rng);
+                if (dot(newDir, ns) < 0) newDir = reflect(ray.direction, ns);
+            } else {
+                newDir = refract(ray.direction, ns, eta);
+                if (dot(newDir, newDir) < 0.001f) { // total internal reflection
+                    newDir = reflect(ray.direction, ns);
+                } else {
+                    newDir = jitterDirection(normalize(newDir), mat.glassParams.y * 0.45f, rng);
+                    // Crossing the boundary toggles the medium;
+                    // the travelled distance is charged at the
+                    // NEXT hit via Beer-Lambert (see loop top).
+                    refracts += 1;
+                    if (front) {
+                        inMedium = true;
+                        mediumLog = log(max(mat.tint.rgb, float3(1e-4f)));
+                    } else {
+                        inMedium = false;
+                    }
+                }
             }
-            break;
+            // v4.15: nested-interface throughput roulette. Once
+            // a path has crossed at least two interfaces, each
+            // further glass continuation survives with
+            // probability q (from the path throughput) and is
+            // compensated by 1/q — the long tail of paths
+            // rattling inside stacked glass stops consuming
+            // intersections for negligible carried light, while
+            // the estimator stays unbiased.
+            if (refracts >= 2u) {
+                float q = clamp(max(throughput.x, max(throughput.y, throughput.z)),
+                                0.05f, 0.95f);
+                if (rng.nextFloat() > q) break;
+                throughput /= q;
+            }
+            float3 off = dot(newDir, geoN) >= 0 ? geoN : -geoN;
+            ray.origin = hitPos + off * 0.0015f;
+            ray.direction = newDir;
+            ray.min_distance = 0.0f;
+            prevSpecular = true;
+            continue;
         }
 
         // ---- Texture fetch
@@ -524,49 +651,6 @@ kernel void pathTraceKernel(
             gloss = max(gloss, wet * 0.85f);
         }
 
-        // ---- Glass: reflect / refract with Fresnel. Past the
-        // refraction budget the surface falls through to diffuse
-        // shading (tinted), which bounds transmission cost in
-        // glass-heavy views.
-        bool glassPath = (mat.flags & FLAG_GLASS) && refracts < u.glassRefractBudget
-                         && rng.nextFloat() < mat.glassParams.x;
-        if (glassPath) {
-            float ior = mat.glassParams.z;
-            float eta = front ? (1.0f / ior) : ior;
-            float f0 = (ior - 1.0f) / (ior + 1.0f);
-            f0 *= f0;
-            float cosT = clamp(dot(-ray.direction, ns), 0.0f, 1.0f);
-            float F = fresnelSchlick(cosT, f0);
-            float3 newDir;
-            if (rng.nextFloat() < F) {
-                newDir = reflect(ray.direction, ns);
-                newDir = jitterDirection(newDir, mat.glassParams.y * 0.45f, rng);
-                if (dot(newDir, ns) < 0) newDir = reflect(ray.direction, ns);
-            } else {
-                newDir = refract(ray.direction, ns, eta);
-                if (dot(newDir, newDir) < 0.001f) { // total internal reflection
-                    newDir = reflect(ray.direction, ns);
-                } else {
-                    newDir = jitterDirection(normalize(newDir), mat.glassParams.y * 0.45f, rng);
-                    // Crossing the boundary toggles the medium;
-                    // the travelled distance is charged at the
-                    // NEXT hit via Beer-Lambert (see loop top).
-                    refracts += 1;
-                    if (front) {
-                        inMedium = true;
-                        mediumLog = log(max(mat.tint.rgb, float3(1e-4f)));
-                    } else {
-                        inMedium = false;
-                    }
-                }
-            }
-            float3 off = dot(newDir, geoN) >= 0 ? geoN : -geoN;
-            ray.origin = hitPos + off * 0.0015f;
-            ray.direction = newDir;
-            ray.min_distance = 0.0f;
-            prevSpecular = true;
-            continue;
-        }
         // A glass surface that took the diffuse fall-through (budget
         // spent or transmission roll failed) shades with its tint.
         if (mat.flags & FLAG_GLASS) {
@@ -574,10 +658,29 @@ kernel void pathTraceKernel(
         }
 
         // ---- Diffuse: next-event estimation toward emissive tris.
-        if (u.emissiveCount > 0 && u.totalEmissiveArea > 0.0f) {
+        // v4.15 (light): the pick is IMPORTANCE-weighted — the
+        // CDF is built over area x luminance(Le), so a small hot
+        // light is picked as often as its contribution warrants
+        // instead of drowning among big dim panels (the picked
+        // point's pdf is lum(picked) / W, hence the W / yPick
+        // factor below; the integral estimated is unchanged).
+        // Deep bounces are additionally THINNED: from bounce 2
+        // on, NEE runs with probability pNEE (throughput-driven,
+        // floored at 0.25) and its contribution is scaled by
+        // 1/pNEE — compensated roulette, so the estimator stays
+        // unbiased while weak paths stop paying for shadow rays.
+        float neeScale = 1.0f;
+        bool doNEE = u.emissiveCount > 0 && u.totalEmissiveArea > 0.0f;
+        if (doNEE && bounce >= 2u) {
+            float pNEE = clamp(max(throughput.x, max(throughput.y, throughput.z)) * 1.5f,
+                               0.25f, 1.0f);
+            if (rng.nextFloat() > pNEE) doNEE = false;
+            else neeScale = 1.0f / pNEE;
+        }
+        if (doNEE) {
             float pickU = rng.nextFloat() * u.totalEmissiveArea;
             uint lo = 0, hi = u.emissiveCount;
-            while (lo < hi) { // binary search the area CDF
+            while (lo < hi) { // binary search the weight CDF
                 uint mid = (lo + hi) / 2;
                 if (emissiveCDF[mid] <= pickU) lo = mid + 1; else hi = mid;
             }
@@ -617,8 +720,19 @@ kernel void pathTraceKernel(
                 if (!occluded) {
                     Material em = materials[eTriMat[eLocal]];
                     float3 Le = em.emissive.rgb * em.emissive.a;
-                    radiance += throughput * (albedo / M_PI_F) * Le
-                              * cosS * cosE * u.totalEmissiveArea / d2;
+                    // v4.15: pdf of the sampled point under
+                    // importance selection is yPick / W (W is
+                    // carried in totalEmissiveArea) — divide by
+                    // it. A picked light always has yPick > 0
+                    // (zero-luminance tris have zero CDF weight
+                    // and are unreachable); the guard covers the
+                    // degenerate all-dark table.
+                    float yPick = dot(Le, float3(0.2126f, 0.7152f, 0.0722f));
+                    if (yPick > 1e-6f) {
+                        radiance += throughput * (albedo / M_PI_F) * Le
+                                  * cosS * cosE
+                                  * (u.totalEmissiveArea / yPick) / d2 * neeScale;
+                    }
                 }
             }
         }
@@ -664,14 +778,31 @@ kernel void pathTraceKernel(
                 }
             }
         }
-        throughput *= bounceTint;
+        // v4.15 (reflections): roughness-aware continuation
+        // roulette for the specular roll. A specular bounce
+        // survives with probability qSpec = 0.35 + 0.65 * gloss
+        // and survivors are compensated by 1/qSpec: mirror-like
+        // reflections (gloss near 1) continue almost always,
+        // while rough sheen — whose continuation averages a
+        // wide, dim cone anyway — ends after this hit's own
+        // shading (its next-event estimate above already
+        // landed). Compensated, so the estimator is unbiased.
+        float specSurvive = 1.0f;
+        if (bounceSpecular) {
+            specSurvive = clamp(0.35f + 0.65f * gloss, 0.35f, 1.0f);
+            if (rng.nextFloat() > specSurvive) break;
+        }
+        throughput *= bounceTint / specSurvive;
         ray.origin = hitPos + geoN * 0.0015f;
         ray.direction = newDir;
         ray.min_distance = 0.0f;
         prevSpecular = bounceSpecular;
 
-        // Russian roulette once the path is deep.
-        if (bounce >= 3) {
+        // Russian roulette once the path is deep (v4.15: from
+        // bounce 2, one earlier than before — same throughput
+        // rule, same compensation, so the expectation is
+        // unchanged and weak paths die one event sooner).
+        if (bounce >= 2) {
             float q = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05f, 0.95f);
             if (rng.nextFloat() > q) break;
             throughput /= q;
@@ -683,8 +814,8 @@ kernel void pathTraceKernel(
     // can't blow out a pixel that has otherwise settled. Young
     // pixels (no trustworthy average yet) get a generous fixed
     // cap; a settled pixel's own average is high, so legitimate
-    // bright content is not biased down.
-    float4 prevA = accum.read(pixel);
+    // bright content is not biased down. (v4.15: prevA is the
+    // read taken at the top of the kernel.)
     float capLum;
     if (prevA.a > 0.5f) {
         float3 avg = prevA.rgb / prevA.a;
@@ -709,6 +840,22 @@ kernel void pathTraceKernel(
         a = u.historyCap - 1.0f;
     }
     accum.write(float4(rgb + radiance, a + 1.0f), pixel);
+
+    // v4.15: maintain the sample moments alongside the sum
+    // (live path only). The moving-average decay mirrors the
+    // accumulation's exactly — the sum decays by s, the sum of
+    // squares by s^2 — so the variance gate always estimates
+    // the same window the accumulator holds.
+    if (u.traceFlags & 2u) {
+        float lumS = dot(radiance, float3(0.2126f, 0.7152f, 0.0722f));
+        float2 m = momentsIn;
+        if (prevA.a >= u.historyCap) {
+            float s = (u.historyCap - 1.0f) / u.historyCap;
+            m *= float2(s, s * s);
+        }
+        m += float2(lumS, lumS * lumS);
+        moments[pixel.y * width + pixel.x] = m;
+    }
 }
 
 // MARK: - Guide kernel (primary-hit world positions, for reprojection)
@@ -1031,21 +1178,30 @@ kernel void reprojectKernel(
     texture2d<float, access::read> curGuide [[texture(2)]],
     texture2d<float, access::write> curAccum [[texture(3)]],
     constant ReprojUniforms& u [[buffer(0)]],
+    device const float2* prevMoments [[buffer(1)]],
+    device float2* curMoments [[buffer(2)]],
     uint2 pixel [[thread_position_in_grid]])
 {
     uint width = curGuide.get_width();
     uint height = curGuide.get_height();
     if (pixel.x >= width || pixel.y >= height) return;
+    // v4.15: the sample moments travel with the accumulation —
+    // every branch that zeroes the accumulation zeroes the
+    // moments; the carry branch rescales them with the same
+    // weight ratio (sum by s, sum of squares by s^2).
+    uint midx = pixel.y * width + pixel.x;
 
     float4 g = curGuide.read(pixel);
     if (g.w < 0.5f || u.reuseCap <= 0.0f) {
         curAccum.write(float4(0, 0, 0, 0), pixel);
+        curMoments[midx] = float2(0);
         return;
     }
     float3 rel = g.xyz - u.prevOrigin;
     float z = dot(rel, u.prevForward);
     if (z <= 1e-4f) {
         curAccum.write(float4(0, 0, 0, 0), pixel);
+        curMoments[midx] = float2(0);
         return;
     }
     float x = dot(rel, u.prevRight);
@@ -1057,6 +1213,7 @@ kernel void reprojectKernel(
     float2 uv = ndc * 0.5f + 0.5f;
     if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
         curAccum.write(float4(0, 0, 0, 0), pixel);
+        curMoments[midx] = float2(0);
         return;
     }
     uint pw = prevGuide.get_width();
@@ -1066,17 +1223,22 @@ kernel void reprojectKernel(
     float4 pg = prevGuide.read(pp);
     if (pg.w < 0.5f) {
         curAccum.write(float4(0, 0, 0, 0), pixel);
+        curMoments[midx] = float2(0);
         return;
     }
     float eps = max(0.02f, 0.002f * length(rel));
     if (distance(pg.xyz, g.xyz) > eps) {
         curAccum.write(float4(0, 0, 0, 0), pixel);
+        curMoments[midx] = float2(0);
         return;
     }
     float4 h = prevAccum.read(pp);
     float wgt = min(h.a, u.reuseCap);
     float3 rgb = h.a > 0.001f ? h.rgb * (wgt / h.a) : float3(0);
     curAccum.write(float4(rgb, wgt), pixel);
+    float2 pm = prevMoments[pp.y * pw + pp.x];
+    float ms = h.a > 0.001f ? (wgt / h.a) : 0.0f;
+    curMoments[midx] = pm * float2(ms, ms * ms);
 }
 
 // MARK: - Tonemap / display
