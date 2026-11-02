@@ -4350,6 +4350,90 @@ final class Renderer {
         return out as Data
     }
 
+    // MARK: v4.15 convergence / perf audit render (REPRO only)
+    //
+    // Traces the current scene offscreen at a fixed sample count
+    // with the still settings (full emissive set restored for the
+    // duration, bounces 6, glass budget 6, no history cap) and
+    // reads the RAW accumulation back: returns the trace wall
+    // time plus the per-region mean luminance of the converged
+    // mean radiance (accum.rgb / accum.a) over a 6x4 region grid,
+    // and the image-wide mean. The v4.15 convergence audit
+    // compares these statistics across engine versions — the
+    // optimised tracer must converge to the same picture, so the
+    // region means must agree with the pre-optimisation baseline
+    // within the audit's stated tolerance. Not called by any UI
+    // path; exists for ReproDriver's convglass / convrefl /
+    // convlight variants.
+    func renderAuditStats(camera: CameraBasis, width: Int, height: Int,
+                          samples: Int, seedStart: UInt32 = 0)
+        -> (wallMs: Double, regions: [Double], overall: Double)? {
+        flushPendingStaticBuild()
+        flushMaterialTable()
+        guard width > 0, height > 0, samples > 0,
+              let accum = makeAccumTexture(width: width, height: height)
+        else { return nil }
+        // Full emissive set for the whole render (same discipline
+        // as renderStillPNG): restore now, defer re-activate.
+        let wasCulling = cullingActive
+        if wasCulling { restoreFullEmissive() }
+        defer { if wasCulling { activateCulledEmissive() } }
+        guard let cmd = queue.makeCommandBuffer() else { return nil }
+        clearAccum(accum, cmd: cmd)
+        let t0 = CACurrentMediaTime()
+        let traced = encodeTrace(accum: accum, camera: camera, count: samples,
+                                 seedStart: seedStart, bounces: 6, cap: 1_000_000,
+                                 glassBudget: 6, cmd: cmd)
+        guard traced else { return nil }
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        let wallMs = (CACurrentMediaTime() - t0) * 1000
+        // Read the raw accumulation (rgba16Float, 8 bytes/pixel)
+        // back through a shared buffer.
+        let byteCount = width * height * 8
+        guard let buf = device.makeBuffer(length: byteCount,
+                                          options: .storageModeShared),
+              let bcmd = queue.makeCommandBuffer(),
+              let blit = bcmd.makeBlitCommandEncoder() else { return nil }
+        blit.copy(from: accum,
+                  sourceOffset: 0,
+                  sourceBytesPerRow: width * 8,
+                  sourceBytesPerImage: byteCount,
+                  sourceSize: MTLSize(width: width, height: height, depth: 1),
+                  to: buf, destinationOffset: 0,
+                  destinationBytesPerRow: width * 8,
+                  destinationBytesPerImage: byteCount)
+        blit.endEncoding()
+        bcmd.commit()
+        bcmd.waitUntilCompleted()
+        let cols = 6, rows = 4
+        var regionSum = [Double](repeating: 0, count: cols * rows)
+        var regionCnt = [Double](repeating: 0, count: cols * rows)
+        let base = buf.contents().bindMemory(to: Float16.self,
+                                             capacity: width * height * 4)
+        for y in 0..<height {
+            let r = min(y * rows / height, rows - 1)
+            for x in 0..<width {
+                let c = min(x * cols / width, cols - 1)
+                let o = (y * width + x) * 4
+                let a = Double(base[o + 3])
+                guard a > 0.5 else { continue }
+                let lum = (0.2126 * Double(base[o]) + 0.7152 * Double(base[o + 1])
+                           + 0.0722 * Double(base[o + 2])) / a
+                regionSum[r * cols + c] += lum
+                regionCnt[r * cols + c] += 1
+            }
+        }
+        var regions: [Double] = []
+        var totSum = 0.0, totCnt = 0.0
+        for i in 0..<(cols * rows) {
+            regions.append(regionCnt[i] > 0 ? regionSum[i] / regionCnt[i] : 0)
+            totSum += regionSum[i]
+            totCnt += regionCnt[i]
+        }
+        return (wallMs, regions, totCnt > 0 ? totSum / totCnt : 0)
+    }
+
     // MARK: Picking (CPU raycast over the merged world triangles)
 
     func pick(origin: SIMD3<Float>, dir: SIMD3<Float>) -> UUID? {

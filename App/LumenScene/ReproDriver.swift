@@ -351,6 +351,271 @@ enum ReproDriver {
                 NodeLink(id: UUID(), from: start.id, fromPin: "out", to: delay2.id, toPin: "in"),
                 NodeLink(id: UUID(), from: delay2.id, fromPin: "out", to: camLoop.id, toPin: "in"),
             ]
+        case "convglass", "convrefl", "convlight":
+            // v4.15 convergence-audit reference scenes. Each
+            // stresses one tracer path family; handleAudit
+            // renders them offscreen at a fixed sample count
+            // and compares per-region converged statistics
+            // against the pre-optimisation baseline.
+            func prim(_ kind: String, _ name: String,
+                      pos: [Double], rot: [Double] = [0, 0, 0],
+                      params: [String: Double] = [:],
+                      material: MaterialProps) -> SceneObject {
+                var o = SceneObject.primitive(kind, name: name)
+                if !params.isEmpty { o.params = params }
+                o.transform.position = pos
+                o.transform.rotation = rot
+                o.material = material
+                return o
+            }
+            func room(_ w: Double, _ d: Double, _ h: Double,
+                      floorPreset: String, floorScale: Double) -> [SceneObject] {
+                var floorMat = MaterialProps()
+                floorMat.texturePreset = floorPreset
+                floorMat.textureScale = floorScale
+                var brickMat = MaterialProps()
+                brickMat.texturePreset = "brick"
+                brickMat.textureScale = 2.5
+                var cementMat = MaterialProps()
+                cementMat.texturePreset = "cement"
+                cementMat.textureScale = 2.5
+                var plainMat = MaterialProps()
+                plainMat.baseColor = RGB(0.45, 0.45, 0.47)
+                var ceilMat = MaterialProps()
+                ceilMat.baseColor = RGB(0.16, 0.16, 0.17)
+                return [
+                    prim("plane", "Audit floor", pos: [0, 0, 0],
+                         params: ["w": w, "d": d], material: floorMat),
+                    prim("box", "Audit back wall", pos: [0, h / 2, -d / 2 + 0.1],
+                         params: ["w": w, "h": h, "d": 0.2], material: brickMat),
+                    prim("box", "Audit left wall", pos: [-w / 2 + 0.1, h / 2, 0],
+                         params: ["w": 0.2, "h": h, "d": d], material: cementMat),
+                    prim("box", "Audit right wall", pos: [w / 2 - 0.1, h / 2, 0],
+                         params: ["w": 0.2, "h": h, "d": d], material: plainMat),
+                    prim("box", "Audit ceiling", pos: [0, h + 0.1, 0],
+                         params: ["w": w, "h": 0.2, "d": d], material: ceilMat),
+                ]
+            }
+            func emitter(_ name: String, _ kind: String,
+                         pos: [Double], rot: [Double] = [0, 0, 0],
+                         params: [String: Double],
+                         color: RGB, intensity: Double) -> SceneObject {
+                var m = MaterialProps()
+                m.baseColor = RGB(0.1, 0.1, 0.1)
+                m.emissiveOn = true
+                m.emissiveColor = color
+                m.emissiveIntensity = intensity
+                return prim(kind, name, pos: pos, rot: rot,
+                            params: params, material: m)
+            }
+            func glass(_ name: String, _ kind: String,
+                       pos: [Double], rot: [Double] = [0, 0, 0],
+                       params: [String: Double],
+                       rough: Double, tint: RGB) -> SceneObject {
+                var m = MaterialProps()
+                m.glassOn = true
+                m.transmission = 1.0
+                m.roughness = rough
+                m.ior = 1.5
+                m.tint = tint
+                return prim(kind, name, pos: pos, rot: rot,
+                            params: params, material: m)
+            }
+            switch variant {
+            case "convglass":
+                // GLASS-heavy: three nested glass boxes around a
+                // glowing core (paths cross up to 7 interfaces),
+                // crossed clear panes, a frosted block, a glass
+                // sphere and a deep-tinted glass cylinder.
+                var objs = room(10, 8, 3.4, floorPreset: "concrete", floorScale: 2.0)
+                objs.append(emitter("Audit ceiling light", "box",
+                                    pos: [0, 3.32, -0.6],
+                                    params: ["w": 2.4, "h": 0.06, "d": 1.2],
+                                    color: RGB(1.0, 0.97, 0.9), intensity: 3.0))
+                objs.append(emitter("Audit neon sign", "box",
+                                    pos: [0.6, 2.05, -3.72],
+                                    params: ["w": 2.4, "h": 0.8, "d": 0.1],
+                                    color: RGB(1.0, 0.16, 0.5), intensity: 7.0))
+                objs.append(glass("Audit glass outer", "box",
+                                  pos: [0, 0.65, -0.8],
+                                  params: ["w": 1.3, "h": 1.3, "d": 1.3],
+                                  rough: 0.03, tint: RGB(0.90, 1.0, 0.94)))
+                objs.append(glass("Audit glass middle", "box",
+                                  pos: [0, 0.65, -0.8],
+                                  params: ["w": 0.85, "h": 0.85, "d": 0.85],
+                                  rough: 0.15, tint: RGB(1.0, 0.88, 0.70)))
+                objs.append(glass("Audit glass inner", "box",
+                                  pos: [0, 0.65, -0.8],
+                                  params: ["w": 0.5, "h": 0.5, "d": 0.5],
+                                  rough: 0.35, tint: RGB(0.75, 0.88, 1.0)))
+                objs.append(emitter("Audit glass core", "box",
+                                    pos: [0, 0.65, -0.8],
+                                    params: ["w": 0.22, "h": 0.22, "d": 0.22],
+                                    color: RGB(0.1, 0.9, 1.0), intensity: 5.0))
+                objs.append(glass("Audit pane A", "box",
+                                  pos: [2.3, 1.0, -0.7], rot: [0, 30, 0],
+                                  params: ["w": 1.6, "h": 2.0, "d": 0.04],
+                                  rough: 0.02, tint: RGB(0.95, 1.0, 0.98)))
+                objs.append(glass("Audit pane B", "box",
+                                  pos: [-2.3, 1.0, -0.7], rot: [0, -30, 0],
+                                  params: ["w": 1.6, "h": 2.0, "d": 0.04],
+                                  rough: 0.02, tint: RGB(0.95, 1.0, 0.98)))
+                objs.append(glass("Audit frosted block", "box",
+                                  pos: [-1.7, 0.3, 0.9],
+                                  params: ["w": 0.6, "h": 0.6, "d": 0.6],
+                                  rough: 0.6, tint: RGB(0.95, 0.98, 1.0)))
+                objs.append(glass("Audit glass sphere", "sphere",
+                                  pos: [1.9, 0.45, 1.3],
+                                  params: ["r": 0.45],
+                                  rough: 0.05, tint: RGB(0.96, 1.0, 0.97)))
+                objs.append(glass("Audit green cylinder", "cylinder",
+                                  pos: [-2.9, 0.55, -1.9],
+                                  params: ["r": 0.3, "h": 1.1],
+                                  rough: 0.08, tint: RGB(0.5, 0.95, 0.6)))
+                var crateMat = MaterialProps()
+                crateMat.baseColor = RGB(0.95, 0.45, 0.1)
+                objs.append(prim("box", "Audit crate", pos: [3.0, 0.25, -2.6],
+                                 rot: [0, -20, 0],
+                                 params: ["w": 0.7, "h": 0.5, "d": 0.7],
+                                 material: crateMat))
+                p.scene.objects = objs
+                p.scene.camera.target = [0, 0.85, -0.7]
+                p.scene.camera.azimuth = 24
+                p.scene.camera.elevation = 13
+                p.scene.camera.distance = 6.8
+            case "convrefl":
+                // REFLECTION-heavy: a wet road-texture floor
+                // (the audit forces wet = 1, so up-facing gloss
+                // is 0.85 and the specular roll dominates),
+                // tilted mirror panes, glossy road-texture
+                // blocks, and bright emissive content to reflect.
+                var objs = room(12, 10, 3.6, floorPreset: "road-normal", floorScale: 3.0)
+                objs.append(emitter("Audit ceiling light", "box",
+                                    pos: [0, 3.52, -0.5],
+                                    params: ["w": 3.0, "h": 0.06, "d": 1.6],
+                                    color: RGB(1.0, 0.97, 0.9), intensity: 3.0))
+                objs.append(emitter("Audit neon sign", "box",
+                                    pos: [0.8, 2.1, -4.72],
+                                    params: ["w": 2.6, "h": 0.9, "d": 0.1],
+                                    color: RGB(1.0, 0.16, 0.5), intensity: 7.0))
+                objs.append(emitter("Audit glow cube", "box",
+                                    pos: [-2.8, 0.18, -1.4],
+                                    params: ["w": 0.36, "h": 0.36, "d": 0.36],
+                                    color: RGB(0.1, 0.9, 1.0), intensity: 3.5))
+                objs.append(glass("Audit mirror pane", "box",
+                                  pos: [0, 1.5, -2.4], rot: [-14, 0, 0],
+                                  params: ["w": 3.2, "h": 2.2, "d": 0.04],
+                                  rough: 0.03, tint: RGB(0.96, 1.0, 0.98)))
+                objs.append(glass("Audit side pane", "box",
+                                  pos: [3.6, 1.3, -0.6], rot: [0, -38, 0],
+                                  params: ["w": 2.4, "h": 2.0, "d": 0.04],
+                                  rough: 0.03, tint: RGB(0.96, 1.0, 0.98)))
+                objs.append(glass("Audit glass slab", "box",
+                                  pos: [-2.6, 0.25, 1.4], rot: [0, 18, 0],
+                                  params: ["w": 2.0, "h": 0.5, "d": 1.2],
+                                  rough: 0.1, tint: RGB(0.94, 0.99, 1.0)))
+                var roadMat = MaterialProps()
+                roadMat.texturePreset = "road-normal"
+                roadMat.textureScale = 1.5
+                objs.append(prim("box", "Audit road block", pos: [2.4, 0.35, 1.6],
+                                 rot: [0, -12, 0],
+                                 params: ["w": 1.4, "h": 0.7, "d": 1.4],
+                                 material: roadMat))
+                var pillarMat = MaterialProps()
+                pillarMat.texturePreset = "concrete"
+                pillarMat.textureScale = 1.5
+                objs.append(prim("cylinder", "Audit pillar", pos: [-3.4, 0.8, -2.6],
+                                 params: ["r": 0.35, "h": 1.6],
+                                 material: pillarMat))
+                p.scene.objects = objs
+                p.scene.camera.target = [0, 0.8, -0.9]
+                p.scene.camera.azimuth = 18
+                p.scene.camera.elevation = 7
+                p.scene.camera.distance = 7.4
+            default: // convlight
+                // LIGHT-heavy: 18 emissive objects spanning a
+                // huge area x intensity range — two 12.9 m2 dim
+                // ceiling panels (intensity 0.7-0.9) vs 0.08 m
+                // cubes at intensity 25. Uniform-by-area light
+                // selection wastes nearly every pick on the dim
+                // panels; the receivers are plain diffuse.
+                var objs = room(10, 8, 3.4, floorPreset: "concrete", floorScale: 2.0)
+                objs.append(emitter("Audit panel A", "box",
+                                    pos: [-1.8, 3.32, -1.0],
+                                    params: ["w": 3.0, "h": 0.08, "d": 2.0],
+                                    color: RGB(1.0, 0.9, 0.75), intensity: 0.7))
+                objs.append(emitter("Audit panel B", "box",
+                                    pos: [2.0, 3.32, 0.8],
+                                    params: ["w": 3.0, "h": 0.08, "d": 2.0],
+                                    color: RGB(0.8, 0.9, 1.0), intensity: 0.9))
+                objs.append(emitter("Audit wall panel 1", "box",
+                                    pos: [-4.78, 1.9, -1.5], rot: [0, 90, 0],
+                                    params: ["w": 1.2, "h": 0.8, "d": 0.06],
+                                    color: RGB(1.0, 0.55, 0.15), intensity: 3.0))
+                objs.append(emitter("Audit wall panel 2", "box",
+                                    pos: [4.78, 1.9, 0.5], rot: [0, -90, 0],
+                                    params: ["w": 1.2, "h": 0.8, "d": 0.06],
+                                    color: RGB(0.3, 1.0, 0.45), intensity: 3.5))
+                objs.append(emitter("Audit wall panel 3", "box",
+                                    pos: [-1.5, 2.2, -3.78],
+                                    params: ["w": 1.4, "h": 0.7, "d": 0.06],
+                                    color: RGB(0.35, 0.5, 1.0), intensity: 4.0))
+                objs.append(emitter("Audit wall panel 4", "box",
+                                    pos: [2.2, 1.6, -3.78],
+                                    params: ["w": 1.0, "h": 0.7, "d": 0.06],
+                                    color: RGB(1.0, 0.3, 0.8), intensity: 2.5))
+                let cubeCols: [RGB] = [RGB(1.0, 0.25, 0.2), RGB(0.1, 0.9, 1.0),
+                                       RGB(1.0, 0.85, 0.2), RGB(0.3, 1.0, 0.4),
+                                       RGB(0.3, 0.45, 1.0), RGB(1.0, 0.4, 0.75)]
+                let cubePos: [[Double]] = [[-3.2, 0.09, -0.6], [-1.2, 0.09, 1.6],
+                                           [0.8, 0.09, -1.8], [2.6, 0.09, 0.9],
+                                           [3.6, 0.09, -2.4], [-2.4, 0.09, 2.6]]
+                for i in 0..<6 {
+                    objs.append(emitter("Audit bright cube \(i)", "box",
+                                        pos: cubePos[i],
+                                        params: ["w": 0.18, "h": 0.18, "d": 0.18],
+                                        color: cubeCols[i], intensity: 12.0))
+                }
+                let stripPos: [[Double]] = [[0, 0.06, -3.5], [-4.5, 0.06, 0.5],
+                                            [4.5, 0.06, -0.8], [1.5, 0.06, 3.4]]
+                let stripRot: [[Double]] = [[0, 0, 0], [0, 90, 0], [0, 90, 0], [0, 0, 0]]
+                for i in 0..<4 {
+                    objs.append(emitter("Audit strip \(i)", "box",
+                                        pos: stripPos[i], rot: stripRot[i],
+                                        params: ["w": 1.6, "h": 0.12, "d": 0.12],
+                                        color: RGB(0.9, 0.95, 1.0), intensity: 5.0))
+                }
+                objs.append(emitter("Audit tiny cube 1", "box",
+                                    pos: [-0.5, 0.04, 0.2],
+                                    params: ["w": 0.08, "h": 0.08, "d": 0.08],
+                                    color: RGB(1.0, 0.95, 0.85), intensity: 25.0))
+                objs.append(emitter("Audit tiny cube 2", "box",
+                                    pos: [1.8, 0.04, -0.4],
+                                    params: ["w": 0.08, "h": 0.08, "d": 0.08],
+                                    color: RGB(0.85, 0.92, 1.0), intensity: 25.0))
+                var crateMat = MaterialProps()
+                crateMat.baseColor = RGB(0.95, 0.45, 0.1)
+                objs.append(prim("box", "Audit crate", pos: [2.9, 0.25, -2.5],
+                                 rot: [0, -20, 0],
+                                 params: ["w": 0.7, "h": 0.5, "d": 0.7],
+                                 material: crateMat))
+                var sphereMat = MaterialProps()
+                sphereMat.texturePreset = "cement"
+                sphereMat.textureScale = 1.2
+                objs.append(prim("sphere", "Audit sphere", pos: [-3.5, 0.42, 1.6],
+                                 params: ["r": 0.42], material: sphereMat))
+                var pillarMat = MaterialProps()
+                pillarMat.texturePreset = "concrete"
+                pillarMat.textureScale = 1.5
+                objs.append(prim("cylinder", "Audit pillar", pos: [-2.9, 0.48, -2.3],
+                                 params: ["r": 0.35, "h": 0.95],
+                                 material: pillarMat))
+                p.scene.objects = objs
+                p.scene.camera.target = [0, 1.0, -0.5]
+                p.scene.camera.azimuth = 30
+                p.scene.camera.elevation = 16
+                p.scene.camera.distance = 7.2
+            }
         default:
             break
         }
@@ -962,6 +1227,55 @@ final class ReproRun {
         exit(0)
     }
 
+    // MARK: v4.15 convergence audit (convglass / convrefl /
+    // convlight): weather off, a short settle for the scene
+    // upload, then three offscreen renders of the variant's
+    // reference scene through Renderer.renderAuditStats (fixed
+    // 768 samples, still settings). Stats come from the first
+    // render; the PERF line reports the trace wall times of the
+    // following renders (host-measured on the CI runner).
+    private var isAuditVariant: Bool {
+        ["convglass", "convrefl", "convlight"].contains(ReproDriver.variant)
+    }
+    private var auditPhase = 0
+
+    private func handleAudit() {
+        guard let session, let renderer else { return }
+        switch auditPhase {
+        case 0:
+            session.setWeatherMode(0)
+            if pumpCount >= 45 { auditPhase = 1 }
+        case 1:
+            let camera = session.project.scene.camera.orbitBasis()
+            let savedWet = renderer.weatherWet
+            if ReproDriver.variant == "convrefl" { renderer.weatherWet = 1 }
+            var walls: [Double] = []
+            var stats: (wallMs: Double, regions: [Double], overall: Double)?
+            for i in 0..<4 {
+                let r = renderer.renderAuditStats(camera: camera, width: 384,
+                                                  height: 256, samples: 768,
+                                                  seedStart: 0)
+                if let r {
+                    if i == 0 { stats = r } else { walls.append(r.wallMs) }
+                }
+            }
+            renderer.weatherWet = savedWet
+            guard let stats else {
+                check("render", false, "renderAuditStats returned nil")
+                finishSnow()
+                return
+            }
+            ReproDriver.marker(String(format: "AUDIT %@ overall=%.6f regions=%@",
+                ReproDriver.variant, stats.overall,
+                stats.regions.map { String(format: "%.6f", $0) }
+                    .joined(separator: ",")))
+            perfMetric("auditTrace768", walls)
+            finishSnow()
+        default:
+            break
+        }
+    }
+
     /// One named audit verdict line. REPRO-DONE only proves
     /// the sequence completed without crashing (the v4.11
     /// convention); the verdicts live in these lines and the
@@ -1066,8 +1380,12 @@ final class ReproRun {
             handleLoopAudit()
             if finished { return }
         }
+        if isAuditVariant {
+            handleAudit()
+            if finished { return }
+        }
 
-        if !isGravityVariant, !isPerfVariant, !isLoopVariant, crossedA, firstStepCrossed, pumpCount >= 90 {
+        if !isGravityVariant, !isPerfVariant, !isLoopVariant, !isAuditVariant, crossedA, firstStepCrossed, pumpCount >= 90 {
             finished = true
             ReproDriver.marker("settle W=\(a) pumps=\(pumpCount)")
             print("REPRO-DONE")
@@ -1084,6 +1402,7 @@ final class ReproRun {
         let watchdogLimit: CFTimeInterval
         switch ReproDriver.variant {
         case "gravfall", "gravstack": watchdogLimit = 120
+        case "convglass", "convrefl", "convlight": watchdogLimit = 360
         default: watchdogLimit = 100
         }
         if CACurrentMediaTime() - startedAt > watchdogLimit {

@@ -113,6 +113,9 @@ jobs:
               ("gravstack", ["-LSVariant", "gravstack"]),
               ("loopmove", ["-LSVariant", "loopmove"]),
               ("playernodes", ["-LSVariant", "playernodes"]),
+              ("convglass", ["-LSVariant", "convglass"]),
+              ("convrefl", ["-LSVariant", "convrefl"]),
+              ("convlight", ["-LSVariant", "convlight"]),
               ("toggle-syncas", ["-LSToggle", "syncas"]),
               ("toggle-norefit", ["-LSToggle", "norefit"]),
           ]
