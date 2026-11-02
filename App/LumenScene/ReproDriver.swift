@@ -1302,7 +1302,7 @@ final class ReproRun {
             perfMetric("auditTrace768", walls)
             // v4.15 convergence audit: settled output vs the
             // pre-optimisation baseline, region by region.
-            if let base = ReproDriver.auditBaselines[ReproDriver.variant] {
+            if let base = ReproRun.auditBaselines[ReproDriver.variant] {
                 var worst = 0.0
                 for i in 0..<min(base.regions.count, stats.regions.count) {
                     let tol = max(0.04 * base.regions[i], 0.004)
