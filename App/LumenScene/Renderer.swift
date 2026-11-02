@@ -4370,6 +4370,13 @@ final class Renderer {
         -> (wallMs: Double, regions: [Double], overall: Double)? {
         flushPendingStaticBuild()
         flushMaterialTable()
+        print("AUDIT-PREP accel=\(accel != nil) pipe=\(tracePipeline != nil) "
+              + "pos=\(posBuffer != nil) nrm=\(nrmBuffer != nil) uv=\(uvBuffer != nil) "
+              + "col=\(colBuffer != nil) idx=\(idxBuffer != nil) triMat=\(triMatBuffer != nil) "
+              + "mat=\(matBuffer != nil) emisT=\(emisTriBuffer != nil) emisC=\(emisCDFBuffer != nil) "
+              + "texA=\(texAlbedo != nil) texN=\(texNormal != nil) texD=\(texData != nil) "
+              + "wf=\(weatherFieldTex != nil) triCount=\(triCount) emisCount=\(emissiveCount)")
+        fflush(stdout)
         guard width > 0, height > 0, samples > 0,
               let accum = makeAccumTexture(width: width, height: height)
         else { return nil }
