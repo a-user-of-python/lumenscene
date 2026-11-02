@@ -4352,6 +4352,8 @@ final class Renderer {
                 enc.setBuffer(edgeCountB, offset: 0, index: 10)
                 enc.setBytes(&edgeCap, length: 4, index: 11)
                 enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 12)
+                enc.setBuffer(occLoB, offset: 0, index: 13)
+                enc.setBuffer(occHiB, offset: 0, index: 14)
                 let ws = snowSrc.threadExecutionWidth
                 enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: ws, height: 1, depth: 1))
                 dispatched = true

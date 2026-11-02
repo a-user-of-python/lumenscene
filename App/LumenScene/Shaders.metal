@@ -2063,6 +2063,8 @@ kernel void snowSourcesKernel(
     device uint* edgeCount [[buffer(10)]],
     constant uint& edgeCapacity [[buffer(11)]],
     constant SimParams& sp [[buffer(12)]],
+    device const float* occLo [[buffer(13)]],
+    device const float* occHi [[buffer(14)]],
     uint idx [[thread_position_in_grid]])
 {
     uint count = sp.vx * sp.vz;
