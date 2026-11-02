@@ -754,17 +754,13 @@ final class EditorSession: ObservableObject {
         renderer.weatherSnowAmount = Float(buildupSnow)
         renderer.objectSnowAmounts = snowExposureA
         renderer.snowFootprints = []
-        // v4.6: hand the renderer the saved plow layer BEFORE
-        // the first rebuild, so a project saved with trails
-        // opens with them in place. Old files have none.
+        // v4.11: the v4.6 plow layer is retired — old saves'
+        // plowCells still decode (the field stays in the
+        // model) but are deliberately not applied: trails are
+        // the physics simulation's own state now, and a stale
+        // recorded layer must not shape it.
         renderer.snowfallTotal = Float(snowfallTotal)
         renderer.weatherFreeze = Float(buildupFreeze)
-        renderer.snowPlow = Dictionary(
-            uniqueKeysWithValues: (project.scene.weather.plowCells ?? []).map {
-                (Renderer.snowPlowKey(Int($0.gx), Int($0.gz)),
-                 (d: Float($0.d), a: Float($0.a),
-                  s: Float($0.s ?? snowfallTotal)))
-            })
         // v3.4: seed the renderer's quantised geometry levels
         // from the saved build-up BEFORE the first rebuild, so a
         // project saved with snow/puddles opens with its solid
@@ -2089,14 +2085,11 @@ final class EditorSession: ObservableObject {
             project.scene.weather.snowAmount = buildupSnow
         }
         syncExposuresToProject()
-        // v4.6: the plow layer round-trips through the
-        // renderer (it is the recorder's working copy); an
-        // empty layer saves as nil so untouched projects keep
-        // byte-identical saves.
-        let plow = renderer.exportSnowPlow()
-        let plowValue: [SnowPlowCell]? = plow.isEmpty ? nil : plow
-        if project.scene.weather.plowCells != plowValue {
-            project.scene.weather.plowCells = plowValue
+        // v4.11: new saves write no plow layer (the field is
+        // retired; see loadFromProject). Projects saved by
+        // older versions keep decoding, with the layer ignored.
+        if project.scene.weather.plowCells != nil {
+            project.scene.weather.plowCells = nil
         }
         // v4.7: snowfall clock + freeze fraction persist the
         // same way — nil at their zero values so untouched
@@ -2725,6 +2718,9 @@ final class EditorSession: ObservableObject {
                 ? Float((depth / 900) * 0.5 * weatherRateScale) : 0
             renderer.simRaining = eff == 1
             renderer.simWaterBase = Float(dynIntensity * weatherRateScale)
+            // v4.11: the snow physics reads the temperature
+            // directly (repose / fresh density / wet mobility).
+            renderer.simTemperature = temp.map { Float($0) }
         }
         // v4.7: renderer sees the EFFECTIVE mode (phase layer
         // recomputed here for the every-frame writes; when

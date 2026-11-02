@@ -113,6 +113,12 @@ jobs:
               ("deeprest", ["-LSVariant", "deeprest"]),
               ("deepdrag", ["-LSVariant", "deepdrag"]),
               ("deepspawn", ["-LSVariant", "deepspawn"]),
+              ("phys-pile", ["-LSVariant", "pile"]),
+              ("phys-settle", ["-LSVariant", "settle"]),
+              ("phys-drag2", ["-LSVariant", "drag2"]),
+              ("phys-spawn2", ["-LSVariant", "spawn2"]),
+              ("phys-roof", ["-LSVariant", "roof"]),
+              ("phys-longrun", ["-LSVariant", "longrun"]),
               ("deepdrag-simtickoff", ["-LSVariant", "deepdrag", "-LSToggle", "simtick"]),
               ("deepdrag-noscoped", ["-LSVariant", "deepdrag", "-LSToggle", "noscoped"]),
               ("toggle-simtick", ["-LSToggle", "simtick"]),
@@ -121,7 +127,7 @@ jobs:
               ("toggle-copyreads", ["-LSToggle", "copyreads"]),
               ("toggle-norefit", ["-LSToggle", "norefit"]),
           ]
-          PER_RUN_TIMEOUT = 240
+          PER_RUN_TIMEOUT = 300
 
           def crash_reports():
               found = {}

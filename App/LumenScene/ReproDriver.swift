@@ -227,6 +227,48 @@ enum ReproDriver {
             p.scene.weather.snowAmount = 1.80
             p.scene.weather.snow = 0.9
             p.scene.camera.target = [0, 1, 0]
+        case "pile", "settle", "drag2", "spawn2", "roof", "longrun":
+            // v4.11 physics-audit scenes: a bare 16x16 plane
+            // (plus a variant object), temperature -8 C, and a
+            // whisper of pre-seeded snow (0.05 m) so the sheet
+            // builds and the sim initialises at session init.
+            // The real test fields are INJECTED into the sim
+            // by handlePhysics once establishment is proven —
+            // the in-app counterparts of the mirror audit's
+            // PILE / SETTLE / DRAG / SPAWN / ROOF / LONGRUN.
+            var plane = SceneObject.primitive("plane", name: "Repro physics plane")
+            plane.params = ["w": 16, "d": 16]
+            plane.transform.position = [0, 0, 0]
+            p.scene.objects = [plane]
+            if variant == "settle" || variant == "longrun" {
+                var box = SceneObject.primitive("box", name: "Repro settle box")
+                box.params = ["w": 1, "h": 1, "d": 1]
+                box.transform.position = [0, 0.5, 0]
+                p.scene.objects.append(box)
+            }
+            if variant == "drag2" {
+                var box = SceneObject.primitive("box", name: "Repro drag box")
+                box.params = ["w": 1, "h": 1, "d": 1]
+                box.transform.position = [-2.5, 0.5, 0]
+                p.scene.objects.append(box)
+            }
+            if variant == "roof" {
+                // A box rolled 45 degrees: its two upper faces
+                // are 45-degree slopes meeting at a ridge.
+                var roof = SceneObject.primitive("box", name: "Repro roof block")
+                roof.params = ["w": 1, "h": 1, "d": 1]
+                roof.transform.scale = [3, 1, 2]
+                roof.transform.rotation = [0, 0, 45]
+                roof.transform.position = [0, 2.2, 0]
+                p.scene.objects.append(roof)
+            }
+            if variant == "spawn2" {
+                p.scene.camera.target = [0, 1, 0]
+            }
+            p.scene.weather.maxDepth = 2.0
+            p.scene.weather.snowAmount = 0.05
+            p.scene.weather.snow = 0.9
+            p.scene.weather.temperature = -8
         default:
             break
         }
@@ -287,6 +329,19 @@ final class ReproRun {
     private var isDeepVariant: Bool {
         ReproDriver.variant == "deeprest" || ReproDriver.variant == "deepdrag"
             || ReproDriver.variant == "deepspawn"
+    }
+
+    // Physics-audit state (v4.11 variants pile / settle /
+    // drag2 / spawn2 / roof / longrun).
+    private enum PhysPhase { case establishing, running, dragging, settling,
+                             spawnSnow, longrunA, longrunB }
+    private var physPhase: PhysPhase = .establishing
+    private var physPhaseSince: CFTimeInterval = 0
+    private var injectedMass: Float = 0
+
+    private var isPhysicsVariant: Bool {
+        ["pile", "settle", "drag2", "spawn2", "roof", "longrun"]
+            .contains(ReproDriver.variant)
     }
 
     /// LS-REPRO metrics: computed from the renderer's sim
@@ -449,6 +504,144 @@ final class ReproRun {
                            ringMean, ringMin, ringMax, ringCount,
                            fieldMean, fieldMax, fieldCount,
                            ratio, session?.liveSnowAmount ?? 0)
+        }
+        // Physics section (v4.11 variants): total snow MASS,
+        // the TRUE max slope (8-neighbour; an edge counts only
+        // when its higher endpoint carries snow — a step up to
+        // a bare support is an exposed object wall), and the
+        // repose-support spike residual (a column is a spike
+        // only if it rises above what ANY same-support
+        // neighbour could support at repose + 2 deg).
+        if isPhysicsVariant, s.initialised, n > 0,
+           s.mass.count >= n, s.snow.count >= n, s.support.count >= n, s.cs > 0 {
+            var massTotal: Float = 0
+            for i in 0..<n { massTotal += clean(s.mass[i]) }
+            massTotal *= s.cs * s.cs
+            var slopeTrue: Float = 0
+            var spikeR: Float = 0
+            let tanLim = Float(tan(36.0 * Double.pi / 180))
+            for j in 0..<s.vz {
+                for i in 0..<s.vx {
+                    let a = j * s.vx + i
+                    let surfA = clean(s.support[a]) + clean(s.snow[a])
+                    for (di, dj) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
+                        let ni = i + di, nj = j + dj
+                        if ni < 0 || nj < 0 || ni >= s.vx || nj >= s.vz { continue }
+                        let b = nj * s.vx + ni
+                        let surfB = clean(s.support[b]) + clean(s.snow[b])
+                        let dist = s.cs * ((di != 0 && dj != 0) ? Float(1.41421356) : 1)
+                        let hiSnow = surfA >= surfB ? clean(s.snow[a]) : clean(s.snow[b])
+                        if hiSnow > 0.001 {
+                            let deg = Float(atan(Double(abs(surfA - surfB) / dist)))
+                                * 180 / Float.pi
+                            if deg > slopeTrue { slopeTrue = deg }
+                        }
+                    }
+                    if i > 0, j > 0, i + 1 < s.vx, j + 1 < s.vz {
+                        var best: Float = .infinity
+                        for dj in -1...1 {
+                            for di in -1...1 where !(di == 0 && dj == 0) {
+                                let b = (j + dj) * s.vx + (i + di)
+                                if abs(clean(s.support[b]) - clean(s.support[a])) > 0.05 { continue }
+                                let dist = s.cs * Float(hypot(Double(di), Double(dj)))
+                                let cand = clean(s.support[b]) + clean(s.snow[b]) + tanLim * dist
+                                if cand < best { best = cand }
+                            }
+                        }
+                        if best.isFinite {
+                            let r = surfA - best
+                            if r > spikeR { spikeR = r }
+                        }
+                    }
+                }
+            }
+            line += String(format: " mass=%.5f slopeTrue=%.2f spikeR=%.4f",
+                           massTotal, slopeTrue, spikeR)
+            switch ReproDriver.variant {
+            case "pile":
+                // Cone flank: median local edge slope along
+                // the four rays from the cone centre.
+                var loc: [Float] = []
+                let ci = Int(((0 - s.ox) / s.cs).rounded())
+                let cj = Int(((0 - s.oz) / s.cs).rounded())
+                for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    var prev = clean(s.support[cj * s.vx + ci]) + clean(s.snow[cj * s.vx + ci])
+                    for r in 1...8 {
+                        let ii = ci + di * r, jj = cj + dj * r
+                        if ii < 0 || jj < 0 || ii >= s.vx || jj >= s.vz { break }
+                        let h = clean(s.support[jj * s.vx + ii]) + clean(s.snow[jj * s.vx + ii])
+                        let drop = prev - h
+                        if drop > 0.02 {
+                            loc.append(Float(atan(Double(drop / s.cs))) * 180 / Float.pi)
+                        }
+                        prev = h
+                    }
+                }
+                loc.sort()
+                let flank: Float = loc.isEmpty ? 0 : loc[loc.count / 2]
+                line += String(format: " coneFlank=%.2f", flank)
+            case "drag2":
+                var sum: Float = 0, cnt = 0
+                for j in 0..<s.vz {
+                    for i in 0..<s.vx {
+                        let idx = j * s.vx + i
+                        if abs(clean(s.support[idx])) > 0.05 { continue }
+                        let x = s.ox + Float(i) * s.cs
+                        let z = s.oz + Float(j) * s.cs
+                        if abs(z) <= 0.4, x >= Float(dragStartX) + 0.3,
+                           x <= Float(dragX) - 0.3 {
+                            sum += clean(s.snow[idx]); cnt += 1
+                        }
+                    }
+                }
+                line += String(format: " trenchMean=%.4f", cnt > 0 ? sum / Float(cnt) : 0)
+            case "spawn2":
+                var topSum: Float = 0, topCnt = 0
+                var ringSum: Float = 0, ringCnt = 0
+                if let box = session?.project.scene.objects.first(where: { $0.primitiveKind == "box" }) {
+                    let cx = Float(box.transform.position[0])
+                    let cz = Float(box.transform.position[2])
+                    for j in 0..<s.vz {
+                        for i in 0..<s.vx {
+                            let idx = j * s.vx + i
+                            let x = s.ox + Float(i) * s.cs
+                            let z = s.oz + Float(j) * s.cs
+                            let sup = clean(s.support[idx])
+                            let inside = abs(x - cx) <= 0.5 && abs(z - cz) <= 0.5
+                            if inside, abs(sup - 2.5) < 0.05 {
+                                topSum += clean(s.snow[idx]); topCnt += 1
+                            } else if abs(sup) < 0.05 {
+                                let dx = max(abs(x - cx) - 0.5, 0)
+                                let dz = max(abs(z - cz) - 0.5, 0)
+                                let rd = sqrtf(dx * dx + dz * dz)
+                                if rd > 0.001, rd <= 0.4 {
+                                    ringSum += clean(s.snow[idx]); ringCnt += 1
+                                }
+                            }
+                        }
+                    }
+                }
+                line += String(format: " spawnTopMean=%.4f ringMean=%.4f",
+                               topCnt > 0 ? topSum / Float(topCnt) : 0,
+                               ringCnt > 0 ? ringSum / Float(ringCnt) : 0)
+            case "roof":
+                var sum: Float = 0, cnt = 0
+                for j in 0..<s.vz {
+                    for i in 0..<s.vx {
+                        let idx = j * s.vx + i
+                        let x = s.ox + Float(i) * s.cs
+                        let z = s.oz + Float(j) * s.cs
+                        let sup = clean(s.support[idx])
+                        if sup > 0.9, sup < 3.7, abs(x) <= 1.55, abs(z) <= 1.05 {
+                            sum += clean(s.snow[idx]); cnt += 1
+                        }
+                    }
+                }
+                line += String(format: " roofFaceMean=%.4f roofFaceCount=%d",
+                               cnt > 0 ? sum / Float(cnt) : 0, cnt)
+            default:
+                break
+            }
         }
         print(line)
         fflush(stdout)
@@ -616,6 +809,160 @@ final class ReproRun {
                 if spawnCheckpointIdx >= spawnCheckpoints.count {
                     finishDeep()
                 }
+            }
+        }
+    }
+
+    /// v4.11: inject a snow field into the live sim (mass at
+    /// density 0.45) from a depth closure over (x, z, support).
+    private func injectField(_ depthAt: (Float, Float, Float) -> Float) {
+        guard let renderer else { return }
+        let s = renderer.reproSimSnapshot()
+        let n = s.vx * s.vz
+        guard s.initialised, n > 0, s.support.count >= n else { return }
+        var mass = [Float](repeating: 0, count: n)
+        var total: Float = 0
+        for j in 0..<s.vz {
+            for i in 0..<s.vx {
+                let idx = j * s.vx + i
+                let x = s.ox + Float(i) * s.cs
+                let z = s.oz + Float(j) * s.cs
+                let d = depthAt(x, z, s.support[idx])
+                if d > 0 {
+                    mass[idx] = d * 0.45
+                    total += mass[idx]
+                }
+            }
+        }
+        injectedMass = total * s.cs * s.cs
+        renderer.reproInjectSnow(mass: mass, rho: 0.45)
+        ReproDriver.marker("injected mass=\(injectedMass)")
+    }
+
+    /// v4.11 physics-variant phase machine. Establishment uses
+    /// the same witnesses as the deep variants; then the field
+    /// is injected, weather input is stopped (mode 0 at
+    /// temperature -8 C gives zero base rate and zero sink in
+    /// the session's own feed), and the variant runs its
+    /// course against the REAL sim.
+    private func handlePhysics() {
+        guard let session else { return }
+        let now = CACurrentMediaTime()
+        let variant = ReproDriver.variant
+        switch physPhase {
+        case .establishing:
+            guard let renderer else { return }
+            let snap = renderer.reproSimSnapshot()
+            guard snap.initialised, snap.swapped,
+                  sawTickTag, simTickFrames >= 5 else { return }
+            switch variant {
+            case "pile":
+                injectField { x, z, sup in
+                    if abs(sup) > 0.05 { return 0 }
+                    let r = hypotf(x, z)
+                    return r < 1.2 ? 1.6 * (1 - r / 1.2) : 0
+                }
+                session.setWeatherMode(0)
+                physPhase = .running
+            case "settle", "longrun":
+                let fins: [(Float, Float)] = [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0),
+                                              (0.0, -1.0), (3.0, 2.0), (-3.0, -2.0),
+                                              (2.0, -3.0), (-2.0, 3.0)]
+                injectField { x, z, sup in
+                    var d: Float = 0
+                    if abs(sup) < 0.05 || abs(sup - 1.0) < 0.05 { d = 1.2 }
+                    if d > 0 {
+                        for (fx, fz) in fins where hypotf(x - fx, z - fz) < 0.15 {
+                            d += 1.2
+                        }
+                    }
+                    return d
+                }
+                session.setWeatherMode(0)
+                physPhase = variant == "longrun" ? .longrunA : .running
+            case "drag2":
+                injectField { _, _, sup in abs(sup) < 0.05 ? 1.8 : 0 }
+                session.setWeatherMode(0)
+                if let idx = session.project.scene.objects.firstIndex(where: { $0.primitiveKind == "box" }) {
+                    dragStartX = session.project.scene.objects[idx].transform.position[0]
+                    dragX = dragStartX
+                }
+                dragMidEmitted = false
+                physPhase = .dragging
+                ReproDriver.marker("phys-drag-start x=\(dragStartX)")
+            case "spawn2":
+                injectField { _, _, sup in abs(sup) < 0.05 ? 1.8 : 0 }
+                emitMetric("pre-spawn")
+                // The REAL Add path, then the box is stretched
+                // tall (2.5 m) so its top PROTRUDES from the
+                // 1.8 m field (a 1 m box would be buried by
+                // flux — correct physics, wrong test).
+                session.addPrimitive("box")
+                if let idx = session.project.scene.objects.firstIndex(where: { $0.primitiveKind == "box" }) {
+                    session.project.scene.objects[idx].transform.scale = [1, 2.5, 1]
+                    session.project.scene.objects[idx].transform.position[1] = 1.25
+                    session.scheduleRebuild(geometry: true)
+                    let p = session.project.scene.objects[idx].transform.position
+                    ReproDriver.marker("spawn2-placed pos=[\(p[0]), \(p[1]), \(p[2])]")
+                }
+                emitMetric("spawn-0")
+                physPhase = .spawnSnow
+            case "roof":
+                injectField { x, z, sup in
+                    (sup > 0.9 && sup < 3.7 && abs(x) <= 1.55 && abs(z) <= 1.05) ? 0.5 : 0
+                }
+                session.setWeatherMode(0)
+                physPhase = .running
+            default:
+                physPhase = .running
+            }
+            physPhaseSince = now
+        case .running:
+            let dur: CFTimeInterval = variant == "pile" ? 15 : (variant == "roof" ? 25 : 20)
+            if now - physPhaseSince >= dur {
+                emitMetric("final")
+                finishDeep()
+            }
+        case .dragging:
+            guard let idx = session.project.scene.objects.firstIndex(where: { $0.primitiveKind == "box" }) else {
+                physPhase = .settling
+                physPhaseSince = now
+                return
+            }
+            dragX = min(dragX + 0.011, dragStartX + 3.3)
+            session.project.scene.objects[idx].transform.position[0] = dragX
+            session.scheduleRebuild(geometry: true)
+            if !dragMidEmitted, dragX >= dragStartX + 1.65 {
+                dragMidEmitted = true
+                emitMetric("mid-drag")
+            }
+            if dragX >= dragStartX + 3.3 - 1e-9 {
+                emitMetric("post-drag")
+                physPhase = .settling
+                physPhaseSince = now
+                ReproDriver.marker("phys-drag-end x=\(dragX)")
+            }
+        case .settling:
+            if now - physPhaseSince >= 20 {
+                emitMetric("settled")
+                finishDeep()
+            }
+        case .spawnSnow:
+            if now - physPhaseSince >= 30 {
+                emitMetric("spawn+30s")
+                finishDeep()
+            }
+        case .longrunA:
+            if now - physPhaseSince >= 60 {
+                emitMetric("lr-60s")
+                session.setWeatherMode(2)
+                physPhase = .longrunB
+                physPhaseSince = now
+            }
+        case .longrunB:
+            if now - physPhaseSince >= 60 {
+                emitMetric("lr-120s")
+                finishDeep()
             }
         }
     }
@@ -805,11 +1152,15 @@ final class ReproRun {
             handleDeep()
             if finished { return }
         }
+        if isPhysicsVariant {
+            handlePhysics()
+            if finished { return }
+        }
 
         let simSatisfied = ReproToggles.simTick ? framesAfterSwap >= 90
                                                 : (sawTickTag && simTickFrames >= 5)
         let freezeSatisfied = !isFreezeVariant || freezeDone
-        if !isDeepVariant, crossedA, firstStepCrossed, sawSwapAfterWeatherOn, simSatisfied, freezeSatisfied {
+        if !isDeepVariant, !isPhysicsVariant, crossedA, firstStepCrossed, sawSwapAfterWeatherOn, simSatisfied, freezeSatisfied {
             finished = true
             ReproDriver.marker("settle A=\(a) pumps=\(pumpCount) simTicks=\(simTickFrames)")
             print("REPRO-DONE")
@@ -822,7 +1173,8 @@ final class ReproRun {
         // Deep variants are long by design (30 s rest / ~3.3 m
         // drag + 20 s settle), so they get a 200 s watchdog
         // (the workflow's per-run timeout is 240 s).
-        let watchdogLimit: CFTimeInterval = isDeepVariant ? 200 : 100
+        let watchdogLimit: CFTimeInterval = isDeepVariant ? 200
+            : (isPhysicsVariant ? 280 : 100)
         if CACurrentMediaTime() - startedAt > watchdogLimit {
             finished = true
             print("REPRO-TIMEOUT pumps=\(pumpCount) A=\(a) step=\(tag) crossedA=\(crossedA) sheet=\(sawSheetAfterWeatherOn) swap=\(sawSwapAfterWeatherOn) simTicks=\(simTickFrames)")

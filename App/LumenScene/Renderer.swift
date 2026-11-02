@@ -93,7 +93,10 @@ struct SimParams {
     var freezeFrac: Float = 0
     var snowBase: Float = 0
     var waterBase: Float = 0
-    var pad: Float = 0
+    var snowMode: UInt32 = 0
+    var reposeTan: Float = 0
+    var freshRho: Float = 0.4
+    var snowTemp: Float = 999
 }
 
 struct ReprojUniforms {
@@ -741,6 +744,37 @@ final class Renderer {
     private var simSourcePipeline: MTLComputePipelineState?
     private var simFlowPipeline: MTLComputePipelineState?
     private var simEditPipeline: MTLComputePipelineState?
+    // v4.11 snow physics pipelines + state buffers.
+    private var snowSourcesPipeline: MTLComputePipelineState?
+    private var snowFluxPipeline: MTLComputePipelineState?
+    private var snowDisplaceCountPipeline: MTLComputePipelineState?
+    private var snowDisplaceApplyPipeline: MTLComputePipelineState?
+    private var snowWritebackPipeline: MTLComputePipelineState?
+    private var snowEdgeResetPipeline: MTLComputePipelineState?
+    private var snowPressClearPipeline: MTLComputePipelineState?
+    private var simSnowMassBuf: MTLBuffer?
+    private var simSnowRhoBuf: MTLBuffer?
+    private var simSnowAgeBuf: MTLBuffer?
+    private var simSnowGateBuf: MTLBuffer?
+    private var simOccCovBuf: MTLBuffer?
+    private var simOccLoBuf: MTLBuffer?
+    private var simOccHiBuf: MTLBuffer?
+    private var simPressBuf: MTLBuffer?
+    private var simEdgeBuf: MTLBuffer?
+    private var simEdgeCountBuf: MTLBuffer?
+    private var simEdgeCapacity: Int = 0
+    /// Host identity per vertex from the last full sync (the
+    /// support-switch transfer needs the OLD lattice's hosts).
+    private var simPrevHostIDs: [UUID?] = []
+    /// The last intruder set a sheet build computed — the tick
+    /// rasterises THESE into the occupancy buffers each frame
+    /// (rebuilds refresh it whenever anything moves).
+    private var lastSnowIntruders: [SnowIntruder] = []
+    /// Footprint press bookkeeping: keys of the stamps already
+    /// pressed (a stamp presses ONCE, when it first appears)
+    /// and presses queued for the next tick.
+    private var pressedStampKeys: Set<Int64> = []
+    private var pendingPresses: [(x: Float, z: Float, r: Float, c: Float)] = []
     private var simSnowBuf: MTLBuffer?
     private var simWaterBuf: MTLBuffer?
     private var simSupportBuf: MTLBuffer?
@@ -765,6 +799,11 @@ final class Renderer {
     var simCompactRate: Float = 0    // m/s toward a lowered ceiling
     var simRaining: Bool = false     // effective rain this tick
     var simWaterBase: Float = 0      // surge x rate scale for water fill
+    /// v4.11: the project's Temperature setting (nil = legacy
+    /// projects), fed by the session alongside the rates. It
+    /// drives the snow model's repose angle, fresh density
+    /// and wet mobility (see the design record).
+    var simTemperature: Float? = nil
     var simLastTick: CFTimeInterval = 0
     /// v4.10.2: the last committed sim-tick command buffer.
     /// The tick is fire-and-forget; this handle lets CPU
@@ -898,6 +937,27 @@ final class Renderer {
         }
         if let fn = library.makeFunction(name: "simApplyEditsKernel") {
             simEditPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "snowSourcesKernel") {
+            snowSourcesPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "snowFluxKernel") {
+            snowFluxPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "snowDisplaceCountKernel") {
+            snowDisplaceCountPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "snowDisplaceApplyKernel") {
+            snowDisplaceApplyPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "snowWritebackKernel") {
+            snowWritebackPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "snowEdgeResetKernel") {
+            snowEdgeResetPipeline = try? device.makeComputePipelineState(function: fn)
+        }
+        if let fn = library.makeFunction(name: "snowPressClearKernel") {
+            snowPressClearPipeline = try? device.makeComputePipelineState(function: fn)
         }
         if let vfn = library.makeFunction(name: "tonemapVertex"),
            let ffn = library.makeFunction(name: "tonemapFragment") {
@@ -2245,11 +2305,31 @@ final class Renderer {
         return wgfSmooth(0.45, 0.75, pc * (0.3 + 1.4 * wgfDrift(x, z)))
     }
 
-    /// v4.3: the snow depth (metres) at a world XZ under the
-    /// AMBIENT accumulation — the session uses this to place
-    /// player footprints on the snow surface in Play.
+    /// The snow depth (metres) at a world XZ — v4.11: the
+    /// SIMULATED depth where the sim is live (the session's
+    /// footprint gate must see the trench the player is
+    /// actually standing in, not the ambient closed form),
+    /// falling back to the ambient accumulation before the
+    /// sim initialises. The 4-point sample reads the shared
+    /// depth buffer directly; a torn read against an
+    /// in-flight tick is harmless for a stamping gate.
     func snowDepthAt(x: Float, z: Float) -> Float {
-        wgfSnowHeight(x, z, amount: weatherSnowAmount)
+        if simInitialised, let buf = simSnowBuf, simVX > 1, simVZ > 1,
+           buf.length >= simVX * simVZ * 4 {
+            let fx = (x - simOX) / simCS, fz = (z - simOZ) / simCS
+            if fx >= 0, fz >= 0, fx <= Float(simVX - 1), fz <= Float(simVZ - 1) {
+                let count = simVX * simVZ
+                let ptr = buf.contents().bindMemory(to: Float.self, capacity: count)
+                let ix = min(Int(fx), simVX - 2), iz = min(Int(fz), simVZ - 2)
+                let tx = fx - Float(ix), tz = fz - Float(iz)
+                let a = ptr[iz * simVX + ix], b = ptr[iz * simVX + ix + 1]
+                let c = ptr[(iz + 1) * simVX + ix], d = ptr[(iz + 1) * simVX + ix + 1]
+                let v = (a * (1 - tx) + b * tx) * (1 - tz)
+                    + (c * (1 - tx) + d * tx) * tz
+                if v.isFinite { return max(0, v) }
+            }
+        }
+        return wgfSnowHeight(x, z, amount: weatherSnowAmount)
     }
 
     /// The trace kernel's puddle mask, mirrored: (mask, depth01)
@@ -3402,6 +3482,138 @@ final class Renderer {
         lastSimCmd = nil
     }
 
+    /// v4.11: angle of repose (degrees) at an air temperature:
+    /// cold dry snow lies looser, near-0 wet snow holds
+    /// somewhat steeper; unset (legacy projects) keeps the
+    /// historical 37. Mirrors the Python audit exactly.
+    static func snowReposeDeg(temp: Float?) -> Float {
+        guard let t = temp else { return 37 }
+        if t <= -5 { return 34 }
+        if t >= 0 { return 38 }
+        return 34 + (t + 5) / 5 * 4
+    }
+
+    /// v4.11: fresh-snow density at an air temperature.
+    static func snowFreshRho(temp: Float?) -> Float {
+        guard let t = temp else { return 0.40 }
+        if t <= -5 { return 0.35 }
+        if t >= 0 { return 0.50 }
+        return 0.35 + (t + 5) / 5 * 0.15
+    }
+
+    /// v4.11: the load-time initial condition's density for a
+    /// closed-form target depth — deep initial snow starts
+    /// compacted, shallow starts fresh.
+    private func snowInitRho(depth: Float) -> Float {
+        let rf = Renderer.snowFreshRho(temp: simTemperature)
+        if depth <= 0 { return rf }
+        return rf + (1 - rf) * (1 - expf(-depth / 0.8))
+    }
+
+    /// v4.11: CPU prep for one tick's snow step — rasterise
+    /// the live intruder set into the occupancy buffers.
+    /// Called after waitForSimTick and before any encoder
+    /// exists, so the shared-buffer writes cannot race a
+    /// tick. Returns true only when some column's snow
+    /// ACTUALLY overlaps an intruder's volume right now (a
+    /// resting object whose footprint snow has already
+    /// vacated is not activity — otherwise the sim could
+    /// never sleep in a scene with anything sitting in snow).
+    private func prepareSnowTickBuffers() -> Bool {
+        let count = simVX * simVZ
+        guard count > 0,
+              let covB = simOccCovBuf, let loB = simOccLoBuf, let hiB = simOccHiBuf,
+              covB.length >= count * 4, loB.length >= count * 4,
+              hiB.length >= count * 4,
+              let supB = simSupportBuf, supB.length >= count * 4,
+              let depB = simSnowBuf, depB.length >= count * 4
+              else { return false }
+        let cov = covB.contents().bindMemory(to: Float.self, capacity: count)
+        let lo = loB.contents().bindMemory(to: Float.self, capacity: count)
+        let hi = hiB.contents().bindMemory(to: Float.self, capacity: count)
+        for i in 0..<count { cov[i] = 0; lo[i] = 0; hi[i] = 0 }
+        guard !lastSnowIntruders.isEmpty else { return false }
+        let sup = supB.contents().bindMemory(to: Float.self, capacity: count)
+        for intr in lastSnowIntruders {
+            // The player figure (no staticID, no plowKey) is
+            // NOT an occupancy intruder — it interacts through
+            // footprint presses only, per the design record.
+            if intr.staticID == nil && intr.plowKey == nil { continue }
+            let i0 = max(0, Int((intr.worldMin.x - simOX) / simCS) - 1)
+            let i1 = min(simVX - 1, Int((intr.worldMax.x - simOX) / simCS) + 1)
+            let j0 = max(0, Int((intr.worldMin.z - simOZ) / simCS) - 1)
+            let j1 = min(simVZ - 1, Int((intr.worldMax.z - simOZ) / simCS) + 1)
+            if i1 < i0 || j1 < j0 { continue }
+            for j in j0...j1 {
+                for i in i0...i1 {
+                    let idx = j * simVX + i
+                    let x = simOX + Float(i) * simCS
+                    let z = simOZ + Float(j) * simCS
+                    // Same inside test the sheet's pinning used:
+                    // the vertex in the intruder's local frame
+                    // (the support height at the vertex rides
+                    // along, as it did there).
+                    let lp = intr.inverse * SIMD4<Float>(x, sup[idx], z, 1)
+                    let lx = lp.x - intr.centre.x
+                    let lz = lp.z - intr.centre.y
+                    let inside: Bool
+                    if intr.isCircle {
+                        inside = lx * lx + lz * lz < intr.half.x * intr.half.x
+                    } else {
+                        inside = abs(lx) < intr.half.x && abs(lz) < intr.half.y
+                    }
+                    if inside {
+                        cov[idx] = 1
+                        lo[idx] = intr.bottomY
+                        hi[idx] = intr.worldMax.y
+                    }
+                }
+            }
+        }
+        let dep = depB.contents().bindMemory(to: Float.self, capacity: count)
+        for idx in 0..<count where cov[idx] > 0 {
+            let d = dep[idx]
+            if d <= 0 { continue }
+            let ov = min(hi[idx] - sup[idx], d) - max(lo[idx] - sup[idx], 0)
+            if ov > 0.001 { return true }
+        }
+        return false
+    }
+
+    /// v4.11: stamp the queued footprint presses into the
+    /// press buffer (zeroed first). Called once per tick that
+    /// will actually step, after the activity decision and
+    /// before the encoder exists; the sources kernel consumes
+    /// the stamps on the first substep and a clear dispatch
+    /// follows it, so a press lands exactly once.
+    private func stampPressBuffer() {
+        let count = simVX * simVZ
+        guard count > 0, let pressB = simPressBuf,
+              pressB.length >= count * 4 else { pendingPresses.removeAll(); return }
+        let press = pressB.contents().bindMemory(to: Float.self, capacity: count)
+        for i in 0..<count { press[i] = 0 }
+        for p in pendingPresses {
+            let r = max(p.r, 0.05)
+            let i0 = max(0, Int((p.x - r - simOX) / simCS))
+            let i1 = min(simVX - 1, Int((p.x + r - simOX) / simCS))
+            let j0 = max(0, Int((p.z - r - simOZ) / simCS))
+            let j1 = min(simVZ - 1, Int((p.z + r - simOZ) / simCS))
+            if i1 < i0 || j1 < j0 { continue }
+            for j in j0...j1 {
+                for i in i0...i1 {
+                    let cx = simOX + Float(i) * simCS
+                    let cz = simOZ + Float(j) * simCS
+                    let d = hypotf(cx - p.x, cz - p.z) / r
+                    if d >= 1 { continue }
+                    let v = p.c * max(0, 1 - d)
+                    let idx = j * simVX + i
+                    if v > press[idx] { press[idx] = v }
+                }
+            }
+        }
+        pendingPresses.removeAll()
+    }
+
     private func simSyncLattice(ox: Float, oz: Float, cs: Float,
                                 vx: Int, vz: Int,
                                 supportY: [Float], hasSup: [Bool],
@@ -3411,8 +3623,8 @@ final class Renderer {
                                 targetSnow: [Float], targetWater: [Float],
                                 forceInit: Bool) {
         // v4.10.2: this function writes the shared sim
-        // buffers (ceilings/rates/depths) — fence on the last
-        // tick first so the writes can't race its kernels.
+        // buffers — fence on the last tick first so the
+        // writes can't race its kernels.
         waitForSimTick()
         let count = vx * vz
         guard count > 0, simSourcePipeline != nil else { simInitialised = false; return }
@@ -3441,9 +3653,12 @@ final class Renderer {
             && simVX == vx && simVZ == vz && simOX == ox && simOZ == oz
             && simCS == cs && simSupportHash == hash
         if latticeSame {
-            // Same lattice: refresh only the static field buffers
-            // (ceilings move with exposure / max depth).
+            // Same lattice: refresh only the static field
+            // buffers (ceilings/gates move with exposure / max
+            // depth). v4.11: the ceiling array is ALSO the
+            // snow deposition gate now.
             simWrite(simSnowCeilBuf, snowCeil)
+            simWrite(simSnowGateBuf, snowCeil)
             simWrite(simSnowRateBuf, driftFac)
             simWrite(simWaterCeilBuf, waterCeil)
             simWrite(simWaterRateBuf, waterRate)
@@ -3455,14 +3670,41 @@ final class Renderer {
             simPrevCentroids = centroids
             return
         }
-        var snow = targetSnow
+        // v4.11: the load-time initial condition for a vertex
+        // with no remapped state — the closed-form target
+        // depth converted to MASS via the density profile
+        // (deep initial snow starts compacted, shallow fresh).
+        func initMass(_ depth: Float) -> (m: Float, rho: Float, age: Float) {
+            let rho = snowInitRho(depth: depth)
+            return (max(0, depth) * rho, rho, depth > 0.05 ? 120 : 0)
+        }
+        var mass = [Float](repeating: 0, count: count)
+        var rhoA = [Float](repeating: Renderer.snowFreshRho(temp: simTemperature),
+                            count: count)
+        var ageA = [Float](repeating: 0, count: count)
         var water = targetWater
+        // Mass displaced by vertices whose host is NEW (the
+        // support-switch transfer, below).
+        var disp = [Float](repeating: 0, count: count)
+        var newHost = [Bool](repeating: false, count: count)
         if simInitialised, let oldSnowBuf = simSnowBuf, let oldWaterBuf = simWaterBuf,
+           let oldMassBuf = simSnowMassBuf, let oldRhoBuf = simSnowRhoBuf,
+           let oldAgeBuf = simSnowAgeBuf,
            simVX > 0, simVZ > 0 {
-            let oldSnow = simRead(oldSnowBuf, count: simVX * simVZ)
             let oldWater = simRead(oldWaterBuf, count: simVX * simVZ)
+            let oldMass = simRead(oldMassBuf, count: simVX * simVZ)
+            let oldRho = simRead(oldRhoBuf, count: simVX * simVZ)
+            let oldAge = simRead(oldAgeBuf, count: simVX * simVZ)
+            let oldSup = simRead(simSupportBuf, count: simVX * simVZ)
+            _ = oldSnowBuf // depth buffer no longer remapped (derived)
             let oldOX = simOX, oldOZ = simOZ, oldCS = simCS
             let oldVX = simVX, oldVZ = simVZ
+            let oldHosts = simPrevHostIDs
+            // Old surface (for transfer headroom weights).
+            var oldSurf = [Float](repeating: 0, count: oldVX * oldVZ)
+            for i in 0..<(oldVX * oldVZ) {
+                oldSurf[i] = oldSup[i] + oldMass[i] / max(oldRho[i], 0.05)
+            }
             for i in 0..<count where hasSup[i] {
                 let x = ox + Float(i % vx) * cs, z = oz + Float(i / vx) * cs
                 var dx: Float = 0, dz: Float = 0
@@ -3470,27 +3712,46 @@ final class Renderer {
                     dx = nc.x - oc.x; dz = nc.y - oc.y
                     if abs(dx) < 0.001 && abs(dz) < 0.001 { dx = 0; dz = 0 }
                 }
-                // v4.10.4: a vertex whose host is NEW to the
-                // lattice (no entry in simPrevCentroids) keeps
-                // its targetSnow/targetWater — do NOT sample
-                // the old field for it. Snow travels with hosts
-                // that existed; a new host starts from its own
-                // exposure-seeded target. (Pre-fix, a freshly
-                // placed box's top inherited the ground snow
-                // that happened to lie at the same XZ — up to
-                // the full field depth — and, its target being
-                // ~its ceiling, no edit transfer ever cleaned
-                // it up.) Vertices with no host, or a host the
-                // lattice already knew, sample exactly as
-                // before.
+                // v4.10.4 rule, kept: a vertex whose host is
+                // NEW to the lattice does NOT sample the old
+                // field for itself — it starts from its own
+                // exposure-seeded initial condition (a freshly
+                // placed box's top must not inherit the ground
+                // snow at the same XZ).
                 var hostIsNew = false
                 if let h = hostIDs[i], simPrevCentroids[h] == nil {
                     hostIsNew = true
                 }
-                if !hostIsNew {
-                    if let v = simSampleBilinear(oldSnow, ox: oldOX, oz: oldOZ, cs: oldCS,
+                if hostIsNew {
+                    newHost[i] = true
+                    let ic = initMass(targetSnow[i])
+                    mass[i] = ic.m; rhoA[i] = ic.rho; ageA[i] = ic.age
+                    // v4.11: the snow that USED to lie at this
+                    // world position (on the old host) is
+                    // displaced by the arriving object — it is
+                    // handed to the old host's surviving
+                    // vertices by the transfer pass below. It
+                    // is never deleted and never teleported
+                    // onto the new host.
+                    if let v = simSampleBilinear(oldMass, ox: oldOX, oz: oldOZ, cs: oldCS,
+                                                 vx: oldVX, vz: oldVZ, x: x, z: z), v > 0 {
+                        disp[i] = v
+                    }
+                } else {
+                    if let v = simSampleBilinear(oldMass, ox: oldOX, oz: oldOZ, cs: oldCS,
                                                  vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
-                        snow[i] = v
+                        mass[i] = v
+                        if let r = simSampleBilinear(oldRho, ox: oldOX, oz: oldOZ, cs: oldCS,
+                                                     vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
+                            rhoA[i] = min(max(r, 0.05), 1)
+                        }
+                        if let a = simSampleBilinear(oldAge, ox: oldOX, oz: oldOZ, cs: oldCS,
+                                                     vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
+                            ageA[i] = a
+                        }
+                    } else {
+                        let ic = initMass(targetSnow[i])
+                        mass[i] = ic.m; rhoA[i] = ic.rho; ageA[i] = ic.age
                     }
                     if let v = simSampleBilinear(oldWater, ox: oldOX, oz: oldOZ, cs: oldCS,
                                                  vx: oldVX, vz: oldVZ, x: x - dx, z: z - dz) {
@@ -3498,9 +3759,83 @@ final class Renderer {
                     }
                 }
             }
+            // SUPPORT-SWITCH TRANSFER: every displaced unit of
+            // mass lands on surviving vertices of the host it
+            // used to lie on, near the switch, weighted by
+            // surface headroom (water-filling — banks form at
+            // the object's base, then flux relaxes them to
+            // repose). Exactly conservative per vertex.
+            for i in 0..<count where disp[i] > 0 {
+                let x = ox + Float(i % vx) * cs, z = oz + Float(i / vx) * cs
+                // The old host at this world position.
+                var oldHost: UUID? = nil
+                let oi = Int(((x - oldOX) / oldCS).rounded())
+                let oj = Int(((z - oldOZ) / oldCS).rounded())
+                if oi >= 0, oj >= 0, oi < oldVX, oj < oldVZ,
+                   oj * oldVX + oi < oldHosts.count {
+                    oldHost = oldHosts[oj * oldVX + oi]
+                }
+                let surf0 = simSampleBilinear(oldSurf, ox: oldOX, oz: oldOZ, cs: oldCS,
+                                              vx: oldVX, vz: oldVZ, x: x, z: z)
+                    ?? (supportY[i] + targetSnow[i])
+                let ci = i % vx, cj = i / vx
+                var placed: Float = 0
+                // Same-host ring first (radius 1..3), then any
+                // supported ring vertex (radius 1..2).
+                for (radius, sameHostOnly) in [(1, true), (2, true), (3, true),
+                                               (1, false), (2, false)] {
+                    if placed > 0 { break }
+                    var cand: [(idx: Int, w: Float)] = []
+                    var wSum: Float = 0
+                    for dj in -radius...radius {
+                        for di in -radius...radius {
+                            if max(abs(di), abs(dj)) != radius { continue }
+                            let ni = ci + di, nj = cj + dj
+                            if ni < 0 || nj < 0 || ni >= vx || nj >= vz { continue }
+                            let c = nj * vx + ni
+                            if !hasSup[c] || newHost[c] { continue }
+                            if sameHostOnly && hostIDs[c] != oldHost { continue }
+                            let surfC = supportY[c] + mass[c] / max(rhoA[c], 0.05)
+                            let w = max(surf0 - surfC, 0) + 0.01
+                            cand.append((c, w))
+                            wSum += w
+                        }
+                    }
+                    if cand.isEmpty || wSum <= 0 { continue }
+                    for (c, w) in cand {
+                        let share = disp[i] * (w / wSum)
+                        mass[c] += share
+                        placed += share
+                    }
+                }
+                if placed <= 0 {
+                    // No neighbour exists at all (isolated
+                    // vertex): the mass stays on the vertex
+                    // rather than being deleted — conservation
+                    // is absolute.
+                    mass[i] += disp[i]
+                }
+            }
+        } else {
+            // First initialisation for this lattice: every
+            // vertex starts from its initial condition.
+            for i in 0..<count where hasSup[i] {
+                let ic = initMass(targetSnow[i])
+                mass[i] = ic.m; rhoA[i] = ic.rho; ageA[i] = ic.age
+            }
         }
-        simSnowBuf = makeSimBuffer(snow)
+        // The derived depth buffer (skin / water ceiling /
+        // snowDepthAt) starts consistent with the state.
+        var depth = [Float](repeating: 0, count: count)
+        for i in 0..<count where hasSup[i] {
+            depth[i] = mass[i] / max(rhoA[i], 0.05)
+        }
+        simSnowBuf = makeSimBuffer(depth)
         simWaterBuf = makeSimBuffer(water)
+        simSnowMassBuf = makeSimBuffer(mass)
+        simSnowRhoBuf = makeSimBuffer(rhoA)
+        simSnowAgeBuf = makeSimBuffer(ageA)
+        simSnowGateBuf = makeSimBuffer(snowCeil)
         simSupportBuf = makeSimBuffer(supportY)
         simSnowCeilBuf = makeSimBuffer(snowCeil)
         simSnowRateBuf = makeSimBuffer(driftFac)
@@ -3510,15 +3845,27 @@ final class Renderer {
         if simPinnedBuf == nil || (simPinnedBuf?.length ?? 0) != count * 4 {
             simPinnedBuf = makeSimBufferU32([UInt32](repeating: 0, count: count))
         }
+        // v4.11 tick buffers: occupancy + press are rewritten
+        // by the CPU every tick; the edge buffer holds
+        // (vertex, mass) displacement entries — worst case one
+        // press entry and one intrusion entry per vertex.
+        simOccCovBuf = makeSimBuffer([Float](repeating: 0, count: count))
+        simOccLoBuf = makeSimBuffer([Float](repeating: 0, count: count))
+        simOccHiBuf = makeSimBuffer([Float](repeating: 0, count: count))
+        simPressBuf = makeSimBuffer([Float](repeating: 0, count: count))
+        simEdgeCapacity = 2 * count + 64
+        simEdgeBuf = device.makeBuffer(length: simEdgeCapacity * 8,
+                                       options: .storageModeShared)
+        simEdgeCountBuf = makeSimBufferU32([0])
         simOX = ox; simOZ = oz; simCS = cs; simVX = vx; simVZ = vz
         simSupportHash = hash
         simPrevCentroids = centroids
-        simInitialised = simSnowBuf != nil && simWaterBuf != nil
+        simPrevHostIDs = hostIDs
+        simInitialised = simSnowBuf != nil && simWaterBuf != nil && simSnowMassBuf != nil
         simSettled = false
         // v4.9 (item 4): content knowledge from the actual
-        // (re)initialised fields — the arrays in hand ARE the
-        // new buffer contents.
-        simSnowContent = snow.contains { $0 > 0 }
+        // (re)initialised fields.
+        simSnowContent = mass.contains { $0 > 0 }
         simWaterContent = water.contains { $0 > 0 }
         simSnowCeilMax = snowCeil.max() ?? 0
         simWaterCeilMax = waterCeil.max() ?? 0
@@ -3556,10 +3903,11 @@ final class Renderer {
                                 vx: Int, vz: Int, cs: Float,
                                 ox: Float, oz: Float,
                                 plowMaxPos: Float, plowMinNeg: Float,
-                                initialised: Bool, swapped: Bool) {
+                                initialised: Bool, swapped: Bool,
+                                mass: [Float], rho: [Float]) {
         guard simInitialised else {
             return ([], [], [], simVX, simVZ, simCS, simOX, simOZ, 0, 0, false,
-                    staticEverSwapped)
+                    staticEverSwapped, [], [])
         }
         waitForSimTick()
         var plowMaxPos: Float = 0
@@ -3572,7 +3920,31 @@ final class Renderer {
                 simRead(simSupportBuf, count: simVX * simVZ),
                 simRead(simSnowCeilBuf, count: simVX * simVZ),
                 simVX, simVZ, simCS, simOX, simOZ,
-                plowMaxPos, plowMinNeg, true, staticEverSwapped)
+                plowMaxPos, plowMinNeg, true, staticEverSwapped,
+                simRead(simSnowMassBuf, count: simVX * simVZ),
+                simRead(simSnowRhoBuf, count: simVX * simVZ))
+    }
+
+    /// LS-REPRO (v4.11 physics variants): replace the snow
+    /// state wholesale with an injected field (mass + uniform
+    /// density), the way the mirror audit seeds its scenarios.
+    /// Fenced like every CPU sim write; the derived depth
+    /// buffer is rewritten to match. INERT in normal use — no
+    /// call site outside ReproDriver.
+    func reproInjectSnow(mass: [Float], rho: Float) {
+        guard simInitialised, mass.count == simVX * simVZ else { return }
+        waitForSimTick()
+        let count = simVX * simVZ
+        simWrite(simSnowMassBuf, mass)
+        simWrite(simSnowRhoBuf, [Float](repeating: rho, count: count))
+        simWrite(simSnowAgeBuf, [Float](repeating: 0, count: count))
+        var depth = [Float](repeating: 0, count: count)
+        for i in 0..<count {
+            depth[i] = mass[i] / max(rho, 0.05)
+        }
+        simWrite(simSnowBuf, depth)
+        simSnowContent = mass.contains { $0 > 0 }
+        simSettled = false
     }
 
     /// Drop all sim state (Clear build-up / Re-roll): the next
@@ -3583,6 +3955,8 @@ final class Renderer {
         simLastTick = 0
         simSnowContent = false
         simWaterContent = false
+        pressedStampKeys.removeAll()
+        pendingPresses.removeAll()
     }
 
     /// v4.10 (WS1): the session woke from an idle freeze spanning
@@ -3608,11 +3982,13 @@ final class Renderer {
 
     /// Step the simulation from the render loop. Fixed substeps
     /// of 1/30 s, at most 4 per frame (excess time is dropped,
-    /// never spiralled); 1 source/sink dispatch + 3 flow passes
-    /// (each = red + black, snow + water) per substep. Skipped
-    /// entirely when nothing can change: no weather input, no
-    /// sink, and the flow settle scan (every 0.5 s, CPU scan of
-    /// the shared buffers) reports max slope excess < 0.5 mm.
+    /// never spiralled). Per substep: the v4.8 water system
+    /// (source/sink + levelling flow) runs untouched; the
+    /// v4.11 snow physics runs sources → flux → displacement →
+    /// writeback. Skipped entirely when nothing can change: no
+    /// weather input, no live intrusion or press, and the
+    /// settle scan (every 0.5 s, CPU scan of the shared
+    /// buffers) reports no slope past the dynamic repose.
     func tickWeatherSim(now: CFTimeInterval) {
         // LS-REPRO TOGGLE `simtick`: skip GPU sim stepping
         // entirely — the depth buffers keep the sheet build's
@@ -3623,19 +3999,35 @@ final class Renderer {
               let supB = simSupportBuf, let ceilB = simSnowCeilBuf,
               let rateB = simSnowRateBuf, let wCeilB = simWaterCeilBuf,
               let wRateB = simWaterRateBuf, let hasB = simHasBuf,
-              let pinB = simPinnedBuf else { return }
+              let pinB = simPinnedBuf,
+              let snowSrc = snowSourcesPipeline, let snowFlux = snowFluxPipeline,
+              let dispCount = snowDisplaceCountPipeline,
+              let dispApply = snowDisplaceApplyPipeline,
+              let writeback = snowWritebackPipeline,
+              let edgeReset = snowEdgeResetPipeline,
+              let pressClear = snowPressClearPipeline,
+              let massB = simSnowMassBuf, let rhoB = simSnowRhoBuf,
+              let ageB = simSnowAgeBuf, let gateB = simSnowGateBuf,
+              let occCovB = simOccCovBuf, let occLoB = simOccLoBuf,
+              let occHiB = simOccHiBuf, let pressB = simPressBuf,
+              let edgeB = simEdgeBuf, let edgeCountB = simEdgeCountBuf
+              else { return }
         noteWeatherStep("tick:entry")
         // v4.10.1 hardening: the shared buffers must actually
-        // hold the lattice the counts describe — if any buffer
-        // is short (allocation edge), the tick steps nothing
-        // rather than binding/reading past its length.
+        // hold the lattice the counts describe.
         let latticeCount = simVX * simVZ
         guard latticeCount > 0,
               snowB.length >= latticeCount * 4, waterB.length >= latticeCount * 4,
               supB.length >= latticeCount * 4, ceilB.length >= latticeCount * 4,
               rateB.length >= latticeCount * 4, wCeilB.length >= latticeCount * 4,
               wRateB.length >= latticeCount * 4, hasB.length >= latticeCount * 4,
-              pinB.length >= latticeCount * 4 else { return }
+              pinB.length >= latticeCount * 4,
+              massB.length >= latticeCount * 4, rhoB.length >= latticeCount * 4,
+              ageB.length >= latticeCount * 4, gateB.length >= latticeCount * 4,
+              occCovB.length >= latticeCount * 4, occLoB.length >= latticeCount * 4,
+              occHiB.length >= latticeCount * 4, pressB.length >= latticeCount * 4,
+              edgeB.length >= simEdgeCapacity * 8, edgeCountB.length >= 4
+              else { return }
         if simLastTick == 0 { simLastTick = now; return }
         let rawDt = now - simLastTick
         simLastTick = now
@@ -3644,57 +4036,104 @@ final class Renderer {
         // buffers on the CPU — fence on the previous tick
         // before touching them (and before encoding this one).
         waitForSimTick()
+        // v4.11: footprint stamps press ONCE, when they first
+        // appear in the session's stamp list (the list itself
+        // is rebuilt every frame in Play; a stamp's identity
+        // here is its quantised position).
+        do {
+            var keys = Set<Int64>()
+            keys.reserveCapacity(snowFootprints.count)
+            for st in snowFootprints {
+                let key = Renderer.snowPlowKey(Int((st.x * 50).rounded()),
+                                               Int((st.z * 50).rounded()))
+                keys.insert(key)
+                if !pressedStampKeys.contains(key) {
+                    pendingPresses.append((x: st.x, z: st.z, r: st.radius, c: st.compress))
+                }
+            }
+            pressedStampKeys = keys
+        }
+        // v4.11: rasterise occupancy (returns true only when
+        // some column's snow actually overlaps an intruder).
+        let anyIntrusion = prepareSnowTickBuffers()
+        let pressesQueued = !pendingPresses.isEmpty
         let inputsActive = simSnowBaseRate > 0 || simSnowSinkRate > 0
             || simRaining || weatherFreeze > 0.001
-        if !inputsActive && simSettled { simStepsLastFrame = 0; return }
+        if !inputsActive && !anyIntrusion && !pressesQueued && simSettled {
+            simStepsLastFrame = 0; return
+        }
         // Settle scan at most twice a second while inactive.
-        // v4.9 (2a): the scan reads the shared buffers through
-        // their contents() pointers — the same values simRead
-        // copied out (two full arrays per scan before; zero
-        // bytes copied now). It also refreshes the per-kind
-        // content flags (item 4) from the same read.
-        if !inputsActive, now - simLastSettleScan >= 0.5 {
+        // v4.11: the test is the physics fixed point itself —
+        // over all EIGHT neighbour pairs (support steps
+        // included), the surface slope past the pair's
+        // dynamic repose (temperature + sinter), skipping
+        // pairs whose higher endpoint is bare support (an
+        // exposed object wall is not a snow slope). Intrusion
+        // overlap is already excluded by anyIntrusion above:
+        // a live displacement is never "settled".
+        if !inputsActive, !anyIntrusion, !pressesQueued,
+           now - simLastSettleScan >= 0.5 {
             noteWeatherStep("tick:settleScan")
             simLastSettleScan = now
             let count = simVX * simVZ
-            let snowPtr = snowB.contents().bindMemory(to: Float.self, capacity: count)
+            let massPtr = massB.contents().bindMemory(to: Float.self, capacity: count)
+            let rhoPtr = rhoB.contents().bindMemory(to: Float.self, capacity: count)
+            let agePtr = ageB.contents().bindMemory(to: Float.self, capacity: count)
             let supPtr = supB.contents().bindMemory(to: Float.self, capacity: count)
             let waterPtr = waterB.contents().bindMemory(to: Float.self, capacity: count)
-            // LS-REPRO TOGGLE `copyreads`: when on, the scan
-            // reads explicit simRead copies of the buffers
-            // instead of the v4.9 zero-copy contents() pointers
-            // (the accessors below are the scan's only read
-            // path; the tick's length guard above guarantees
-            // the copies hold `count` values). Default OFF =
-            // shipped behaviour.
-            let snowCopy: [Float]? = ReproToggles.copyReads ? simRead(snowB, count: count) : nil
+            // LS-REPRO TOGGLE `copyreads`: explicit simRead
+            // copies instead of the zero-copy contents()
+            // pointers (the scan's only read path). Default
+            // OFF = shipped behaviour.
+            let massCopy: [Float]? = ReproToggles.copyReads ? simRead(massB, count: count) : nil
+            let rhoCopy: [Float]? = ReproToggles.copyReads ? simRead(rhoB, count: count) : nil
+            let ageCopy: [Float]? = ReproToggles.copyReads ? simRead(ageB, count: count) : nil
             let supCopy: [Float]? = ReproToggles.copyReads ? simRead(supB, count: count) : nil
             let waterCopy: [Float]? = ReproToggles.copyReads ? simRead(waterB, count: count) : nil
-            func snowAt(_ i: Int) -> Float { snowCopy.map { $0[i] } ?? snowPtr[i] }
+            func massAt(_ i: Int) -> Float { massCopy.map { $0[i] } ?? massPtr[i] }
+            func rhoAt(_ i: Int) -> Float { rhoCopy.map { $0[i] } ?? rhoPtr[i] }
+            func ageAt(_ i: Int) -> Float { ageCopy.map { $0[i] } ?? agePtr[i] }
             func supAt(_ i: Int) -> Float { supCopy.map { $0[i] } ?? supPtr[i] }
             func waterAt(_ i: Int) -> Float { waterCopy.map { $0[i] } ?? waterPtr[i] }
-            var maxSnow: Float = 0
+            var maxMass: Float = 0
             var maxWater: Float = 0
+            var surf = [Float](repeating: 0, count: count)
+            var dep = [Float](repeating: 0, count: count)
             for idx in 0..<count {
-                if snowAt(idx) > maxSnow { maxSnow = snowAt(idx) }
+                let m = massAt(idx)
+                if m > maxMass { maxMass = m }
                 if waterAt(idx) > maxWater { maxWater = waterAt(idx) }
+                dep[idx] = m / max(rhoAt(idx), 0.05)
+                surf[idx] = supAt(idx) + dep[idx]
             }
-            simSnowContent = maxSnow > 0
+            simSnowContent = maxMass > 0
             simWaterContent = maxWater > 0
-            let maxStep = 0.7536 * simCS
+            let baseTan = tanf(Renderer.snowReposeDeg(temp: simTemperature)
+                               * Float.pi / 180)
+            func pairTan(_ a: Int, _ b: Int) -> Float {
+                let fa = min(ageAt(a) / 600, 1)
+                let fb = min(ageAt(b) / 600, 1)
+                return baseTan + 0.0699268 * max(fa, fb)
+            }
             var worst: Float = 0
             for j in 0..<simVZ {
                 for i in 0..<simVX {
                     let a = j * simVX + i
-                    if snowAt(a) <= 0 { continue }
-                    if i + 1 < simVX {
-                        let d = abs((supAt(a) + snowAt(a)) - (supAt(a + 1) + snowAt(a + 1)))
-                        if supAt(a + 1) != 0 || snowAt(a + 1) > 0 { worst = max(worst, d - maxStep) }
-                    }
-                    if j + 1 < simVZ {
-                        let b = a + simVX
-                        let d = abs((supAt(a) + snowAt(a)) - (supAt(b) + snowAt(b)))
-                        worst = max(worst, d - maxStep)
+                    // (di, dj, dist in cells) over the 8-neighbourhood.
+                    let nbrs: [(Int, Int, Float)] = [(1, 0, 1), (0, 1, 1),
+                                                     (1, 1, 1.41421356), (1, -1, 1.41421356)]
+                    for (di, dj, dc) in nbrs {
+                        let ni = i + di, nj = j + dj
+                        if ni < 0 || nj < 0 || ni >= simVX || nj >= simVZ { continue }
+                        let b = nj * simVX + ni
+                        // Bare-wall rule: the higher endpoint
+                        // must carry snow for this to be a
+                        // snow slope at all.
+                        let hi = surf[a] >= surf[b] ? a : b
+                        if dep[hi] <= 0.001 { continue }
+                        let excess = abs(surf[a] - surf[b])
+                            - pairTan(a, b) * dc * simCS
+                        if excess > worst { worst = excess }
                     }
                 }
             }
@@ -3713,21 +4152,27 @@ final class Renderer {
         // active), which is why the app died the moment snow
         // started accumulating. No return path may ever again
         // sit between an encoder's creation and its
-        // endEncoding.
+        // endEncoding. v4.11 keeps the structure verbatim;
+        // snow activity additionally includes live intrusion
+        // and queued presses (a resting scene with a box
+        // sinking into snow must keep stepping).
         let snowCreates = simSnowBaseRate > 0 && simSnowCeilMax > 0
         let waterBaseRate = simRaining ? simWaterBase : 0
         let waterCreates = simRaining && waterBaseRate > 0 && simWaterCeilMax > 0
         if snowCreates { simSnowContent = true }
         if waterCreates { simWaterContent = true }
-        let snowActive = simSnowContent || snowCreates
+        let snowActive = simSnowContent || snowCreates || anyIntrusion || pressesQueued
         let waterActive = simWaterContent || waterCreates
         if !snowActive && !waterActive {
-            // Neither field can change this frame; the source/
-            // sink dispatch would be the identity on both kinds
-            // as well, so the whole tick encodes nothing.
+            // Neither field can change this frame.
             simStepsLastFrame = 0
             return
         }
+        // v4.11: stamp the queued presses into the press
+        // buffer (CPU, still before any encoder exists — the
+        // sources kernel consumes them on the first substep;
+        // a clear dispatch follows that substep's sources).
+        if snowActive && pressesQueued { stampPressBuffer() }
         let sub = 1.0 / 30.0
         let steps = min(4, max(1, Int((rawDt / sub).rounded())))
         simStepsLastFrame = steps
@@ -3744,21 +4189,12 @@ final class Renderer {
         params.freezeFrac = weatherFreeze
         params.snowBase = simSnowBaseRate
         params.waterBase = simRaining ? simWaterBase : 0
-        // v4.9 (item 4): per-kind activity gating. A flow kind
-        // whose field is entirely zero is mathematically
-        // identity — every transfer in simFlowKernel clamps to
-        // the giver's depth (and the boundary drain scales the
-        // giver's own depth), so zero in means zero out, bit
-        // for bit. A kind is ACTIVE iff it has content (flag set
-        // by lattice sync / recorder edits / the settle scan's
-        // full read — never guessed) or a source can create
-        // content this tick (positive base rate AND a positive
-        // ceiling somewhere). Sinks, compaction, drying and
-        // drainage never create content, so they need no
-        // activity of their own: on zero content they are the
-        // identity too (max(0, 0 - sink*dt) == 0). The decision
-        // itself is computed above, before the command buffer
-        // exists (v4.10.3 — see the note there).
+        // v4.11 snow physics parameters.
+        params.snowMode = 1
+        params.reposeTan = tanf(Renderer.snowReposeDeg(temp: simTemperature)
+                                * Float.pi / 180)
+        params.freshRho = Renderer.snowFreshRho(temp: simTemperature)
+        params.snowTemp = simTemperature ?? 999
         noteWeatherStep("tick:dispatch")
         let threads = MTLSize(width: simVX * simVZ, height: 1, depth: 1)
         func bindSim(_ e: MTLComputeCommandEncoder) {
@@ -3772,53 +4208,138 @@ final class Renderer {
             e.setBuffer(hasB, offset: 0, index: 7)
             e.setBuffer(pinB, offset: 0, index: 9)
         }
-        // v4.9 (item 4): dispatch consolidation. The two flow
-        // kinds merge into ONE dispatch per (pass, parity) with
-        // kind == 2 when both are active (the kernel loops over
-        // the kinds; their writable state is disjoint, so every
-        // transfer per buffer is unchanged — see Shaders.metal).
-        // Parity dispatches stay separate (red/black in one
-        // dispatch would race). Barriers are emitted BETWEEN
-        // dispatches only: v4.8's barrier after the final
-        // dispatch of the tick ordered nothing (the encoder
-        // ends and the queue orders the next command buffer).
-        // Per substep: 1 source + 6 flow = 7 dispatches (was
-        // 13), barriers = dispatches - 1 per tick.
-        let flowKind: UInt32 = (snowActive && waterActive) ? 2 : (snowActive ? 0 : 1)
         var dispatched = false
         func barrierIfNeeded() {
             if dispatched { enc.memoryBarrier(scope: .buffers) }
         }
-        for _ in 0..<steps {
-            params.dt = Float(sub)
+        func dispatch(_ pipe: MTLComputePipelineState,
+                      _ t: MTLSize, _ bind: (MTLComputeCommandEncoder) -> Void) {
             barrierIfNeeded()
-            params.parity = 0; params.kind = 0
-            enc.setComputePipelineState(src)
-            bindSim(enc)
+            enc.setComputePipelineState(pipe)
+            bind(enc)
             enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 8)
-            let w = src.threadExecutionWidth
-            enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+            let w = pipe.threadExecutionWidth
+            enc.dispatchThreads(t, threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
             dispatched = true
-            for _ in 0..<3 {
-                for parity in [UInt32(0), UInt32(1)] {
+        }
+        var edgeCap = UInt32(simEdgeCapacity)
+        for stepIdx in 0..<steps {
+            params.dt = Float(sub)
+            // Water source/sink (its snow half is gated off by
+            // snowMode) — runs whenever either kind is active,
+            // exactly as before.
+            dispatch(src, threads) { e in bindSim(e) }
+            if waterActive {
+                for _ in 0..<3 {
+                    for parity in [UInt32(0), UInt32(1)] {
+                        params.kind = 1; params.parity = parity
+                        dispatch(flow, threads) { e in bindSim(e) }
+                    }
+                }
+            }
+            if snowActive {
+                // 0: clear the displacement edge counter.
+                barrierIfNeeded()
+                enc.setComputePipelineState(edgeReset)
+                enc.setBuffer(edgeCountB, offset: 0, index: 0)
+                enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                dispatched = true
+                // 1: sources / sinks / compaction / press / age.
+                barrierIfNeeded()
+                enc.setComputePipelineState(snowSrc)
+                enc.setBuffer(massB, offset: 0, index: 0)
+                enc.setBuffer(rhoB, offset: 0, index: 1)
+                enc.setBuffer(ageB, offset: 0, index: 2)
+                enc.setBuffer(supB, offset: 0, index: 3)
+                enc.setBuffer(gateB, offset: 0, index: 4)
+                enc.setBuffer(rateB, offset: 0, index: 5)
+                enc.setBuffer(hasB, offset: 0, index: 6)
+                enc.setBuffer(occCovB, offset: 0, index: 7)
+                enc.setBuffer(pressB, offset: 0, index: 8)
+                enc.setBuffer(edgeB, offset: 0, index: 9)
+                enc.setBuffer(edgeCountB, offset: 0, index: 10)
+                enc.setBytes(&edgeCap, length: 4, index: 11)
+                enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 12)
+                let ws = snowSrc.threadExecutionWidth
+                enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: ws, height: 1, depth: 1))
+                dispatched = true
+                // Presses are one-shot events: clear the stamp
+                // buffer after the first substep consumed it.
+                if stepIdx == 0 && pressesQueued {
                     barrierIfNeeded()
-                    params.kind = flowKind; params.parity = parity
-                    enc.setComputePipelineState(flow)
-                    bindSim(enc)
-                    enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 8)
-                    let wf = flow.threadExecutionWidth
-                    enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: wf, height: 1, depth: 1))
+                    enc.setComputePipelineState(pressClear)
+                    enc.setBuffer(pressB, offset: 0, index: 0)
+                    let wp = pressClear.threadExecutionWidth
+                    enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: wp, height: 1, depth: 1))
                     dispatched = true
                 }
+                // 2: gravity flux — 3 rounds x 4 colour classes.
+                for _ in 0..<3 {
+                    for cls in [UInt32(0), UInt32(1), UInt32(2), UInt32(3)] {
+                        barrierIfNeeded()
+                        params.parity = cls
+                        enc.setComputePipelineState(snowFlux)
+                        enc.setBuffer(massB, offset: 0, index: 0)
+                        enc.setBuffer(rhoB, offset: 0, index: 1)
+                        enc.setBuffer(ageB, offset: 0, index: 2)
+                        enc.setBuffer(supB, offset: 0, index: 3)
+                        enc.setBuffer(hasB, offset: 0, index: 4)
+                        enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 5)
+                        let wf = snowFlux.threadExecutionWidth
+                        enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: wf, height: 1, depth: 1))
+                        dispatched = true
+                    }
+                }
+                // 3a: displacement count.
+                barrierIfNeeded()
+                enc.setComputePipelineState(dispCount)
+                enc.setBuffer(massB, offset: 0, index: 0)
+                enc.setBuffer(rhoB, offset: 0, index: 1)
+                enc.setBuffer(supB, offset: 0, index: 2)
+                enc.setBuffer(hasB, offset: 0, index: 3)
+                enc.setBuffer(occCovB, offset: 0, index: 4)
+                enc.setBuffer(occLoB, offset: 0, index: 5)
+                enc.setBuffer(occHiB, offset: 0, index: 6)
+                enc.setBuffer(edgeB, offset: 0, index: 7)
+                enc.setBuffer(edgeCountB, offset: 0, index: 8)
+                enc.setBytes(&edgeCap, length: 4, index: 9)
+                enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 10)
+                let wc = dispCount.threadExecutionWidth
+                enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: wc, height: 1, depth: 1))
+                dispatched = true
+                // 3b: displacement apply (one thread per
+                // possible edge entry; the kernel reads the
+                // live counter and returns past it).
+                barrierIfNeeded()
+                enc.setComputePipelineState(dispApply)
+                enc.setBuffer(massB, offset: 0, index: 0)
+                enc.setBuffer(rhoB, offset: 0, index: 1)
+                enc.setBuffer(supB, offset: 0, index: 2)
+                enc.setBuffer(hasB, offset: 0, index: 3)
+                enc.setBuffer(occCovB, offset: 0, index: 4)
+                enc.setBuffer(edgeB, offset: 0, index: 5)
+                enc.setBuffer(edgeCountB, offset: 0, index: 6)
+                enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 7)
+                let wa = dispApply.threadExecutionWidth
+                enc.dispatchThreads(MTLSize(width: simEdgeCapacity, height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: wa, height: 1, depth: 1))
+                dispatched = true
+                // 4: writeback (derived depth for skin/water).
+                barrierIfNeeded()
+                enc.setComputePipelineState(writeback)
+                enc.setBuffer(snowB, offset: 0, index: 0)
+                enc.setBuffer(massB, offset: 0, index: 1)
+                enc.setBuffer(rhoB, offset: 0, index: 2)
+                enc.setBuffer(hasB, offset: 0, index: 3)
+                enc.setBytes(&params, length: MemoryLayout<SimParams>.stride, index: 4)
+                let ww = writeback.threadExecutionWidth
+                enc.dispatchThreads(threads, threadsPerThreadgroup: MTLSize(width: ww, height: 1, depth: 1))
+                dispatched = true
             }
         }
         // v4.10.2: the tick's outcome joins the weather-step
-        // trail. Round 1–2 established the tick had NO error
-        // reporting at all — a GPU fault in it presented
-        // exactly like Sean's silent crash. Now a completed
-        // tick advances the tag (proving the sim dispatch is
-        // exonerated if a later step dies) and an errored one
-        // names itself.
+        // trail (see the note there — kept verbatim).
         cmd.addCompletedHandler { [weak self] b in
             let tag: String?
             if b.status == .error { tag = "tick:gpuError" }
@@ -3847,6 +4368,9 @@ final class Renderer {
         let snowPossible = weatherGeoSnow > 0.001 || weatherSnowAmount > 0.001
             || objectSnowAmounts.values.contains { $0 > 0.001 }
         guard wet > 0.001 || snowPossible else { return }
+        // v4.11: the tick's occupancy rasteriser works from
+        // the intruder set this build computed.
+        lastSnowIntruders = intruders
         // v4.9 (2b): the support index depends only on the
         // included world meshes + per-object amounts — cache it
         // under that key and reuse it on scoped rebuilds (and
@@ -3982,271 +4506,21 @@ final class Renderer {
                 }
             }
         }
-        // v4.6: the layer delta actually applied per vertex
-        // (signed), for the pinning test in (c2).
-        var layerDelta = [Float](repeating: 0, count: vx * vz)
-        var layerApplied = [Bool](repeating: false, count: vx * vz)
-        /// v4.6: lattice indices the recorder carved THIS
-        /// pass — pinned for this pass's relaxation only
-        /// (blade-compacted snow; stops the cumulative
-        /// slump-ratchet across a 50-step drag).
-        var carvedThisPass = Set<Int>()
-
-
-        // (c0/c1) v4.6: PLOW RECORDER + DISPLACEMENT LAYER.
-        // The recorder reads the columns exactly as v4.5
-        // computed them (field + imprints + footprints — the
-        // "base") and writes trails/berms into the layer;
-        // then every column's total becomes base + layer
-        // delta, BEFORE pinning and relaxation, so the repose
-        // pass slumps berms and trail walls like any snow.
-        // When the layer is empty and nothing moved, both
-        // steps are exact no-ops and the sheet is v4.5's.
-        if snowPossible {
-            noteWeatherStep("sheet:plowRecord")
-            var baseH = [Float](repeating: 0, count: vx * vz)
-            var supportY = [Float](repeating: 0, count: vx * vz)
-            var hasSupport = [Bool](repeating: false, count: vx * vz)
-            for idx in verts.indices {
-                if let s = verts[idx].support {
-                    hasSupport[idx] = true
-                    supportY[idx] = s.y
-                    baseH[idx] = verts[idx].snowH
-                }
-            }
-            carvedThisPass = recordPlowing(intruders: intruders, grid: grid,
-                          ox: ox, oz: oz, cs: cs, nx: nx, nz: nz,
-                          baseH: baseH, supportY: supportY,
-                          hasSupport: hasSupport,
-                          latticeSupports: rawSupports)
-            if !snowPlow.isEmpty {
-                noteWeatherStep("sheet:plowLayer")
-                for j in 0..<vz {
-                    for i in 0..<vx {
-                        let idx = vIdx(i, j)
-                        guard let s = verts[idx].support else { continue }
-                        let d = plowDeltaAt(x: vX(i), z: vZ(j))
-                        if d != 0 {
-                            // The layer moves SNOW, never the
-                            // support: depth clamps at 0 (a
-                            // trail cannot dig below the
-                            // surface it was carved in).
-                            // Remember the SIGNED delta for the
-                            // pinning test in (c2).
-                            layerDelta[idx] = d
-                            layerApplied[idx] = true
-                            // v4.10.4 (round 3): a deposit may
-                            // not stack a column more than
-                            // 0.6 m above its own pre-layer
-                            // depth. The recorder conserves
-                            // volume exactly, but its front
-                            // band concentrates the standing
-                            // bow wave into the cells at the
-                            // mover's face, and a deposit cell
-                            // flanked by the pinned trench and
-                            // the mover's wall is relaxation-
-                            // isolated (pinned neighbours are
-                            // skipped, support steps are
-                            // skipped), so the raw stack reached
-                            // the sim unshaped: single-cell
-                            // deltas of +3.5 m, a settled wall
-                            // ~3.3 m tall in the deepdrag repro
-                            // (cap 2.0). The cap bounds the
-                            // APPLIED total only — the stored
-                            // layer is untouched, so the target
-                            // stays a fixed point (no ratchet),
-                            // and berms still stand up to
-                            // 0.6 m proud of the field.
-                            let preLayer = verts[idx].snowH
-                            verts[idx].snowH = min(max(0, preLayer + d),
-                                                   preLayer + 0.6)
-                            verts[idx].topY = s.y + verts[idx].snowH
-                        }
-                    }
-                }
-            }
-        } else {
-            // No snow to plow (rain-only or dry rebuild):
-            // advance the motion memory without recording.
-            var snap: [Int: PlowPrev] = [:]
-            for intr in intruders
-            where !(intr.staticID == nil && intr.plowKey == nil) {
-                snap[plowIdentityKey(intr)] = plowSnapshot(intr)
-            }
-            prevPlowIntruders = snap
-        }
-        // (c1b) v4.10.4: PINNED columns + REPOSE RELAXATION of
-        // the TARGET — the v4.6 shaping, restored to BEFORE the
-        // sim sync (it sat in (c2), after the sync, and ran 0
-        // passes while the sim was live, so recorder deposits
-        // reached the sim and the screen UNSHAPED at every drag
-        // rebuild, and the flow kernel's work at edited cells
-        // was overwritten by the raw target at the next one).
-        //
-        // A column is PINNED when a contacting intruder's
-        // footprint covers it and the intruder's underside is
-        // at or below the column's snow top — the object is
-        // physically holding that snow down, so relaxation
-        // must not move it (and the drop at a present object's
-        // wall is the object's own silhouette, like a support
-        // step — the sheet meets the wall at the banked
-        // height and the compressed interior is inside the
-        // object, unseen).
-        //
-        // Relaxation then enforces the angle of repose on the
-        // snow SURFACE: between same-support neighbours
-        // (support heights within 5 cm — a genuine support
-        // step is the object's silhouette, not snow holding a
-        // cliff), no edge may exceed tan(37°) × cell. It runs
-        // Gauss–Seidel (in-place, fixed sweep order) because
-        // the Jacobi form of this scheme DIVERGES in 2D (four
-        // edges per column, per-edge transfer of half the
-        // excess overshoots — host audit, v4.5: heights blew
-        // past 1e10 within 40 passes on the pit grid). GS
-        // leaves each visited pair exactly at the limit and
-        // is a pure function of the current height state:
-        // deterministic per rebuild, no state, nothing extra
-        // stored — save/load is untouched. Effect: lift a
-        // buried block and the pit the imprint leaves slumps —
-        // audit: max interior slope 81° -> 37°, pit centre
-        // recovers 0.00 -> 0.76 m of its 1.56 m field (a smooth
-        // hollow; volume is conserved, so it does not fill
-        // flat). Footprint stamps (soft, unpinned) get their
-        // rims softened the same way. The GPU sim still owns
-        // evolution BETWEEN rebuilds at unedited cells; at
-        // edited cells it now starts from this shaped state.
-        noteWeatherStep("sheet:pinRelax")
-        var pinned = [Bool](repeating: false, count: vx * vz)
-        if snowPossible {
-            for j in 0..<vz {
-                for i in 0..<vx {
-                    let idx = vIdx(i, j)
-                    guard let s = verts[idx].support else { continue }
-                    let x = vX(i), z = vZ(j)
-                    for intr in intruders {
-                        if let sid = intr.staticID, sid == s.hostID { continue }
-                        if x < intr.worldMin.x - 0.5 || x > intr.worldMax.x + 0.5
-                            || z < intr.worldMin.z - 0.5 || z > intr.worldMax.z + 0.5 {
-                            continue
-                        }
-                        // v4.6: the underside test reads the
-                        // column top WITHOUT the displacement
-                        // layer — a berm the plow just deposited
-                        // beside (or the trail under) the
-                        // footprint must slump like any snow,
-                        // not be pinned by the layer's own
-                        // height. layerTop was captured before
-                        // step (c1) overwrote topY.
-                        let layerTop = s.y + verts[idx].snowH
-                            - (layerApplied[idx] ? layerDelta[idx] : 0)
-                        guard intr.worldMax.y > s.y + 0.001,
-                              intr.bottomY - 0.02 <= layerTop + 0.01 else { continue }
-                        let lp = intr.inverse * SIMD4<Float>(x, s.y, z, 1)
-                        let lx = lp.x - intr.centre.x
-                        let lz = lp.z - intr.centre.y
-                        let inside: Bool
-                        if intr.isCircle {
-                            inside = lx * lx + lz * lz < intr.half.x * intr.half.x
-                        } else {
-                            inside = abs(lx) < intr.half.x && abs(lz) < intr.half.y
-                        }
-                        if inside { pinned[idx] = true; break }
-                    }
-                }
-            }
-            // v4.6: freshly carved columns are blade-
-            // compacted — pinned for THIS pass too (the
-            // persistent rule below covers them from the next
-            // pass on; this covers the carving pass itself).
-            for vi in carvedThisPass { pinned[vi] = true }
-            // v4.6: and PERSISTENTLY — any column whose
-            // stored layer delta is a real carve (≤ −0.10 m)
-            // is compacted snow: pinned in every pass, like
-            // snow an object is standing on. The repose pass
-            // otherwise treats a narrow deep trail exactly
-            // like the v4.5 imprint pit and slumps it to a
-            // wide V in a single solve (audit round 6: stored
-            // carve −1.45 m rendered as a 0.49 m trough).
-            // Loose snow — berms (positive deltas), field,
-            // pits — relaxes as always; only the blade-packed
-            // floor holds.
-            if !snowPlow.isEmpty {
-                for idx in verts.indices where layerApplied[idx] {
-                    if layerDelta[idx] <= -0.10 { pinned[idx] = true }
-                }
-            }
-            let maxStep = Float(0.7536) * cs // tan(37°) × cell
-            for _ in 0..<48 {
-                var worst: Float = 0
-                for j in 0..<vz {
-                    for i in 0..<vx {
-                        let a = vIdx(i, j)
-                        if pinned[a] || verts[a].support == nil { continue }
-                        for (di, dj) in [(1, 0), (0, 1)] {
-                            let ii = i + di, jj = j + dj
-                            if ii >= vx || jj >= vz { continue }
-                            let b = vIdx(ii, jj)
-                            if pinned[b], verts[b].support != nil { continue }
-                            guard let sa = verts[a].support,
-                                  let sb = verts[b].support else { continue }
-                            if abs(sa.y - sb.y) > 0.05 { continue }
-                            let d = verts[a].topY - verts[b].topY
-                            if abs(d) > maxStep {
-                                let m = (abs(d) - maxStep) * 0.5
-                                worst = max(worst, m)
-                                if d > 0 {
-                                    verts[a].topY -= m; verts[b].topY += m
-                                } else {
-                                    verts[a].topY += m; verts[b].topY -= m
-                                }
-                            }
-                        }
-                    }
-                }
-                if worst < 0.0005 { break }
-            }
-            // Write the relaxed heights back into snowH NOW,
-            // before (c2a) builds tSnow from verts: the sim's
-            // initial condition, its remap fallback and every
-            // edit transfer must carry the SHAPED target.
-            for idx in verts.indices {
-                if let s = verts[idx].support {
-                    verts[idx].snowH = max(0, verts[idx].topY - s.y)
-                }
-            }
-            // v4.6 NOTE — no slump write-back, deliberately.
-            // The audit tried absorbing the relaxation's
-            // changes into the layer three ways (absolute,
-            // change-form, voted); every variant ratcheted:
-            // each rebuild's relaxation slumps the trail walls
-            // a little more and storing that state compounds
-            // across a 50-step drag until a 1.4 m plow depth
-            // reads as a 0.4 m swale and the berms are eaten
-            // into moats. The layer therefore stores ONLY what
-            // the recorder wrote (carve + deposit); the
-            // relaxation remains a per-pass RENDERING of that
-            // state (softening walls and berm crests for the
-            // eye) without feeding back into it. Same stored
-            // state → same rendered surface, every rebuild:
-            // the trail is a true fixed point.
-        }
-        // (c2a) v4.8: SIMULATION SYNC. The columns above are
-        // the v4.7 TARGET surface (closed form + imprints +
-        // plow layer). The sim buffers are initialised from it
-        // (load-time initial condition), remapped across
-        // lattice/support changes (moved hosts carry their
-        // patch), and afterwards the skin reads the SIM state:
-        // only vertices where the target differs from the pure
-        // closed-form ceiling -- i.e. where an intruder, a
-        // footprint, or the plow layer is actively shaping the
-        // snow -- receive an edit transfer (target written into
-        // the shared snow buffer). Everywhere else the GPU
-        // simulation's own evolution (deposition, repose,
-        // rounding, melt) is what renders. The target the
-        // transfers carry is the RELAXED target from (c1b):
-        // the sheet shapes the target as v4.6 did, and the
-        // sim owns evolution between rebuilds at unedited
-        // cells, starting from shaped state at edited ones.
+        // v4.11: the v4.6 plow recorder, the displacement
+        // layer, the pinning pass and the target relaxation
+        // that used to sit here are GONE — snow displacement
+        // is the physics simulation's occupancy channel now
+        // (see the design record). The columns above are only
+        // the sync's initial condition / remap fallback.
+        // (c2a) v4.11: SIMULATION SYNC. The sim buffers are
+        // initialised from the target (load-time initial
+        // condition, converted to mass via the density
+        // profile), remapped across lattice/support changes
+        // (moved hosts carry their patch; a NEW host's
+        // vertices start from their own initial condition and
+        // the snow they displace is transferred to the old
+        // host's surviving vertices), and afterwards the skin
+        // reads the SIM state only.
         noteWeatherStep("sheet:simSync")
         var v48SimActive = false
         do {
@@ -4293,38 +4567,18 @@ final class Renderer {
                snowBuf.length >= n * 4, waterBuf.length >= n * 4 {
                 noteWeatherStep("sheet:simReadback")
                 v48SimActive = true
-                // v4.9 (2a): read/write the sim state through
-                // the shared buffers' contents() pointers — the
-                // same memory simRead/simWrite copied in and out
-                // (two full field copies + one full write-back
-                // per sheet build before; zero copies now, and
-                // edit transfers write only the edited vertices,
-                // in place, with the identical values).
-                // LS-REPRO TOGGLE `copyreads`: when on, the
-                // edit transfers + readback below run on
-                // explicit simRead copies (written back with
-                // simWrite) instead of the v4.9 zero-copy
-                // contents() pointers — same values, same
-                // finite-guard, copy path only. Default OFF =
-                // shipped behaviour (the else branch, verbatim).
+                // v4.11: the skin reads the SIM state — the
+                // derived depth buffer the tick's writeback
+                // keeps current (and the sync just wrote).
+                // There are no edit transfers any more: the
+                // target above is only the sync's initial
+                // condition / remap fallback, never written
+                // over live sim state. LS-REPRO TOGGLE
+                // `copyreads` still selects the read path
+                // (explicit copies vs zero-copy pointers).
                 if ReproToggles.copyReads {
-                    var snowArr = simRead(snowBuf, count: n)
+                    let snowArr = simRead(snowBuf, count: n)
                     let waterArr = simRead(waterBuf, count: n)
-                    var editedCopy = false
-                    for idx in verts.indices where hasS[idx] {
-                        if abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
-                            let tv = tSnow[idx]
-                            if idx < snowArr.count {
-                                snowArr[idx] = tv.isFinite ? tv : 0
-                            }
-                            if !tv.isFinite { noteNanClamp() }
-                            editedCopy = true
-                        }
-                    }
-                    if editedCopy {
-                        simSnowContent = true
-                        simWrite(snowBuf, snowArr)
-                    }
                     for idx in verts.indices where hasS[idx] {
                         let sv: Float = idx < snowArr.count ? snowArr[idx] : 0
                         let wv: Float = idx < waterArr.count ? waterArr[idx] : 0
@@ -4336,61 +4590,29 @@ final class Renderer {
                         verts[idx].waterD = w
                     }
                 } else {
-                let snowPtr = snowBuf.contents().bindMemory(to: Float.self, capacity: n)
-                let waterPtr = waterBuf.contents().bindMemory(to: Float.self, capacity: n)
-                var edited = false
-                for idx in verts.indices where hasS[idx] {
-                    // Edit transfer: only where intruders /
-                    // footprints / plow shape the column
-                    // (target != pure ceiling).
-                    if abs(tSnow[idx] - ceilA[idx]) > 0.0005 {
-                        // v4.10.2: a non-finite target must
-                        // not be written into the sim either —
-                        // the flow kernel's diffusion would
-                        // spread it to every neighbour.
-                        let tv = tSnow[idx]
-                        snowPtr[idx] = tv.isFinite ? tv : 0
-                        if !tv.isFinite { noteNanClamp() }
-                        edited = true
+                    let snowPtr = snowBuf.contents().bindMemory(to: Float.self, capacity: n)
+                    let waterPtr = waterBuf.contents().bindMemory(to: Float.self, capacity: n)
+                    for idx in verts.indices where hasS[idx] {
+                        // v4.10.2 (the round-2 NaN fix): THE
+                        // finite-guard between the sim and the
+                        // sheet/AS. Round 1 checked buffer
+                        // LENGTHS here but copied values
+                        // verbatim; one non-finite depth flowed
+                        // into sheet vertices, the normals and
+                        // the AS build. Replace with 0 (and
+                        // count it) instead — kept verbatim.
+                        let sv = snowPtr[idx]
+                        let wv = waterPtr[idx]
+                        let s = sv.isFinite ? sv : 0
+                        let w = wv.isFinite ? wv : 0
+                        if s != sv || w != wv { noteNanClamp() }
+                        verts[idx].snowH = s
+                        verts[idx].topY = supY[idx] + s
+                        verts[idx].waterD = w
                     }
                 }
-                if edited { simSnowContent = true }
-                for idx in verts.indices where hasS[idx] {
-                    // v4.10.2 (the round-2 NaN fix): THE
-                    // finite-guard between the sim and the
-                    // sheet/AS. Round 1 checked buffer LENGTHS
-                    // here but copied values verbatim; one
-                    // non-finite depth — from a corrupt
-                    // persisted exposure, a singular intruder
-                    // inverse, or a raced buffer — flowed into
-                    // sheet vertices, the finite-difference
-                    // normals, and the AS build, any of which
-                    // can kill the process on device. Replace
-                    // with 0 (and count it) instead.
-                    let sv = snowPtr[idx]
-                    let wv = waterPtr[idx]
-                    let s = sv.isFinite ? sv : 0
-                    let w = wv.isFinite ? wv : 0
-                    if s != sv || w != wv { noteNanClamp() }
-                    verts[idx].snowH = s
-                    verts[idx].topY = supY[idx] + s
-                    verts[idx].waterD = w
-                }
-                } // LS-REPRO TOGGLE `copyreads`: end of the zero-copy branch.
                 flushNanClampCount()
             }
-        }
-        // (c2) v4.10.4: the pinned set and the repose
-        // relaxation moved to (c1b), BEFORE the sim sync, so
-        // the sim starts from the shaped target at edited
-        // cells. What remains at this v4.8 site is the pin-
-        // buffer write (post-sync, as before — the buffer's
-        // count is the lattice's only now): the flow kernel
-        // reads the same pinning between rebuilds.
-        if snowPossible, let pinB = simPinnedBuf,
-           pinned.count * 4 == (pinB.length) {
-            let ptr = pinB.contents().bindMemory(to: UInt32.self, capacity: pinned.count)
-            for i in pinned.indices { ptr[i] = pinned[i] ? 1 : 0 }
         }
         noteWeatherStep("sheet:normals")
         // (c3) v4.5: normals from the RELAXED lattice —

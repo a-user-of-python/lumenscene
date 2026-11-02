@@ -1697,49 +1697,74 @@ fragment float4 lineFragment(LineOut in [[stage_in]]) {
     return in.color;
 }
 
-// MARK: - Weather simulation (v4.8: persistent GPU state)
+// MARK: - Weather simulation (v4.8 water / v4.11 snow physics)
 //
-// The snow and water surfaces are no longer re-derived from a
-// closed-form height function at rebuild time. Their depths
-// live HERE, in persistent per-lattice-vertex buffers owned by
-// Renderer.swift (snowDepth / waterDepth, one Float per vertex
-// of the SAME 0.20 m world-XZ lattice the v4.4 sheet used, with
-// the same support sampling). These kernels STEP that state:
+// WATER is the v4.8 system, unchanged: depths live in a
+// persistent per-lattice-vertex buffer (waterDepth) stepped by
+// simSourceSinkKernel (rain fill toward the pooling ceiling,
+// drying, edge drainage) and simFlowKernel kind==1 (levelling
+// in red-black order). Sean's puddle behaviour — round,
+// confined, no climbing — is exactly that system's, and the
+// v4.8 audit still covers it.
 //
-//   * simSourceSinkKernel -- deposition toward the per-vertex
-//     ceiling, temperature / legacy melt sinks, compaction
-//     toward a lowered ceiling, rain fill toward the per-vertex
-//     water ceiling, drying, and edge drainage (a vertex with a
-//     missing neighbour is a support edge: its water bleeds off
-//     at the drain rate, so water never stands past an edge).
-//   * simFlowKernel -- pairwise neighbour transfers in
-//     RED-BLACK checkerboard order. Within one pass only
-//     opposite-colour neighbours are read, so every transfer is
-//     pairwise antisymmetric (what leaves a is added to b in
-//     the same visit) and mass-conserving by construction. The
-//     naive Jacobi form of the repose step DIVERGED in the
-//     v4.5 audit; red-black Gauss-Seidel does not, and the
-//     host audit (v48-sim-audit.py) mirrors this exact scheme.
-//     Snow: repose transfer drives inter-cell slope toward
-//     tan(37 deg) PLUS a small always-on diffusion (0.8% of the
-//     snow-depth difference per visit) that relaxes piles into
-//     soft rounded mounds with no faceted steps. Water:
-//     levelling transfers equalise supportY + waterDepth
-//     between neighbours (near-flat pool surfaces), scaled by
-//     (1 - freezeFrac) -- frozen water does not flow.
-//   * simApplyEditsKernel -- intruder / plow / footprint edit
-//     transfers: (vertex index, delta) pairs written by the
-//     CPU recorder, applied to snowDepth verbatim (clamped at
-//     0 -- an edit cannot dig below the support).
+// SNOW was rebuilt in v4.11 as a physically-based granular
+// height-field simulation (Sean, 2026-11-01: "Snow is now a
+// simulation... affected by physics and gravity... very very
+// very accurate to how real snow works"; the v4.2-v4.10.4
+// rule-stack — closed-form ceilings as shapes, exposure clocks,
+// the plow layer, drag caps, relaxation patches — is RETIRED).
+// The model (design record + Python mirror proof in the goal
+// record, hidden_files/v411-snow-audit.py — PILE / SETTLE /
+// DRAG / SPAWN / ROOF / LONGRUN all pass there, and the old
+// kernel rules fail the same SETTLE field at 79.7 deg):
 //
-// The closed-form v4.3-v4.7 height function survives ONLY as
-// (a) the per-vertex deposition CEILING + drift-rate field
-// baked into the ceiling/rate buffers at lattice build time,
-// and (b) the load-time initial condition for the depth
-// buffers. The rendered sheets are skins over this state (see
-// Renderer.appendSnowSheet): topology fixed per lattice build,
-// heights read back from these buffers at the quantised
-// rebuild cadence.
+//   State per lattice column: MASS m (SWE metres), DENSITY
+//   rho in [~0.35, 1.0], sinter AGE. Depth h = m / rho is
+//   DERIVED (snowWritebackKernel refreshes the snowDepth
+//   buffer the skin and water read). Per substep (1/30 s):
+//     1. snowSourcesKernel — deposition as an input FLUX
+//        (base rate x drift factor x fresh density, softly
+//        gated by the per-vertex gate = the old ceiling value
+//        demoted to an input gate), melt as mass removal at
+//        the session sink rate, overburden + gate + intruder
+//        compaction, footprint press events (CPU-stamped),
+//        ageing. This is the ONLY place snow mass is created
+//        or destroyed (plus the sync-time initial condition).
+//     2. snowFluxKernel — gravity flux: pairwise transfers
+//        over the snow SURFACE (support + depth) across ALL
+//        EIGHT neighbours (diagonals included: axial-only
+//        constraints let corner gradients reach sqrt(2) x
+//        repose — measured 43.7 deg at box corners in the
+//        mirror), FOUR-colour pass order (diagonals join
+//        same-parity cells), transfer = 0.25 x mobility x
+//        excess over the repose plane, the giver's total
+//        outflow scaled to never exceed its mass (the limiter
+//        makes conservation exact — without it parallel
+//        giving at support steps CREATED mass in the mirror).
+//        Mobility falls with density and sinter age; the
+//        repose angle is temperature-driven (34 deg cold to
+//        38 deg at 0 C, + up to 4 deg of sinter bonus). No
+//        diffusion term. Support steps are NOT skipped: snow
+//        sheds off edges and wall-adjacent fins relax, which
+//        is the v4.10.4 device failure this replaces.
+//     3. snowDisplaceCountKernel + snowDisplaceApplyKernel —
+//        objects as volume boundaries: the CPU rasterises the
+//        live intruder set into occupancy buffers every tick;
+//        intruded columns vacate a rate-limited fraction of
+//        their overlap mass each substep (compaction absorbs
+//        first, in step 1), distributed to non-intruded
+//        neighbours lowest-surface-first. Berms and trenches
+//        EMERGE from this + flux; nothing is recorded.
+//   simSourceSinkKernel's snow half is gated OFF by
+//   sp.snowMode == 1 (the v4.11 path); it still runs water.
+//   simFlowKernel now runs kind==1 (water) only.
+//   simApplyEditsKernel is dead (kept compiled; no dispatch).
+//
+// The closed-form height function survives ONLY as (a) the
+// per-vertex deposition GATE + drift-rate field (inputs), and
+// (b) the load-time initial condition (converted to mass via
+// a density profile at sync). The rendered sheet is a skin
+// over this state, as before.
 
 struct SimParams {
     uint vx;          // lattice vertices per row
@@ -1755,7 +1780,11 @@ struct SimParams {
     float freezeFrac; // 0..1; water flow scales by (1 - freezeFrac)
     float snowBase;   // v4.8: live snow base rate (m/s at drift factor 1)
     float waterBase;  // v4.8: live water fill scale (surge x rate scale)
-    float pad;
+    uint snowMode;    // v4.11: 1 = snow owned by the physics kernels
+                      // (source/sink skips its snow half; flow runs water only)
+    float reposeTan;  // v4.11: tan(angle of repose) at the current temperature
+    float freshRho;   // v4.11: fresh-snow density at the current temperature
+    float snowTemp;   // v4.11: air temperature (C); >= 100 = unset (legacy)
 };
 
 kernel void simSourceSinkKernel(
@@ -1772,20 +1801,29 @@ kernel void simSourceSinkKernel(
 {
     uint count = sp.vx * sp.vz;
     if (idx >= count) return;
-    if (hasSupport[idx] == 0u) { snowDepth[idx] = 0.0f; waterDepth[idx] = 0.0f; return; }
-    // Snow: deposit toward the ceiling at the drift rate;
-    // above the ceiling (target lowered) compact toward it.
-    float sn = snowDepth[idx];
-    float ceil = snowCeil[idx];
-    if (sn < ceil) {
-        sn = min(ceil, sn + snowRate[idx] * sp.snowBase * sp.dt);
-    } else if (sn > ceil) {
-        sn = max(ceil, sn - sp.compactRate * sp.dt);
+    if (hasSupport[idx] == 0u) {
+        // v4.11: in snowMode the snow depth buffer is owned by
+        // snowWritebackKernel (it zeroes unsupported columns
+        // itself); only water is still this kernel's to clear.
+        if (sp.snowMode == 0u) { snowDepth[idx] = 0.0f; }
+        waterDepth[idx] = 0.0f;
+        return;
     }
-    // Uniform sinks (temperature melt / legacy rain-melt /
-    // legacy thaw -- the session picks the v4.7 rate).
-    if (sp.snowSink > 0.0f) sn = max(0.0f, sn - sp.snowSink * sp.dt);
-    snowDepth[idx] = sn;
+    // Snow (LEGACY path only — v4.11 sets snowMode == 1 and
+    // snowSourcesKernel owns snow): deposit toward the ceiling
+    // at the drift rate; above the ceiling compact toward it;
+    // uniform sinks (temperature melt / legacy terms).
+    if (sp.snowMode == 0u) {
+        float sn = snowDepth[idx];
+        float ceil = snowCeil[idx];
+        if (sn < ceil) {
+            sn = min(ceil, sn + snowRate[idx] * sp.snowBase * sp.dt);
+        } else if (sn > ceil) {
+            sn = max(ceil, sn - sp.compactRate * sp.dt);
+        }
+        if (sp.snowSink > 0.0f) sn = max(0.0f, sn - sp.snowSink * sp.dt);
+        snowDepth[idx] = sn;
+    }
     // Water: rain fills toward the pooling ceiling (the baked
     // puddle profile for this vertex -- zero where the field
     // never pools, so rain alone cannot flood a flat plane
@@ -1965,4 +2003,371 @@ kernel void simApplyEditsKernel(
     // sim shader set — guard it before anyone wires it up.
     if (v >= latticeCount) return;
     snowDepth[v] = max(0.0f, snowDepth[v] + editDelta[idx]);
+}
+
+// MARK: - v4.11 snow physics kernels
+//
+// Constants below are ported verbatim from the Python mirror
+// (hidden_files/v411-snow-audit.py), where PILE / SETTLE /
+// DRAG / SPAWN / ROOF / LONGRUN pass with them. Do not retune
+// one side without the other.
+
+struct SnowEdge {
+    uint idx;
+    float mass;
+};
+
+// Shared per-column helpers (mirror: mobility / repose).
+static float snowMobility(float rho, float age, constant SimParams& sp) {
+    float mob = 1.0f / (1.0f + max(rho - sp.freshRho, 0.0f) * 3.0f);
+    float agef = clamp(age / 600.0f, 0.0f, 1.0f);
+    mob *= (1.0f - 0.5f * agef);
+    if (sp.snowTemp < 100.0f && sp.snowTemp > 0.0f) mob *= 1.25f;
+    return max(mob, 0.15f);
+}
+static float snowReposeTan(float age, constant SimParams& sp) {
+    float agef = clamp(age / 600.0f, 0.0f, 1.0f);
+    return sp.reposeTan + 0.0699268f * agef; // + tan(4 deg) sinter bonus
+}
+
+// Step 0 of each substep: clear the displacement edge counter.
+kernel void snowEdgeResetKernel(
+    device uint* edgeCount [[buffer(0)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx == 0u) { edgeCount[0] = 0u; }
+}
+
+// Step 1: sources / sinks / compaction / press / ageing.
+// The ONLY kernel that creates or destroys snow mass
+// (deposition in, melt out); press overflow is not destroyed
+// — it is appended to the displacement edge buffer and lands
+// on the neighbours in the apply step.
+kernel void snowSourcesKernel(
+    device float* snowMass [[buffer(0)]],
+    device float* snowRho [[buffer(1)]],
+    device float* snowAge [[buffer(2)]],
+    device const float* supportY [[buffer(3)]],
+    device const float* snowGate [[buffer(4)]],
+    device const float* snowRate [[buffer(5)]],
+    device const uint* hasSupport [[buffer(6)]],
+    device const float* occCov [[buffer(7)]],
+    device const float* press [[buffer(8)]],
+    device SnowEdge* edges [[buffer(9)]],
+    device uint* edgeCount [[buffer(10)]],
+    constant uint& edgeCapacity [[buffer(11)]],
+    constant SimParams& sp [[buffer(12)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint count = sp.vx * sp.vz;
+    if (idx >= count) return;
+    if (hasSupport[idx] == 0u) {
+        snowMass[idx] = 0.0f;
+        snowAge[idx] = 0.0f;
+        return;
+    }
+    float m = snowMass[idx];
+    float rho = clamp(snowRho[idx], 0.05f, 1.0f);
+    float age = snowAge[idx];
+    float gate = snowGate[idx];
+    // Deposition: an input flux at fresh density, softly
+    // gated as depth approaches the gate (the gate is the
+    // old ceiling value — an input limit, never a shape).
+    float depth = m / max(rho, 0.05f);
+    if (sp.snowBase > 0.0f) {
+        float taper = clamp((gate - depth) / 0.05f, 0.0f, 1.0f);
+        float dm = sp.snowBase * snowRate[idx] * sp.freshRho * sp.dt * taper;
+        if (dm > 0.0f) {
+            rho = (m * rho + dm * sp.freshRho) / max(m + dm, 1e-9f);
+            m += dm;
+        }
+    }
+    // Melt: mass out at the session sink rate (a depth rate:
+    // dm = sink * rho * dt keeps dh/dt == sink). Wet snow
+    // densifies slightly while it melts.
+    if (sp.snowSink > 0.0f && m > 0.0f) {
+        float dm = min(m, sp.snowSink * rho * sp.dt);
+        m -= dm;
+        if (sp.snowTemp < 100.0f && sp.snowTemp > 0.0f) {
+            rho += (1.0f - rho) * 0.005f * sp.dt;
+        }
+    }
+    // Overburden compaction: the pack densifies under its own
+    // weight, faster the deeper it is. (Rate tuned in the
+    // mirror: at 10x this, differential compaction flattened a
+    // test pile below repose inside 25 s — real densification
+    // acts over tens of minutes.)
+    {
+        float k = 0.001f * (0.3f + m / 0.5f);
+        rho += (1.0f - rho) * (1.0f - exp(-k * sp.dt));
+    }
+    // Gate compaction: snow sitting ABOVE its deposition gate
+    // (the Max Depth control was lowered) densifies — depth
+    // falls at constant mass. Mass is never deleted here;
+    // v4.7's delete-to-ceiling is deliberately gone (see the
+    // design record).
+    depth = m / max(rho, 0.05f);
+    if (depth > gate) {
+        rho += (1.0f - rho) * (1.0f - exp(-0.02f * sp.dt));
+    }
+    // Intruder compaction: snow under an object is pressed
+    // toward full density fast — this is the "compact first"
+    // half of displacement; the rest vacates in step 3.
+    if (occCov[idx] > 0.0f) {
+        rho += (1.0f - rho) * (1.0f - exp(-3.0f * sp.dt));
+        age = 0.0f;
+    }
+    // Footprint press (player steps, CPU-stamped per-vertex
+    // compress factors): depth scales down at constant mass
+    // (rho rises); past full density the excess mass sheds
+    // to the ring via the edge buffer.
+    float p = press[idx];
+    if (p > 0.001f && m > 0.0f) {
+        depth = m / max(rho, 0.05f);
+        float target = depth * (1.0f - min(p, 0.9f));
+        float rhoWant = m / max(target, 1e-6f);
+        if (rhoWant <= 1.0f) {
+            rho = rhoWant;
+        } else {
+            rho = 1.0f;
+            float over = m - target;
+            if (over > 0.0f) {
+                m = target;
+                uint slot = atomic_fetch_add_explicit(
+                    (device atomic_uint*)edgeCount, 1u,
+                    memory_order_relaxed);
+                if (slot < edgeCapacity) {
+                    edges[slot].idx = idx;
+                    edges[slot].mass = over;
+                }
+                // If the buffer were ever full the excess
+                // stays in the column (m restored) rather
+                // than vanishing: conservation is absolute.
+                else { m += over; }
+            }
+        }
+        age = 0.0f;
+    }
+    age += sp.dt;
+    snowMass[idx] = m;
+    snowRho[idx] = clamp(rho, 0.05f, 1.0f);
+    snowAge[idx] = age;
+}
+
+// Step 2: gravity flux. One thread per column of the pass's
+// colour class (sp.parity = class 0..3 of the 4-colouring
+// (x&1) + 2*(z&1)); a thread owns its column (plain subtract
+// of its own outflow — same-class columns never receive from
+// each other, and other classes are not running) and adds to
+// receivers atomically (several givers share receivers; the
+// adds commute and none are lost, so mass is conserved to
+// float rounding). Transfers are computed from the surfaces
+// the thread reads; staleness between givers is bounded by
+// the 0.25 factor and the outflow limiter, exactly as the
+// mirror's snapshot passes are.
+kernel void snowFluxKernel(
+    device float* snowMass [[buffer(0)]],
+    device const float* snowRho [[buffer(1)]],
+    device float* snowAge [[buffer(2)]],
+    device const float* supportY [[buffer(3)]],
+    device const uint* hasSupport [[buffer(4)]],
+    constant SimParams& sp [[buffer(5)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint count = sp.vx * sp.vz;
+    if (idx >= count) return;
+    if (hasSupport[idx] == 0u) return;
+    uint x = idx % sp.vx;
+    uint z = idx / sp.vx;
+    if (((x & 1u) + 2u * (z & 1u)) != sp.parity) return;
+    float m = snowMass[idx];
+    if (m <= 0.0f) return;
+    float rho = clamp(snowRho[idx], 0.05f, 1.0f);
+    float surfI = supportY[idx] + m / rho;
+    float mobI = snowMobility(rho, snowAge[idx], sp);
+    float rtanI = snowReposeTan(snowAge[idx], sp);
+    const int dxs[8] = {1, -1, 0, 0, 1, 1, -1, -1};
+    const int dzs[8] = {0, 0, 1, -1, 1, -1, 1, -1};
+    uint nIdx[8];
+    float nMove[8];
+    int nCount = 0;
+    float totalOut = 0.0f;
+    for (uint k = 0u; k < 8u; ++k) {
+        int nx = int(x) + dxs[k];
+        int nz = int(z) + dzs[k];
+        if (nx < 0 || nz < 0 || nx >= int(sp.vx) || nz >= int(sp.vz)) continue;
+        uint n = uint(nz) * sp.vx + uint(nx);
+        if (hasSupport[n] == 0u) continue;
+        float dist = sp.cell * ((dxs[k] != 0 && dzs[k] != 0) ? 1.41421356f : 1.0f);
+        float rhoN = clamp(snowRho[n], 0.05f, 1.0f);
+        float surfN = supportY[n] + snowMass[n] / rhoN;
+        float diff = surfI - surfN;
+        if (diff <= 0.0f) continue;
+        float maxStep = max(rtanI, snowReposeTan(snowAge[n], sp)) * dist;
+        float excess = diff - maxStep;
+        if (excess <= 0.0f) continue;
+        float mob = min(mobI, snowMobility(rhoN, snowAge[n], sp));
+        float move = min(0.25f * mob * excess * rho, m);
+        if (move <= 0.0f) continue;
+        nIdx[nCount] = n;
+        nMove[nCount] = move;
+        nCount += 1;
+        totalOut += move;
+    }
+    if (nCount == 0 || totalOut <= 0.0f) return;
+    // Outflow limiter: the giver never gives more than it has.
+    float scale = (totalOut > m) ? (m / totalOut) : 1.0f;
+    float given = 0.0f;
+    for (int k = 0; k < nCount; ++k) {
+        float mv = nMove[k] * scale;
+        if (mv <= 0.0f) continue;
+        atomic_fetch_add_explicit(
+            (device atomic_float*)&snowMass[nIdx[k]], mv,
+            memory_order_relaxed);
+        given += mv;
+    }
+    snowMass[idx] = m - given;
+    if (given > 1e-6f) {
+        // Disturbed snow loses its sinter age. (The write is
+        // the owner's own column; receivers' ages are reset by
+        // their own threads when they next give, and by the
+        // sources kernel when intruded — age is a material
+        // heuristic, not conserved state.)
+        snowAge[idx] = 0.0f;
+    }
+}
+
+// Step 3a: displacement count. One thread per column: if an
+// intruder's volume overlaps this column's snow, append the
+// rate-limited vacated mass to the edge buffer. The mass is
+// subtracted in the apply step (exactly once per entry).
+kernel void snowDisplaceCountKernel(
+    device const float* snowMass [[buffer(0)]],
+    device const float* snowRho [[buffer(1)]],
+    device const float* supportY [[buffer(2)]],
+    device const uint* hasSupport [[buffer(3)]],
+    device const float* occCov [[buffer(4)]],
+    device const float* occLo [[buffer(5)]],
+    device const float* occHi [[buffer(6)]],
+    device SnowEdge* edges [[buffer(7)]],
+    device uint* edgeCount [[buffer(8)]],
+    constant uint& edgeCapacity [[buffer(9)]],
+    constant SimParams& sp [[buffer(10)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint count = sp.vx * sp.vz;
+    if (idx >= count) return;
+    if (hasSupport[idx] == 0u) return;
+    float cov = occCov[idx];
+    if (cov <= 0.0f) return;
+    float m = snowMass[idx];
+    if (m <= 0.0f) return;
+    float rho = clamp(snowRho[idx], 0.05f, 1.0f);
+    float depth = m / rho;
+    float ovTop = min(occHi[idx] - supportY[idx], depth);
+    float ovBot = max(occLo[idx] - supportY[idx], 0.0f);
+    float ovH = ovTop - ovBot;
+    if (ovH <= 0.0f) return;
+    float shed = m * (ovH / max(depth, 1e-6f)) * cov * 0.18f;
+    if (shed <= 1e-7f) return;
+    uint slot = atomic_fetch_add_explicit(
+        (device atomic_uint*)edgeCount, 1u, memory_order_relaxed);
+    if (slot < edgeCapacity) {
+        edges[slot].idx = idx;
+        edges[slot].mass = shed;
+    }
+    // Buffer full: the snow simply stays this substep (it
+    // vacates next substep instead) — never deleted.
+}
+
+// Step 3b: displacement apply. One thread per edge entry:
+// distribute the shed mass to the giver's non-intruded
+// neighbours, weighted by surface headroom (lowest surfaces
+// first — berms shoulder against the mover, never teleport
+// bands), then subtract exactly the distributed sum from the
+// giver. All writes atomic: several entries can share
+// receivers, and a giver here is another entry's neighbour.
+kernel void snowDisplaceApplyKernel(
+    device float* snowMass [[buffer(0)]],
+    device const float* snowRho [[buffer(1)]],
+    device const float* supportY [[buffer(2)]],
+    device const uint* hasSupport [[buffer(3)]],
+    device const float* occCov [[buffer(4)]],
+    device const SnowEdge* edges [[buffer(5)]],
+    device const uint* edgeCount [[buffer(6)]],
+    constant SimParams& sp [[buffer(7)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= edgeCount[0]) return;
+    SnowEdge e = edges[idx];
+    uint g = e.idx;
+    if (g >= sp.vx * sp.vz) return;
+    float shed = e.mass;
+    if (shed <= 0.0f) return;
+    uint x = g % sp.vx;
+    uint z = g / sp.vx;
+    float rhoG = clamp(snowRho[g], 0.05f, 1.0f);
+    float surfG = supportY[g] + snowMass[g] / rhoG;
+    const int dxs[8] = {1, -1, 0, 0, 1, 1, -1, -1};
+    const int dzs[8] = {0, 0, 1, -1, 1, -1, 1, -1};
+    uint nIdx[8];
+    float nW[8];
+    int nCount = 0;
+    float wSum = 0.0f;
+    for (uint k = 0u; k < 8u; ++k) {
+        int nx = int(x) + dxs[k];
+        int nz = int(z) + dzs[k];
+        if (nx < 0 || nz < 0 || nx >= int(sp.vx) || nz >= int(sp.vz)) continue;
+        uint n = uint(nz) * sp.vx + uint(nx);
+        if (hasSupport[n] == 0u) continue;
+        if (occCov[n] > 0.0f) continue; // into the mover: no
+        float rhoN = clamp(snowRho[n], 0.05f, 1.0f);
+        float surfN = supportY[n] + snowMass[n] / rhoN;
+        float w = max(surfG - surfN, 0.0f) + 0.01f;
+        nIdx[nCount] = n;
+        nW[nCount] = w;
+        nCount += 1;
+        wSum += w;
+    }
+    if (nCount == 0 || wSum <= 0.0f) return; // boxed in: stays
+    float given = 0.0f;
+    for (int k = 0; k < nCount; ++k) {
+        float share = shed * (nW[k] / wSum);
+        if (share <= 0.0f) continue;
+        atomic_fetch_add_explicit(
+            (device atomic_float*)&snowMass[nIdx[k]], share,
+            memory_order_relaxed);
+        given += share;
+    }
+    if (given > 0.0f) {
+        atomic_fetch_add_explicit(
+            (device atomic_float*)&snowMass[g], -given,
+            memory_order_relaxed);
+    }
+}
+
+// Press stamps are one-shot events: after the first substep's
+// sources kernel consumes them, this clears the stamp buffer
+// so the remaining substeps of the tick do not re-apply them.
+kernel void snowPressClearKernel(
+    device float* press [[buffer(0)]],
+    uint idx [[thread_position_in_grid]])
+{
+    press[idx] = 0.0f;
+}
+
+// Step 4: writeback — the derived depth the skin, the water
+// ceiling and snowDepthAt read (mass / density).
+kernel void snowWritebackKernel(
+    device float* snowDepth [[buffer(0)]],
+    device const float* snowMass [[buffer(1)]],
+    device const float* snowRho [[buffer(2)]],
+    device const uint* hasSupport [[buffer(3)]],
+    constant SimParams& sp [[buffer(4)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint count = sp.vx * sp.vz;
+    if (idx >= count) return;
+    if (hasSupport[idx] == 0u) { snowDepth[idx] = 0.0f; return; }
+    snowDepth[idx] = snowMass[idx] / clamp(snowRho[idx], 0.05f, 1.0f);
 }
